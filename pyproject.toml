@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mgb-vec-hydro"
+version = "0.1.0"
+description = "Vector hydrography preprocessing tools for MGB model inputs"
+readme = "docs/refactor_goal.md"
+requires-python = ">=3.11"
+license = { file = "LICENSE" }
+authors = [
+  { name = "MGB-Vec-Hydro contributors" }
+]
+dependencies = [
+  "click>=8.1",
+  "geopandas>=0.14",
+  "pandas>=2.0",
+  "pyogrio>=0.7",
+  "shapely>=2.0",
+]
+
+[project.optional-dependencies]
+test = [
+  "pytest>=8.0",
+]
+
+[project.scripts]
+mgb-vec-hydro = "mgb_vec_hydro.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "--basetemp=.pytest-tmp"

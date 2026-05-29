@@ -5,3 +5,14 @@ legacy/*
 data/*
 
 AGENTS.md
+
+__pycache__/
+.venv/
+.pytest_cache/
+.pytest-tmp/
+.ruff_cache/
+*.egg-info/
+build/
+dist/
+output/
+tmp/
