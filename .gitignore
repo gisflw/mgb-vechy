@@ -1,0 +1,7 @@
+# legacy files
+legacy/*
+
+# data files
+data/*
+
+AGENTS.md
