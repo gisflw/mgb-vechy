@@ -31,23 +31,20 @@ def test_carinhanha_roi_matches_reference_properties():
         catchments,
         segments,
         outlet_ids=OUTLET_SEGMENT_IDS,
-        seg_id_col="cotrecho",
-        seg_id_down_col="nutrjus",
-        catch_id_col="cobacia",
+        id_col="cotrecho",
+        id_down_col="nutrjus",
     )
 
     assert len(roi.segments) == len(expected_segments)
     assert len(roi.catchments) == len(expected_catchments)
-    assert set(roi.segments["cotrecho"]) == set(expected_segments["cotrecho"])
-    assert set(roi.catchments["cobacia"].astype(str)) == set(
-        expected_catchments["cobacia"].astype(str)
-    )
-    assert set(roi.segments["nutrjus"]) == set(expected_segments["nutrjus"])
+    assert set(roi.segments["id"]) == set(expected_segments["cotrecho"])
+    assert set(roi.catchments["id"]) == set(expected_catchments["cotrecho"])
+    assert set(roi.segments["id_down"]) == set(expected_segments["nutrjus"])
     assert roi.segments.crs == segments.crs
     assert roi.catchments.crs == catchments.crs
-    assert dict(zip(roi.segments["cotrecho"], roi.segments["sub"])) == dict(
+    assert dict(zip(roi.segments["id"], roi.segments["sub"])) == dict(
         zip(expected_segments["cotrecho"], expected_segments["sub"])
     )
-    assert dict(zip(roi.catchments["cobacia"].astype(str), roi.catchments["sub"])) == dict(
-        zip(expected_catchments["cobacia"].astype(str), expected_catchments["sub"])
+    assert dict(zip(roi.catchments["id"], roi.catchments["sub"])) == dict(
+        zip(expected_catchments["cotrecho"], expected_catchments["sub"])
     )

@@ -28,9 +28,8 @@ def main() -> None:
     required=True,
 )
 @click.option("--outlet-id", "outlet_ids", multiple=True, required=True)
-@click.option("--seg-id-col", default="seg_id", show_default=True)
-@click.option("--seg-id-down-col", default="seg_id_down", show_default=True)
-@click.option("--catch-id-col", default="catch_id", show_default=True)
+@click.option("--id-col", default="id", show_default=True)
+@click.option("--id-down-col", default="id_down", show_default=True)
 @click.option(
     "--output-dir",
     type=click.Path(file_okay=False, path_type=Path),
@@ -41,9 +40,8 @@ def define_roi_command(
     catchments_path: Path,
     segments_path: Path,
     outlet_ids: tuple[str, ...],
-    seg_id_col: str,
-    seg_id_down_col: str,
-    catch_id_col: str,
+    id_col: str,
+    id_down_col: str,
     output_dir: Path,
     output_format: str,
 ) -> None:
@@ -53,16 +51,15 @@ def define_roi_command(
         paths = output_paths(output_dir, output_format)
         catchments = read_vector(catchments_path)
         segments = read_vector(segments_path)
-        if seg_id_col not in segments.columns:
-            raise MissingColumnsError(f"Missing required column(s): {seg_id_col}")
-        coerced_outlet_ids = _coerce_outlet_ids(outlet_ids, segments[seg_id_col])
+        if id_col not in segments.columns:
+            raise MissingColumnsError(f"Missing required column(s): {id_col}")
+        coerced_outlet_ids = _coerce_outlet_ids(outlet_ids, segments[id_col])
         roi = define_roi(
             catchments,
             segments,
             outlet_ids=coerced_outlet_ids,
-            seg_id_col=seg_id_col,
-            seg_id_down_col=seg_id_down_col,
-            catch_id_col=catch_id_col,
+            id_col=id_col,
+            id_down_col=id_down_col,
         )
         write_vector(roi.catchments, paths.catchments, output_format=output_format)
         write_vector(roi.segments, paths.segments, output_format=output_format)

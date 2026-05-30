@@ -1,6 +1,6 @@
 # Stage 1 ROI CLI
 
-`mgb-vec-hydro define-roi` selects catchment and segment features upstream of one or more outlet segment IDs.
+`mgb-vec-hydro define-roi` selects catchment and segment features upstream of one or more outlet IDs.
 
 The command expects prepared vector inputs. It does not clip to a DEM extent and it does not call QGIS.
 
@@ -12,27 +12,34 @@ mgb-vec-hydro define-roi \
   --segments path/to/segments.gpkg \
   --outlet-id 123 \
   --outlet-id 456 \
-  --seg-id-col seg_id \
-  --seg-id-down-col seg_id_down \
-  --catch-id-col catch_id \
+  --id-col id \
+  --id-down-col id_down \
   --output-dir output \
   --output-format fgb
 ```
 
 Supply repeated `--outlet-id` values in downstream-to-upstream order. The first outlet gets the highest `sub` value, and later upstream outlet selections overwrite overlapping `sub` assignments.
 
-## BHO Schema
+Outputs are normalized to exactly these columns:
+
+- `id`
+- `id_down`
+- `sub`
+- `geometry`
+
+Both inputs must share the configured `--id-col`. The downstream topology column is read from the segment input and copied into both outputs.
+
+## Custom Schema
 
 ```bash
 mgb-vec-hydro define-roi \
-  --catchments data/geoft_bhae_area_drenagem.gpkg \
-  --segments data/geoft_bhae_trecho_drenagem.gpkg \
+  --catchments data/areas.gpkg \
+  --segments data/trecs.gpkg \
   --outlet-id 90497 \
   --outlet-id 416 \
   --outlet-id 159713 \
-  --seg-id-col cotrecho \
-  --seg-id-down-col nutrjus \
-  --catch-id-col cobacia \
+  --id-col cotrecho \
+  --id-down-col nutrjus \
   --output-dir output \
   --output-format shp
 ```
