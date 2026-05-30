@@ -126,6 +126,46 @@ def test_define_roi_supports_custom_input_column_names_with_normalized_output():
     assert list(roi.catchments["sub"]) == [1, 1]
 
 
+def test_define_roi_resolves_input_columns_case_insensitively():
+    segments = gpd.GeoDataFrame(
+        {
+            "LINKNO": [10, 20, 30],
+            "DSLINKNO": [None, 10, 20],
+            "geometry": [
+                LineString([(0, 0), (1, 0)]),
+                LineString([(1, 0), (2, 0)]),
+                LineString([(2, 0), (3, 0)]),
+            ],
+        },
+        crs="EPSG:4326",
+    )
+    catchments = gpd.GeoDataFrame(
+        {
+            "LINKNO": [10, 20, 30],
+            "geometry": [
+                Polygon([(0, 0), (1, 0), (1, 1), (0, 1)]),
+                Polygon([(1, 0), (2, 0), (2, 1), (1, 1)]),
+                Polygon([(2, 0), (3, 0), (3, 1), (2, 1)]),
+            ],
+        },
+        crs="EPSG:4326",
+    )
+
+    roi = define_roi(
+        catchments,
+        segments,
+        outlet_ids=[20],
+        id_col="linkno",
+        id_down_col="dslinkno",
+    )
+
+    assert list(roi.segments.columns) == ["id", "id_down", "sub", "geometry"]
+    assert list(roi.catchments.columns) == ["id", "id_down", "sub", "geometry"]
+    assert list(roi.segments["id"]) == [20, 30]
+    assert list(roi.catchments["id"]) == [20, 30]
+    assert list(roi.catchments["id_down"]) == [10, 20]
+
+
 def test_define_roi_requires_shared_id_column_on_catchments():
     catchments = _catchments_gdf().rename(columns={"id": "area_id"})
 

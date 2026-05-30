@@ -28,6 +28,7 @@ Outputs are normalized to exactly these columns:
 - `geometry`
 
 Both inputs must share the configured `--id-col`. The downstream topology column is read from the segment input and copied into both outputs.
+Input column matching is case-insensitive, so `--id-col linkno` can match a source column named `LINKNO`.
 
 ## Custom Schema
 

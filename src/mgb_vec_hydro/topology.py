@@ -54,7 +54,8 @@ def find_upstream_selection(
     """Return upstream IDs for one or more outlets."""
 
     outlet_list = list(outlet_ids)
-    _validate_columns(segments, [id_col, id_down_col])
+    id_col = resolve_column_name(segments, id_col)
+    id_down_col = resolve_column_name(segments, id_down_col)
     _validate_unique_segments(segments, id_col)
 
     ids = set(segments[id_col].tolist())
@@ -76,8 +77,35 @@ def find_upstream_selection(
     return UpstreamSelection(ids=selected_ids)
 
 
+def resolve_column_name(table: pd.DataFrame, column: str) -> str:
+    """Return the real table column for a case-insensitive requested name."""
+
+    if column in table.columns:
+        return column
+
+    matches = [
+        existing for existing in table.columns if existing.casefold() == column.casefold()
+    ]
+    if len(matches) == 1:
+        return matches[0]
+    if not matches:
+        raise MissingColumnsError(f"Missing required column(s): {column}")
+
+    raise MissingColumnsError(
+        "Ambiguous required column "
+        + column
+        + ": "
+        + ", ".join(str(match) for match in matches)
+    )
+
+
 def _validate_columns(table: pd.DataFrame, required_columns: Iterable[str]) -> None:
-    missing = [column for column in required_columns if column not in table.columns]
+    missing = []
+    for column in required_columns:
+        try:
+            resolve_column_name(table, column)
+        except MissingColumnsError:
+            missing.append(column)
     if missing:
         raise MissingColumnsError(
             "Missing required column(s): " + ", ".join(missing)

@@ -4,9 +4,10 @@ from pathlib import Path
 
 import click
 
-from mgb_vec_hydro.exceptions import MgbVecHydroError, MissingColumnsError
+from mgb_vec_hydro.exceptions import MgbVecHydroError
 from mgb_vec_hydro.io import output_paths, read_vector, write_vector
 from mgb_vec_hydro.roi import define_roi
+from mgb_vec_hydro.topology import resolve_column_name
 
 
 @click.group()
@@ -51,9 +52,8 @@ def define_roi_command(
         paths = output_paths(output_dir, output_format)
         catchments = read_vector(catchments_path)
         segments = read_vector(segments_path)
-        if id_col not in segments.columns:
-            raise MissingColumnsError(f"Missing required column(s): {id_col}")
-        coerced_outlet_ids = _coerce_outlet_ids(outlet_ids, segments[id_col])
+        segment_id_col = resolve_column_name(segments, id_col)
+        coerced_outlet_ids = _coerce_outlet_ids(outlet_ids, segments[segment_id_col])
         roi = define_roi(
             catchments,
             segments,

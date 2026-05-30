@@ -43,6 +43,24 @@ def test_find_upstream_segments_with_custom_columns():
     assert result == {20, 30, 40}
 
 
+def test_find_upstream_segments_resolves_input_columns_case_insensitively():
+    segments = pd.DataFrame(
+        {
+            "LINKNO": [10, 20, 30, 40],
+            "DSLINKNO": [None, 10, 20, 20],
+        }
+    )
+
+    result = find_upstream_segments(
+        segments,
+        [20],
+        id_col="linkno",
+        id_down_col="dslinkno",
+    )
+
+    assert result == {20, 30, 40}
+
+
 def test_multiple_outlets_return_union():
     segments = pd.DataFrame(
         {
