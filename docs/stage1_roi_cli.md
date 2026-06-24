@@ -50,4 +50,4 @@ Outputs use legacy Stage 1 names:
 - `roi_areas.<ext>`
 - `roi_trecs.<ext>`
 
-Supported formats are `fgb`, `gpkg`, and `shp`. New workflows should prefer `fgb` or `gpkg`; Shapefile is kept for compatibility checks.
+Supported formats are `fgb` and `gpkg`. New workflows should prefer `fgb`.
