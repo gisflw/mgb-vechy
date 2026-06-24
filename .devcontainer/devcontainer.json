@@ -1,0 +1,20 @@
+{
+  "name": "mgb-ops",
+  "build": {
+    "dockerfile": "Dockerfile",
+    "context": ".."
+  },
+  "workspaceFolder": "/workspace",
+  "workspaceMount": "source=${localWorkspaceFolder},target=/workspace,type=bind",
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "openai.chatgpt",
+        "ms-python.python",
+        "ms-toolsai.jupyter",
+        "zknpr.sqlite-explorer"
+      ]
+    }
+  },
+  "postCreateCommand": "python -m pip install -e ."
+}
