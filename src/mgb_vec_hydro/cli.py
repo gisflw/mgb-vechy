@@ -36,6 +36,8 @@ def main() -> None:
     default=DEFAULT_STRAHLER_ORDER_COL,
     show_default=True,
 )
+@click.option("--source-crs")
+@click.option("--destine-crs", required=True)
 @click.option(
     "--output-dir",
     type=click.Path(file_okay=False, path_type=Path),
@@ -49,6 +51,8 @@ def define_roi_command(
     id_col: str,
     id_down_col: str,
     strahler_order_col: str,
+    source_crs: str | None,
+    destine_crs: str,
     output_dir: Path,
     output_format: str,
 ) -> None:
@@ -64,6 +68,8 @@ def define_roi_command(
             catchments,
             segments,
             outlet_ids=coerced_outlet_ids,
+            destine_crs=destine_crs,
+            source_crs=source_crs,
             id_col=id_col,
             id_down_col=id_down_col,
             strahler_order_col=strahler_order_col,

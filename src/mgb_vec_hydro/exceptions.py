@@ -6,6 +6,10 @@ class MissingColumnsError(MgbVecHydroError):
     """Raised when an input table does not contain required columns."""
 
 
+class MissingCrsError(MgbVecHydroError):
+    """Raised when an input layer has no CRS for geometry measurements."""
+
+
 class DuplicateSegmentIdError(MgbVecHydroError):
     """Raised when segment IDs are duplicated in a topology table."""
 

@@ -31,8 +31,10 @@ def test_carinhanha_roi_matches_reference_properties():
         catchments,
         segments,
         outlet_ids=OUTLET_SEGMENT_IDS,
+        destine_crs="ESRI:102033",
         id_col="cotrecho",
         id_down_col="nutrjus",
+        strahler_order_col="nustrahler",
     )
 
     assert len(roi.segments) == len(expected_segments)
@@ -40,8 +42,8 @@ def test_carinhanha_roi_matches_reference_properties():
     assert set(roi.segments["id"]) == set(expected_segments["cotrecho"])
     assert set(roi.catchments["id"]) == set(expected_catchments["cotrecho"])
     assert set(roi.segments["id_down"]) == set(expected_segments["nutrjus"])
-    assert roi.segments.crs == segments.crs
-    assert roi.catchments.crs == catchments.crs
+    assert roi.segments.crs == "ESRI:102033"
+    assert roi.catchments.crs == "ESRI:102033"
     assert dict(zip(roi.segments["id"], roi.segments["sub"])) == dict(
         zip(expected_segments["cotrecho"], expected_segments["sub"])
     )

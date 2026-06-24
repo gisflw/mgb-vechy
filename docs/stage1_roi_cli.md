@@ -15,6 +15,7 @@ mgb-vec-hydro define-roi \
   --id-col id \
   --id-down-col id_down \
   --strahler-order-col strahler_order \
+  --destine-crs ESRI:102033 \
   --output-dir output \
   --output-format fgb
 ```
@@ -27,11 +28,16 @@ Outputs are normalized to exactly these columns:
 - `id_down`
 - `sub`
 - `strahler_order`
+- `unit_length`
+- `upstream_length`
+- `unit_area`
+- `upstream_area`
 - `geometry`
 
 Both inputs must share the configured `--id-col`. The downstream topology column is read from the segment input and copied into both outputs.
 The Strahler order column is required on the segment input and copied into both outputs as `strahler_order`.
 Input column matching is case-insensitive, so `--id-col linkno` can match a source column named `LINKNO`.
+The command computes geometry metrics after resolving input CRS and transforming to `--destine-crs`, which is also the output CRS. If `--source-crs` is supplied, it overrides the CRS metadata on both input layers. If it is omitted, both input layers must already declare a CRS.
 
 ## Custom Schema
 
@@ -45,6 +51,7 @@ mgb-vec-hydro define-roi \
   --id-col cotrecho \
   --id-down-col nutrjus \
   --strahler-order-col ordem \
+  --destine-crs ESRI:102033 \
   --output-dir output \
   --output-format gpkg
 ```

@@ -19,6 +19,7 @@ mgb-vec-hydro define-roi \
   --outlet-id 123 \
   --id-col id \
   --id-down-col id_down \
+  --destine-crs ESRI:102033 \
   --output-dir output \
   --output-format fgb
 ```
