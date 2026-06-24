@@ -15,7 +15,7 @@ The CLI should support three main workflow stages:
 3. Generate MGB output files:
    - `MINI.gtp`
    - `COTA_AREA.flp`
-   - `minis_mgb.shp` or `minis_mgb.gpkg`
+   - `minis_mgb.fgb`
    - intermediate ROI and aggregated vector outputs.
 
 ## Source Context

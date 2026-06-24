@@ -1,10 +1,10 @@
 # legacy files
 legacy/*
 
-# data files
-data/*
+# scratch files
+scratch/*
 
-AGENTS.md
+tests/carinhanha/*
 
 __pycache__/
 .venv/
