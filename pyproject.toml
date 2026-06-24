@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "mgb-vec-hydro"
 version = "0.1.0"
 description = "Vector hydrography preprocessing tools for MGB model inputs"
-readme = "docs/refactor_goal.md"
+readme = "README.md"
 requires-python = ">=3.11"
 license = { file = "LICENSE" }
 authors = [

@@ -42,7 +42,7 @@ mgb-vec-hydro define-roi \
   --id-col cotrecho \
   --id-down-col nutrjus \
   --output-dir output \
-  --output-format shp
+  --output-format gpkg
 ```
 
 Outputs use legacy Stage 1 names:

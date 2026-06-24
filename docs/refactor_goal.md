@@ -2,11 +2,11 @@
 
 Standalone Python package and command-line interface for preprocessing MGB model inputs from vector hydrographic/catchment networks with topological attributes.
 
-This repository is the computational core only. It must not import QGIS, PyQt, or QGIS Processing. A separate repository will wrap this package as a QGIS plugin.
+This repository is the computational core only. It must not import QGIS, PyQt, or QGIS Processing, and it does not carry a QGIS integration roadmap. The target product is a reusable Python library with a CLI.
 
 ## Goal
 
-Extract the BHO2MGB workflow from the old QGIS plugin into a reproducible Python package with a CLI, while generalizing the implementation to work with any vector hydrographic network that exposes explicit segment and downstream topology columns.
+Extract the BHO2MGB workflow from the old QGIS plugin into a reproducible standalone Python package with a CLI, while generalizing the implementation to work with any vector hydrographic network that exposes explicit segment and downstream topology columns.
 
 The CLI should support three main workflow stages:
 
@@ -43,7 +43,7 @@ The package core must not depend on:
 - `QApplication`
 - QGIS project/layer/task APIs
 
-Any QGIS-specific code belongs in the future QGIS plugin repo.
+QGIS integration is out of scope for this repository.
 
 ## Generic Network Data Model
 
@@ -109,8 +109,8 @@ Old functions:
 
 Outputs:
 
-- `roi_areas.shp`: ROI catchments; keep this legacy name for regression compatibility.
-- `roi_trecs.shp`: ROI segments/streams; keep this legacy name for regression compatibility.
+- `roi_areas.fgb` or `roi_areas.gpkg`: ROI catchments; keep the base name for regression compatibility.
+- `roi_trecs.fgb` or `roi_trecs.gpkg`: ROI segments/streams; keep the base name for regression compatibility.
 
 ### Step 2: Mini-basin aggregation
 
@@ -129,9 +129,9 @@ Old functions:
 
 Outputs:
 
-- `mtrecs.shp`: aggregated stream/segment network.
-- `mareas.shp`: aggregated catchments.
-- `bho2mini.shp`: legacy regression output name.
+- `mtrecs.fgb` or `mtrecs.gpkg`: aggregated stream/segment network.
+- `mareas.fgb` or `mareas.gpkg`: aggregated catchments.
+- `bho2mini.fgb` or `bho2mini.gpkg`: legacy regression base name.
 
 ### Step 3: MGB files
 
@@ -169,7 +169,7 @@ Outputs:
 - `ltnd.tif`
 - `MINI.gtp`
 - `COTA_AREA.flp`
-- `minis_mgb.shp`
+- `minis_mgb.fgb` or `minis_mgb.gpkg`
 
 ## Proposed Package Structure
 
@@ -232,13 +232,13 @@ build-mini \
 run-all ...
 ```
 
-BHO users should pass BHO column names explicitly, as shown above, or use a future `--schema bho` preset. Keep output names like `roi_areas`, `roi_trecs`, `mtrecs`, and `mareas` for now to preserve old regression comparisons, but describe them as generic catchment and segment products in new code and documentation.
+BHO users should pass BHO column names explicitly, as shown above, or use a future `--schema bho` preset. Keep output base names like `roi_areas`, `roi_trecs`, `mtrecs`, and `mareas` for now to preserve old regression comparisons, but describe them as generic catchment and segment products in new code and documentation.
 
 ## Dependency Direction
 
 Keep `pandas` for now. It is central to the existing algorithm.
 
-First priority is removing QGIS/PyQt from the computational core.
+First priority is keeping the computational core independent from QGIS/PyQt and usable as a normal Python package.
 
 Likely package dependencies:
 
@@ -253,15 +253,15 @@ Likely package dependencies:
 - `click` or `typer`
 - `rich`, optional, for CLI progress/logging
 
-GDAL binary installation is the main packaging risk. Prefer conda-forge as the first supported installation path unless PyPI wheels prove reliable enough.
+User installation packaging is deferred. Development can use an isolated local environment while the library and CLI stabilize.
 
 ## Compatibility Problems To Fix
 
 - Remove all `os.chdir` usage.
 - Replace hardcoded `output\\` paths with `pathlib.Path`.
 - Replace deprecated `DataFrame.append`.
-- Stop writing temporary shapefiles into the current working directory.
-- Avoid Shapefile as the default internal format; prefer FGB.
+- Stop writing temporary vector files into the current working directory.
+- Avoid Shapefile in new workflow outputs; prefer FlatGeobuf and GeoPackage.
 - Make CRS handling explicit.
 - Validate required input fields and topology columns before running.
 - Replace BHO-specific upstream traversal with configurable topology traversal.
@@ -295,7 +295,3 @@ Required future tests:
 - Null or empty downstream sink values.
 - Cycle detection.
 - Missing topology columns.
-
-## Open Decisions
-
-- Should the future QGIS plugin call this package inside QGIS Python, or shell out to an external CLI environment?
