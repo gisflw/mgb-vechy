@@ -14,6 +14,9 @@ from mgb_vec_hydro.topology import (
 )
 
 
+DEFAULT_STRAHLER_ORDER_COL = "strahler_order"
+
+
 @dataclass(frozen=True)
 class RoiResult:
     """ROI catchments and segments produced by Stage 1."""
@@ -29,11 +32,13 @@ def define_roi(
     outlet_ids: Iterable[Hashable],
     id_col: str = DEFAULT_ID_COL,
     id_down_col: str = DEFAULT_ID_DOWN_COL,
+    strahler_order_col: str = DEFAULT_STRAHLER_ORDER_COL,
 ) -> RoiResult:
     """Select ROI catchments and segments upstream of ordered outlets."""
 
     segment_id_col = resolve_column_name(segments, id_col)
     segment_id_down_col = resolve_column_name(segments, id_down_col)
+    segment_strahler_order_col = resolve_column_name(segments, strahler_order_col)
     catchment_id_col = resolve_column_name(catchments, id_col)
 
     outlet_list = list(outlet_ids)
@@ -62,12 +67,14 @@ def define_roi(
         catchments[catchment_id_col].isin(selected_ids)
     ].copy()
     id_down_by_id = segments.set_index(segment_id_col)[segment_id_down_col]
+    strahler_order_by_id = segments.set_index(segment_id_col)[segment_strahler_order_col]
 
     normalized_segments = gpd.GeoDataFrame(
         {
             "id": roi_segments[segment_id_col].to_numpy(),
             "id_down": roi_segments[segment_id_down_col].to_numpy(),
             "sub": segment_sub.loc[roi_segments.index].to_numpy(),
+            "strahler_order": roi_segments[segment_strahler_order_col].to_numpy(),
         },
         geometry=roi_segments.geometry.to_numpy(),
         crs=roi_segments.crs,
@@ -78,6 +85,9 @@ def define_roi(
             "id": roi_catchments[catchment_id_col].to_numpy(),
             "id_down": roi_catchments[catchment_id_col].map(id_down_by_id).to_numpy(),
             "sub": catchment_sub.loc[roi_catchments.index].to_numpy(),
+            "strahler_order": roi_catchments[catchment_id_col]
+            .map(strahler_order_by_id)
+            .to_numpy(),
         },
         geometry=roi_catchments.geometry.to_numpy(),
         crs=roi_catchments.crs,

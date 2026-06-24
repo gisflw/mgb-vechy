@@ -6,7 +6,7 @@ import click
 
 from mgb_vec_hydro.exceptions import MgbVecHydroError
 from mgb_vec_hydro.io import output_paths, read_vector, write_vector
-from mgb_vec_hydro.roi import define_roi
+from mgb_vec_hydro.roi import DEFAULT_STRAHLER_ORDER_COL, define_roi
 from mgb_vec_hydro.topology import resolve_column_name
 
 
@@ -32,6 +32,11 @@ def main() -> None:
 @click.option("--id-col", default="id", show_default=True)
 @click.option("--id-down-col", default="id_down", show_default=True)
 @click.option(
+    "--strahler-order-col",
+    default=DEFAULT_STRAHLER_ORDER_COL,
+    show_default=True,
+)
+@click.option(
     "--output-dir",
     type=click.Path(file_okay=False, path_type=Path),
     required=True,
@@ -43,6 +48,7 @@ def define_roi_command(
     outlet_ids: tuple[str, ...],
     id_col: str,
     id_down_col: str,
+    strahler_order_col: str,
     output_dir: Path,
     output_format: str,
 ) -> None:
@@ -60,6 +66,7 @@ def define_roi_command(
             outlet_ids=coerced_outlet_ids,
             id_col=id_col,
             id_down_col=id_down_col,
+            strahler_order_col=strahler_order_col,
         )
         write_vector(roi.catchments, paths.catchments, output_format=output_format)
         write_vector(roi.segments, paths.segments, output_format=output_format)

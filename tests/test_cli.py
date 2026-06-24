@@ -26,6 +26,7 @@ def test_define_roi_cli_writes_outputs(tmp_path):
             "id": [1, 2],
             "id_down": [None, 1],
             "source_length": [1.0, 2.0],
+            "strahler_order": [2, 1],
             "geometry": [
                 LineString([(0, 0), (1, 0)]),
                 LineString([(1, 0), (2, 0)]),
@@ -59,8 +60,11 @@ def test_define_roi_cli_writes_outputs(tmp_path):
 
     roi_areas = gpd.read_file(output_dir / "roi_areas.gpkg")
     roi_trecs = gpd.read_file(output_dir / "roi_trecs.gpkg")
-    assert list(roi_areas.columns) == ["id", "id_down", "sub", "geometry"]
-    assert list(roi_trecs.columns) == ["id", "id_down", "sub", "geometry"]
+    expected_columns = ["id", "id_down", "sub", "strahler_order", "geometry"]
+    assert list(roi_areas.columns) == expected_columns
+    assert list(roi_trecs.columns) == expected_columns
+    assert list(roi_areas["strahler_order"]) == [2, 1]
+    assert list(roi_trecs["strahler_order"]) == [2, 1]
 
 
 def test_define_roi_cli_reports_package_errors(tmp_path):
@@ -77,6 +81,7 @@ def test_define_roi_cli_reports_package_errors(tmp_path):
         {
             "id": [1],
             "id_down": [None],
+            "strahler_order": [1],
             "geometry": [LineString([(0, 0), (1, 0)])],
         },
         crs="EPSG:4326",
@@ -124,6 +129,7 @@ def test_define_roi_cli_accepts_custom_id_columns(tmp_path):
         {
             "cotrecho": [10, 20],
             "nutrjus": [None, 10],
+            "ordem": [2, 1],
             "geometry": [
                 LineString([(0, 0), (1, 0)]),
                 LineString([(1, 0), (2, 0)]),
@@ -148,6 +154,8 @@ def test_define_roi_cli_accepts_custom_id_columns(tmp_path):
             "cotrecho",
             "--id-down-col",
             "nutrjus",
+            "--strahler-order-col",
+            "ordem",
             "--output-dir",
             str(output_dir),
             "--output-format",
@@ -158,10 +166,13 @@ def test_define_roi_cli_accepts_custom_id_columns(tmp_path):
     assert result.exit_code == 0, result.output
     roi_areas = gpd.read_file(output_dir / "roi_areas.gpkg")
     roi_trecs = gpd.read_file(output_dir / "roi_trecs.gpkg")
-    assert list(roi_areas.columns) == ["id", "id_down", "sub", "geometry"]
-    assert list(roi_trecs.columns) == ["id", "id_down", "sub", "geometry"]
+    expected_columns = ["id", "id_down", "sub", "strahler_order", "geometry"]
+    assert list(roi_areas.columns) == expected_columns
+    assert list(roi_trecs.columns) == expected_columns
     assert list(roi_areas["id"]) == [10, 20]
     assert list(roi_trecs["id"]) == [10, 20]
+    assert list(roi_areas["strahler_order"]) == [2, 1]
+    assert list(roi_trecs["strahler_order"]) == [2, 1]
 
 
 def test_define_roi_cli_resolves_input_columns_case_insensitively(tmp_path):
@@ -183,6 +194,7 @@ def test_define_roi_cli_resolves_input_columns_case_insensitively(tmp_path):
         {
             "LINKNO": [10, 20],
             "DSLINKNO": [None, 10],
+            "STRAHLER_ORDER": [2, 1],
             "geometry": [
                 LineString([(0, 0), (1, 0)]),
                 LineString([(1, 0), (2, 0)]),
@@ -217,8 +229,10 @@ def test_define_roi_cli_resolves_input_columns_case_insensitively(tmp_path):
     assert result.exit_code == 0, result.output
     roi_areas = gpd.read_file(output_dir / "roi_areas.gpkg")
     roi_trecs = gpd.read_file(output_dir / "roi_trecs.gpkg")
-    assert list(roi_areas.columns) == ["id", "id_down", "sub", "geometry"]
-    assert list(roi_trecs.columns) == ["id", "id_down", "sub", "geometry"]
+    expected_columns = ["id", "id_down", "sub", "strahler_order", "geometry"]
+    assert list(roi_areas.columns) == expected_columns
+    assert list(roi_trecs.columns) == expected_columns
     assert list(roi_areas["id"]) == [10, 20]
     assert roi_trecs["id_down"].isna().iloc[0]
     assert roi_trecs["id_down"].iloc[1] == 10
+    assert list(roi_trecs["strahler_order"]) == [2, 1]

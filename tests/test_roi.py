@@ -12,6 +12,7 @@ def _segments_gdf():
             "id": [1, 2, 3, 4, 5, 6],
             "id_down": [None, 1, 2, 1, 4, None],
             "length": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+            "strahler_order": [3, 2, 1, 2, 1, 1],
             "geometry": [
                 LineString([(0, 0), (1, 0)]),
                 LineString([(1, 0), (2, 0)]),
@@ -50,16 +51,29 @@ def test_define_roi_returns_union_of_upstream_segments_and_catchments():
     assert set(roi.catchments["id"]) == {2, 3, 4, 5}
 
 
-def test_define_roi_outputs_normalized_columns_only():
+def test_define_roi_outputs_normalized_columns_with_strahler_order():
     roi = define_roi(_catchments_gdf(), _segments_gdf(), outlet_ids=[2, 4])
 
-    assert list(roi.segments.columns) == ["id", "id_down", "sub", "geometry"]
-    assert list(roi.catchments.columns) == ["id", "id_down", "sub", "geometry"]
+    expected_columns = ["id", "id_down", "sub", "strahler_order", "geometry"]
+    assert list(roi.segments.columns) == expected_columns
+    assert list(roi.catchments.columns) == expected_columns
     assert dict(zip(roi.catchments["id"], roi.catchments["id_down"])) == {
         2: 1,
         3: 2,
         4: 1,
         5: 4,
+    }
+    assert dict(zip(roi.segments["id"], roi.segments["strahler_order"])) == {
+        2: 2,
+        3: 1,
+        4: 2,
+        5: 1,
+    }
+    assert dict(zip(roi.catchments["id"], roi.catchments["strahler_order"])) == {
+        2: 2,
+        3: 1,
+        4: 2,
+        5: 1,
     }
 
 
@@ -87,6 +101,7 @@ def test_define_roi_supports_custom_input_column_names_with_normalized_output():
             "cotrecho": [10, 20, 30],
             "nutrjus": [None, 10, 20],
             "legacy_attr": ["x", "y", "z"],
+            "stream_order": [3, 2, 1],
             "geometry": [
                 LineString([(0, 0), (1, 0)]),
                 LineString([(1, 0), (2, 0)]),
@@ -114,16 +129,20 @@ def test_define_roi_supports_custom_input_column_names_with_normalized_output():
         outlet_ids=[20],
         id_col="cotrecho",
         id_down_col="nutrjus",
+        strahler_order_col="stream_order",
     )
 
-    assert list(roi.segments.columns) == ["id", "id_down", "sub", "geometry"]
-    assert list(roi.catchments.columns) == ["id", "id_down", "sub", "geometry"]
+    expected_columns = ["id", "id_down", "sub", "strahler_order", "geometry"]
+    assert list(roi.segments.columns) == expected_columns
+    assert list(roi.catchments.columns) == expected_columns
     assert list(roi.segments["id"]) == [20, 30]
     assert list(roi.catchments["id"]) == [20, 30]
     assert list(roi.segments["id_down"]) == [10, 20]
     assert list(roi.catchments["id_down"]) == [10, 20]
     assert list(roi.segments["sub"]) == [1, 1]
     assert list(roi.catchments["sub"]) == [1, 1]
+    assert list(roi.segments["strahler_order"]) == [2, 1]
+    assert list(roi.catchments["strahler_order"]) == [2, 1]
 
 
 def test_define_roi_resolves_input_columns_case_insensitively():
@@ -131,6 +150,7 @@ def test_define_roi_resolves_input_columns_case_insensitively():
         {
             "LINKNO": [10, 20, 30],
             "DSLINKNO": [None, 10, 20],
+            "STRAHLER_ORDER": [3, 2, 1],
             "geometry": [
                 LineString([(0, 0), (1, 0)]),
                 LineString([(1, 0), (2, 0)]),
@@ -159,11 +179,13 @@ def test_define_roi_resolves_input_columns_case_insensitively():
         id_down_col="dslinkno",
     )
 
-    assert list(roi.segments.columns) == ["id", "id_down", "sub", "geometry"]
-    assert list(roi.catchments.columns) == ["id", "id_down", "sub", "geometry"]
+    expected_columns = ["id", "id_down", "sub", "strahler_order", "geometry"]
+    assert list(roi.segments.columns) == expected_columns
+    assert list(roi.catchments.columns) == expected_columns
     assert list(roi.segments["id"]) == [20, 30]
     assert list(roi.catchments["id"]) == [20, 30]
     assert list(roi.catchments["id_down"]) == [10, 20]
+    assert list(roi.catchments["strahler_order"]) == [2, 1]
 
 
 def test_define_roi_requires_shared_id_column_on_catchments():
@@ -171,3 +193,10 @@ def test_define_roi_requires_shared_id_column_on_catchments():
 
     with pytest.raises(MissingColumnsError, match="id"):
         define_roi(catchments, _segments_gdf(), outlet_ids=[2])
+
+
+def test_define_roi_requires_strahler_order_column_on_segments():
+    segments = _segments_gdf().drop(columns=["strahler_order"])
+
+    with pytest.raises(MissingColumnsError, match="strahler_order"):
+        define_roi(_catchments_gdf(), segments, outlet_ids=[2])

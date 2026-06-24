@@ -14,6 +14,7 @@ mgb-vec-hydro define-roi \
   --outlet-id 456 \
   --id-col id \
   --id-down-col id_down \
+  --strahler-order-col strahler_order \
   --output-dir output \
   --output-format fgb
 ```
@@ -25,9 +26,11 @@ Outputs are normalized to exactly these columns:
 - `id`
 - `id_down`
 - `sub`
+- `strahler_order`
 - `geometry`
 
 Both inputs must share the configured `--id-col`. The downstream topology column is read from the segment input and copied into both outputs.
+The Strahler order column is required on the segment input and copied into both outputs as `strahler_order`.
 Input column matching is case-insensitive, so `--id-col linkno` can match a source column named `LINKNO`.
 
 ## Custom Schema
@@ -41,6 +44,7 @@ mgb-vec-hydro define-roi \
   --outlet-id 159713 \
   --id-col cotrecho \
   --id-down-col nutrjus \
+  --strahler-order-col ordem \
   --output-dir output \
   --output-format gpkg
 ```
