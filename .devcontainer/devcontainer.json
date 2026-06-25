@@ -1,11 +1,16 @@
 {
-  "name": "mgb-ops",
+  "name": "mgb-vechy",
   "build": {
     "dockerfile": "Dockerfile",
     "context": ".."
   },
+  "remoteUser": "rafbar",
+  "containerUser": "rafbar",
   "workspaceFolder": "/workspace",
   "workspaceMount": "source=${localWorkspaceFolder},target=/workspace,type=bind",
+  "remoteEnv": {
+    "PATH": "/home/rafbar/.local/bin:${containerEnv:PATH}"
+  },
   "customizations": {
     "vscode": {
       "extensions": [
