@@ -113,8 +113,8 @@ def test_confluence_continuing_domain_uses_greatest_upstream_area():
     )
 
     mapping = dict(zip(result.mapping["id"], result.mapping["mini_id"]))
-    assert mapping[2] == 1
-    assert mapping[4] == 1
+    assert mapping[2] == 2
+    assert mapping[4] == 4
     assert mapping[3] == 3
     water_course = dict(zip(result.segments["id"], result.segments["water_course"]))
     assert water_course[1] == 1
@@ -129,13 +129,84 @@ def test_cocursodag_column_is_not_required():
     assert "cocursodag" not in segments.columns
 
 
-def test_short_chain_merges_into_greatest_upstream_area_adjacent_group():
+def test_short_chain_merges_into_smallest_unit_length_adjacent_group():
     catchments, segments = _input_fixture(
         ids=(1, 2, 3),
         id_down=(None, 1, 2),
-        sub=(1, 2, 3),
-        unit_length=(3.0, 0.5, 3.0),
+        sub=(1, 1, 1),
+        unit_length=(3.0, 0.5, 2.0),
         upstream_area=(10.0, 8.0, 6.0),
+        water_course=(1, 1, 1),
+    )
+
+    result = aggregate_minibasins(
+        catchments,
+        segments,
+        uparea_min=0,
+        lmin=1.0,
+    )
+
+    mapping = dict(zip(result.mapping["id"], result.mapping["mini_id"]))
+    assert mapping[2] == 3
+    assert mapping[3] == 3
+
+
+def test_short_segments_do_not_merge_across_sub_or_water_course():
+    catchments, segments = _input_fixture(
+        ids=(1, 2, 3, 4),
+        id_down=(None, 1, 2, 1),
+        sub=(1, 1, 1, 2),
+        unit_length=(3.0, 0.5, 3.0, 3.0),
+        upstream_area=(10.0, 8.0, 6.0, 5.0),
+        water_course=(1, 2, 1, 2),
+    )
+
+    result = aggregate_minibasins(
+        catchments,
+        segments,
+        uparea_min=0,
+        lmin=1.0,
+    )
+
+    mapping = dict(zip(result.mapping["id"], result.mapping["mini_id"]))
+    assert mapping[2] == 2
+    assert mapping[3] == 3
+    assert mapping[4] == 4
+
+
+def test_segments_below_uparea_min_are_merged_but_not_output_minis():
+    catchments, segments = _input_fixture(
+        ids=(1, 2, 3),
+        id_down=(None, 1, 2),
+        sub=(1, 1, 1),
+        unit_length=(5.0, 1.0, 4.0),
+        upstream_area=(10.0, 2.0, 8.0),
+        water_course=(1, 1, 1),
+    )
+
+    result = aggregate_minibasins(
+        catchments,
+        segments,
+        uparea_min=5.0,
+        lmin=0,
+    )
+
+    mapping = dict(zip(result.mapping["id"], result.mapping["mini_id"]))
+    assert 2 not in set(result.segments["id"])
+    assert mapping[2] == 3
+    assert result.catchments["unit_area"].sum() == pytest.approx(
+        catchments["unit_area"].sum()
+    )
+
+
+def test_lmin_uses_evolving_aggregated_length_until_threshold_is_met():
+    catchments, segments = _input_fixture(
+        ids=(1, 2, 3),
+        id_down=(None, 1, 2),
+        sub=(1, 1, 1),
+        unit_length=(5.0, 0.4, 0.4),
+        upstream_area=(10.0, 8.0, 6.0),
+        water_course=(1, 1, 1),
     )
 
     result = aggregate_minibasins(
@@ -147,7 +218,10 @@ def test_short_chain_merges_into_greatest_upstream_area_adjacent_group():
 
     mapping = dict(zip(result.mapping["id"], result.mapping["mini_id"]))
     assert mapping[2] == 1
-    assert mapping[3] == 3
+    assert mapping[3] == 1
+    assert result.segments.loc[result.segments["id"] == 1, "unit_length"].iloc[
+        0
+    ] == pytest.approx(5.8)
 
 
 def test_catchments_are_assigned_once():

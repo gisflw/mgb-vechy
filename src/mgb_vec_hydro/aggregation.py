@@ -59,10 +59,17 @@ def aggregate_minibasins(
         segments[["id", "id_down"]].itertuples(index=False, name=None)
     )
     upstream_by_downstream = _build_reverse_adjacency(segments)
-    downstream_order = _downstream_to_upstream_order(segments, downstream_by_id)
-    domain_by_id = _domain_ids(segments, downstream_order, upstream_by_downstream)
-    mini_by_segment = _initial_candidate_groups(segments, domain_by_id, uparea_min)
-    mini_by_segment = _merge_short_groups(segments, mini_by_segment, lmin)
+    _downstream_to_upstream_order(segments, downstream_by_id)
+    domain_by_id = _aggregation_domain_ids(segments)
+    mini_by_segment = _initial_candidate_groups(segments, uparea_min)
+    mini_by_segment = _assign_remaining_segments(
+        segments,
+        downstream_by_id,
+        upstream_by_downstream,
+        mini_by_segment,
+        domain_by_id,
+    )
+    mini_by_segment = _merge_short_groups(segments, mini_by_segment, domain_by_id, lmin)
     mini_by_segment = _assign_remaining_segments(
         segments,
         downstream_by_id,
@@ -202,58 +209,32 @@ def _downstream_to_upstream_order(
     return list(reversed(upstream_to_downstream))
 
 
-def _domain_ids(
+def _aggregation_domain_ids(
     segments: gpd.GeoDataFrame,
-    downstream_order: list[Hashable],
-    upstream_by_downstream: dict[Hashable, list[Hashable]],
-) -> dict[Hashable, Hashable]:
-    attrs = segments.set_index("id")[["upstream_area", "unit_length"]]
-    domain_by_id: dict[Hashable, Hashable] = {}
-    for segment_id in downstream_order:
-        domain_by_id.setdefault(segment_id, segment_id)
-        children = upstream_by_downstream.get(segment_id, [])
-        if not children:
-            continue
-
-        main_child = max(
-            children,
-            key=lambda child: (
-                attrs.at[child, "upstream_area"],
-                attrs.at[child, "unit_length"],
-                str(child),
-            ),
-        )
-        for child in children:
-            if child == main_child:
-                domain_by_id[child] = domain_by_id[segment_id]
-            else:
-                domain_by_id[child] = child
-
-    return domain_by_id
+) -> dict[Hashable, tuple[Hashable, Hashable]]:
+    return {
+        segment_id: (sub, water_course)
+        for segment_id, sub, water_course in segments[
+            ["id", "sub", "water_course"]
+        ].itertuples(index=False, name=None)
+    }
 
 
 def _initial_candidate_groups(
     segments: gpd.GeoDataFrame,
-    domain_by_id: dict[Hashable, Hashable],
     uparea_min: float,
 ) -> dict[Hashable, Hashable]:
-    candidate_segments = segments.loc[segments["upstream_area"] > uparea_min].copy()
+    candidate_segments = segments.loc[segments["upstream_area"] >= uparea_min]
     mini_by_segment: dict[Hashable, Hashable] = {}
-    if candidate_segments.empty:
-        return mini_by_segment
-
-    candidate_segments["domain"] = candidate_segments["id"].map(domain_by_id)
-    for _, group in candidate_segments.groupby(["sub", "domain"], sort=False):
-        representative_id = _representative_id(group)
-        for segment_id in group["id"]:
-            mini_by_segment[segment_id] = representative_id
-
+    for segment_id in candidate_segments["id"]:
+        mini_by_segment[segment_id] = segment_id
     return mini_by_segment
 
 
 def _merge_short_groups(
     segments: gpd.GeoDataFrame,
     mini_by_segment: dict[Hashable, Hashable],
+    domain_by_id: dict[Hashable, tuple[Hashable, Hashable]],
     lmin: float,
 ) -> dict[Hashable, Hashable]:
     if not mini_by_segment:
@@ -263,14 +244,14 @@ def _merge_short_groups(
         segments[["id", "id_down"]].itertuples(index=False, name=None)
     )
     upstream_by_downstream = _build_reverse_adjacency(segments)
-    attrs = segments.set_index("id")[["unit_length", "upstream_area"]]
+    unit_length = segments.set_index("id")["unit_length"]
 
     changed = True
     while changed:
         changed = False
         groups = _groups_from_assignment(mini_by_segment)
         lengths = {
-            mini_id: float(attrs.loc[list(member_ids), "unit_length"].sum())
+            mini_id: float(unit_length.loc[list(member_ids)].sum())
             for mini_id, member_ids in groups.items()
         }
         short_ids = sorted(
@@ -287,7 +268,8 @@ def _merge_short_groups(
                 mini_by_segment,
                 downstream_by_id,
                 upstream_by_downstream,
-                attrs["upstream_area"],
+                domain_by_id,
+                lengths,
             )
             if target is None:
                 continue
@@ -304,7 +286,7 @@ def _assign_remaining_segments(
     downstream_by_id: dict[Hashable, Hashable],
     upstream_by_downstream: dict[Hashable, list[Hashable]],
     mini_by_segment: dict[Hashable, Hashable],
-    domain_by_id: dict[Hashable, Hashable],
+    domain_by_id: dict[Hashable, tuple[Hashable, Hashable]],
 ) -> dict[Hashable, Hashable]:
     ids = set(segments["id"].tolist())
     if not mini_by_segment:
@@ -318,23 +300,24 @@ def _assign_remaining_segments(
         return mini_by_segment
 
     pending = ids - set(mini_by_segment)
-    upstream_area_by_id = segments.set_index("id")["upstream_area"]
+    unit_length = segments.set_index("id")["unit_length"]
     while pending:
         progressed = False
+        groups = _groups_from_assignment(mini_by_segment)
+        lengths = {
+            mini_id: float(unit_length.loc[list(member_ids)].sum())
+            for mini_id, member_ids in groups.items()
+        }
         for segment_id in sorted(pending, key=_stable_key):
-            target = _nearest_downstream_mini(
-                segment_id,
-                downstream_by_id,
+            target = _best_adjacent_group(
+                {segment_id},
+                None,
                 mini_by_segment,
-                ids,
+                downstream_by_id,
+                upstream_by_downstream,
+                domain_by_id,
+                lengths,
             )
-            if target is None:
-                target = _nearest_upstream_mini(
-                    segment_id,
-                    upstream_by_downstream,
-                    mini_by_segment,
-                    upstream_area_by_id,
-                )
             if target is None:
                 continue
             mini_by_segment[segment_id] = target
@@ -355,17 +338,21 @@ def _assign_remaining_segments(
 
 def _best_adjacent_group(
     members: set[Hashable],
-    mini_id: Hashable,
+    mini_id: Hashable | None,
     mini_by_segment: dict[Hashable, Hashable],
     downstream_by_id: dict[Hashable, Hashable],
     upstream_by_downstream: dict[Hashable, list[Hashable]],
-    upstream_area: pd.Series,
+    domain_by_id: dict[Hashable, tuple[Hashable, Hashable]],
+    lengths: dict[Hashable, float],
 ) -> Hashable | None:
     candidates: set[Hashable] = set()
     all_ids = set(downstream_by_id)
+    member_domain = domain_by_id[next(iter(members))]
     for segment_id in members:
         downstream_id = downstream_by_id.get(segment_id)
         while downstream_id in all_ids:
+            if domain_by_id[downstream_id] != member_domain:
+                break
             downstream_mini = mini_by_segment.get(downstream_id)
             if downstream_mini is not None and downstream_mini != mini_id:
                 candidates.add(downstream_mini)
@@ -379,6 +366,8 @@ def _best_adjacent_group(
             if upstream_id in seen:
                 continue
             seen.add(upstream_id)
+            if domain_by_id[upstream_id] != member_domain:
+                continue
             upstream_mini = mini_by_segment.get(upstream_id)
             if upstream_mini is not None and upstream_mini != mini_id:
                 candidates.add(upstream_mini)
@@ -387,49 +376,10 @@ def _best_adjacent_group(
 
     if not candidates:
         return None
-    return max(
+    return min(
         candidates,
-        key=lambda candidate: (upstream_area.at[candidate], str(candidate)),
+        key=lambda candidate: (lengths[candidate], str(candidate)),
     )
-
-
-def _nearest_downstream_mini(
-    segment_id: Hashable,
-    downstream_by_id: dict[Hashable, Hashable],
-    mini_by_segment: dict[Hashable, Hashable],
-    ids: set[Hashable],
-) -> Hashable | None:
-    downstream_id = downstream_by_id.get(segment_id)
-    seen = {segment_id}
-    while downstream_id in ids and downstream_id not in seen:
-        if downstream_id in mini_by_segment:
-            return mini_by_segment[downstream_id]
-        seen.add(downstream_id)
-        downstream_id = downstream_by_id.get(downstream_id)
-    return None
-
-
-def _nearest_upstream_mini(
-    segment_id: Hashable,
-    upstream_by_downstream: dict[Hashable, list[Hashable]],
-    mini_by_segment: dict[Hashable, Hashable],
-    upstream_area: pd.Series,
-) -> Hashable | None:
-    stack = list(upstream_by_downstream.get(segment_id, []))
-    seen: set[Hashable] = set()
-    candidates: set[Hashable] = set()
-    while stack:
-        upstream_id = stack.pop()
-        if upstream_id in seen:
-            continue
-        seen.add(upstream_id)
-        if upstream_id in mini_by_segment:
-            candidates.add(mini_by_segment[upstream_id])
-            continue
-        stack.extend(upstream_by_downstream.get(upstream_id, []))
-    if not candidates:
-        return None
-    return max(candidates, key=lambda value: (upstream_area.at[value], str(value)))
 
 
 def _unassigned_component(

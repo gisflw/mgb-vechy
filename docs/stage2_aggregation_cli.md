@@ -16,7 +16,7 @@ mgb-vec-hydro aggregate \
   --output-format fgb
 ```
 
-At confluences, the continuing path is the upstream segment with the greatest `upstream_area`. Ties are resolved by larger `unit_length`, then by the stable string form of `id`.
+Aggregation is constrained to segments in the same `sub` and `water_course` domain.
 
 ## Input Schema
 
@@ -39,9 +39,9 @@ Inputs with missing, extra, or reordered columns are rejected before topology or
 
 ## Aggregation Parameters
 
-`--uparea-min` selects candidate segments where `upstream_area > uparea_min`, grouped by `sub` and derived topology domain.
+`--uparea-min` excludes segments where `upstream_area < uparea_min` from becoming mini-basin anchors. Their catchments are still merged into adjacent mini-basins in the same `sub` and `water_course` domain when one is available. Segments exactly equal to `uparea_min` remain eligible.
 
-`--lmin` merges candidate chains shorter than the minimum length into an adjacent candidate group whose representative segment has the greatest `upstream_area`.
+`--lmin` iteratively merges current mini-basins whose aggregated `unit_length` is shorter than the minimum length. Each short mini-basin merges into an adjacent mini-basin in the same `sub` and `water_course` domain with the smallest current `unit_length`; ties use the stable string form of `id`.
 
 ## Outputs
 
