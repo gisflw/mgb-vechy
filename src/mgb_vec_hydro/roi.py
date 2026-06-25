@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import defaultdict
 from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Hashable
@@ -109,6 +110,12 @@ def define_roi(
         geometry=projected_roi_segments.geometry.to_numpy(),
         crs=projected_roi_segments.crs,
     )
+    segment_water_course = _water_course_by_segment(normalized_segments)
+    normalized_segments.insert(
+        len(normalized_segments.columns) - 1,
+        "water_course",
+        normalized_segments["id"].map(segment_water_course).to_numpy(),
+    )
 
     normalized_catchments = gpd.GeoDataFrame(
         {
@@ -122,6 +129,9 @@ def define_roi(
             "upstream_length": metric_columns["catchment_upstream_length"].to_numpy(),
             "unit_area": metric_columns["catchment_unit_area"].to_numpy(),
             "upstream_area": metric_columns["catchment_upstream_area"].to_numpy(),
+            "water_course": roi_catchments[catchment_id_col]
+            .map(segment_water_course)
+            .to_numpy(),
         },
         geometry=projected_roi_catchments.geometry.to_numpy(),
         crs=projected_roi_catchments.crs,
@@ -248,3 +258,65 @@ def _accumulate_upstream_metrics(
         pd.Series(upstream_length_by_id, dtype="float64"),
         pd.Series(upstream_area_by_id, dtype="float64"),
     )
+
+
+def _water_course_by_segment(segments: gpd.GeoDataFrame) -> dict[Hashable, Hashable]:
+    water_course_by_id: dict[Hashable, Hashable] = {}
+    for _, group in segments.groupby("sub", sort=False):
+        water_course_by_id.update(_water_course_by_sub(group))
+    return water_course_by_id
+
+
+def _water_course_by_sub(segments: gpd.GeoDataFrame) -> dict[Hashable, Hashable]:
+    ids = set(segments["id"].tolist())
+    downstream_by_id = dict(
+        segments[["id", "id_down"]].itertuples(index=False, name=None)
+    )
+    upstream_by_downstream: dict[Hashable, list[Hashable]] = defaultdict(list)
+    upstream_count_by_id = dict.fromkeys(ids, 0)
+    for segment_id, downstream_id in downstream_by_id.items():
+        if downstream_id in ids:
+            upstream_by_downstream[downstream_id].append(segment_id)
+            upstream_count_by_id[downstream_id] += 1
+
+    ready = [
+        segment_id
+        for segment_id, upstream_count in upstream_count_by_id.items()
+        if upstream_count == 0
+    ]
+    upstream_to_downstream: list[Hashable] = []
+    while ready:
+        segment_id = ready.pop()
+        upstream_to_downstream.append(segment_id)
+        downstream_id = downstream_by_id.get(segment_id)
+        if downstream_id in upstream_count_by_id:
+            upstream_count_by_id[downstream_id] -= 1
+            if upstream_count_by_id[downstream_id] == 0:
+                ready.append(downstream_id)
+
+    if len(upstream_to_downstream) != len(ids):
+        raise TopologyCycleError("Detected topology cycle while computing water_course")
+
+    attrs = segments.set_index("id")[["upstream_area", "unit_length"]]
+    water_course_by_id: dict[Hashable, Hashable] = {}
+    for segment_id in reversed(upstream_to_downstream):
+        water_course_by_id.setdefault(segment_id, segment_id)
+        children = upstream_by_downstream.get(segment_id, [])
+        if not children:
+            continue
+
+        main_child = max(
+            children,
+            key=lambda child: (
+                attrs.at[child, "upstream_area"],
+                attrs.at[child, "unit_length"],
+                str(child),
+            ),
+        )
+        for child in children:
+            if child == main_child:
+                water_course_by_id[child] = water_course_by_id[segment_id]
+            else:
+                water_course_by_id[child] = child
+
+    return water_course_by_id

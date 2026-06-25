@@ -1,6 +1,7 @@
 from pathlib import Path
 
 import geopandas as gpd
+import pandas as pd
 import pytest
 
 from mgb_vec_hydro.aggregation import INPUT_COLUMNS, aggregate_minibasins
@@ -69,6 +70,7 @@ def _legacy_roi_to_input(
         "unit_area": legacy_segments["nuareacont"].to_numpy(),
         "upstream_area": legacy_segments["nuareamont"].to_numpy(),
     }
+    common["water_course"] = _legacy_water_course(common)
     catchment_geometry = (
         legacy_catchments.set_index("cotrecho")
         .loc[legacy_segments["cotrecho"], "geometry"]
@@ -84,3 +86,47 @@ def _legacy_roi_to_input(
         crs=legacy_catchments.crs,
     )
     return roi_segments[INPUT_COLUMNS], roi_catchments[INPUT_COLUMNS]
+
+
+def _legacy_water_course(common: dict[str, object]) -> pd.Series:
+    segments = pd.DataFrame(common)
+    water_course_by_id = {}
+    for _, group in segments.groupby("sub", sort=False):
+        ids = set(group["id"].tolist())
+        downstream_by_id = dict(
+            group[["id", "id_down"]].itertuples(index=False, name=None)
+        )
+        upstream_by_downstream = {segment_id: [] for segment_id in ids}
+        for segment_id, downstream_id in downstream_by_id.items():
+            if downstream_id in ids:
+                upstream_by_downstream[downstream_id].append(segment_id)
+
+        attrs = group.set_index("id")[["upstream_area", "unit_length"]]
+        roots = [
+            segment_id
+            for segment_id, downstream_id in downstream_by_id.items()
+            if downstream_id not in ids
+        ]
+        stack = list(roots)
+        for root in roots:
+            water_course_by_id[root] = root
+        while stack:
+            segment_id = stack.pop()
+            children = upstream_by_downstream.get(segment_id, [])
+            if not children:
+                continue
+            main_child = max(
+                children,
+                key=lambda child: (
+                    attrs.at[child, "upstream_area"],
+                    attrs.at[child, "unit_length"],
+                    str(child),
+                ),
+            )
+            for child in children:
+                water_course_by_id[child] = (
+                    water_course_by_id[segment_id] if child == main_child else child
+                )
+                stack.append(child)
+
+    return pd.Series(common["id"]).map(water_course_by_id)

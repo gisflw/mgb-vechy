@@ -13,10 +13,13 @@ def _input_fixture(
     sub=(1, 1, 1, 1),
     unit_length=(1.0, 1.0, 1.0, 1.0),
     upstream_area=(10.0, 6.0, 4.0, 2.0),
+    water_course=None,
 ):
     unit_area = [float(value) for value in ids]
     upstream_length = list(upstream_area)
     strahler_order = list(reversed(range(1, len(ids) + 1)))
+    if water_course is None:
+        water_course = ids
     catchments = gpd.GeoDataFrame(
         {
             "id": list(ids),
@@ -27,6 +30,7 @@ def _input_fixture(
             "upstream_length": upstream_length,
             "unit_area": unit_area,
             "upstream_area": list(upstream_area),
+            "water_course": list(water_course),
             "geometry": [
                 Polygon([(index, 0), (index + 1, 0), (index + 1, 1), (index, 1)])
                 for index, _ in enumerate(ids)
@@ -44,6 +48,7 @@ def _input_fixture(
             "upstream_length": upstream_length,
             "unit_area": unit_area,
             "upstream_area": list(upstream_area),
+            "water_course": list(water_course),
             "geometry": [
                 LineString([(index, 0), (index + 1, 0)])
                 for index, _ in enumerate(ids)
@@ -72,6 +77,7 @@ def test_exact_input_schema_is_accepted():
     "mutate",
     [
         lambda gdf: gdf.drop(columns=["upstream_area"]),
+        lambda gdf: gdf.drop(columns=["water_course"]),
         lambda gdf: gdf.assign(extra=1),
         lambda gdf: gdf[
             [
@@ -82,6 +88,7 @@ def test_exact_input_schema_is_accepted():
                 "unit_length",
                 "upstream_length",
                 "unit_area",
+                "water_course",
                 "upstream_area",
                 "geometry",
             ]
@@ -96,7 +103,7 @@ def test_input_schema_rejects_missing_extra_or_reordered_columns(mutate):
 
 
 def test_confluence_continuing_domain_uses_greatest_upstream_area():
-    catchments, segments = _input_fixture()
+    catchments, segments = _input_fixture(water_course=(1, 1, 3, 1))
 
     result = aggregate_minibasins(
         catchments,
@@ -109,6 +116,9 @@ def test_confluence_continuing_domain_uses_greatest_upstream_area():
     assert mapping[2] == 1
     assert mapping[4] == 1
     assert mapping[3] == 3
+    water_course = dict(zip(result.segments["id"], result.segments["water_course"]))
+    assert water_course[1] == 1
+    assert water_course[3] == 3
 
 
 def test_cocursodag_column_is_not_required():

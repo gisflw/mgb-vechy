@@ -15,6 +15,7 @@ EXPECTED_COLUMNS = [
     "upstream_length",
     "unit_area",
     "upstream_area",
+    "water_course",
     "geometry",
 ]
 
@@ -97,6 +98,9 @@ def test_define_roi_outputs_normalized_columns_with_strahler_order():
         4: 2,
         5: 1,
     }
+    assert dict(zip(roi.catchments["id"], roi.catchments["water_course"])) == dict(
+        zip(roi.segments["id"], roi.segments["water_course"])
+    )
 
 
 def test_define_roi_assigns_sub_from_downstream_to_upstream_order():
@@ -265,6 +269,65 @@ def test_define_roi_computes_unit_and_upstream_metrics():
     assert list(roi.catchments["unit_area"]) == [1.0, 2.0, 3.0]
     assert list(roi.segments["upstream_area"]) == [6.0, 5.0, 3.0]
     assert list(roi.catchments["upstream_area"]) == [6.0, 5.0, 3.0]
+
+
+def test_define_roi_assigns_water_course_through_dominant_upstream_branch():
+    segments = gpd.GeoDataFrame(
+        {
+            "id": [1, 2, 3, 4],
+            "id_down": [None, 1, 1, 2],
+            "strahler_order": [3, 2, 1, 1],
+            "geometry": [
+                LineString([(0, 0), (1000, 0)]),
+                LineString([(1000, 0), (2000, 0)]),
+                LineString([(1000, 1), (2000, 1)]),
+                LineString([(2000, 0), (3000, 0)]),
+            ],
+        },
+        crs="EPSG:3857",
+    )
+    catchments = gpd.GeoDataFrame(
+        {
+            "id": [1, 2, 3, 4],
+            "geometry": [
+                Polygon([(0, 0), (1000, 0), (1000, 1000), (0, 1000)]),
+                Polygon([(1000, 0), (3000, 0), (3000, 1000), (1000, 1000)]),
+                Polygon([(1000, 0), (2000, 0), (2000, 1000), (1000, 1000)]),
+                Polygon([(3000, 0), (4000, 0), (4000, 1000), (3000, 1000)]),
+            ],
+        },
+        crs="EPSG:3857",
+    )
+
+    roi = define_roi(catchments, segments, outlet_ids=[1], destine_crs="EPSG:3857")
+
+    segment_water_course = dict(zip(roi.segments["id"], roi.segments["water_course"]))
+    catchment_water_course = dict(
+        zip(roi.catchments["id"], roi.catchments["water_course"])
+    )
+    assert segment_water_course == {
+        1: 1,
+        2: 1,
+        3: 3,
+        4: 1,
+    }
+    assert catchment_water_course == segment_water_course
+
+
+def test_define_roi_assigns_water_course_inside_each_sub_domain():
+    roi = define_roi(
+        _catchments_gdf(),
+        _segments_gdf(),
+        outlet_ids=[1, 2],
+        destine_crs="EPSG:3857",
+    )
+
+    segment_water_course = dict(zip(roi.segments["id"], roi.segments["water_course"]))
+    assert segment_water_course[1] == 1
+    assert segment_water_course[4] == 1
+    assert segment_water_course[5] == 1
+    assert segment_water_course[2] == 2
+    assert segment_water_course[3] == 2
 
 
 def test_define_roi_source_crs_overrides_existing_layer_crs():

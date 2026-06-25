@@ -24,6 +24,7 @@ INPUT_COLUMNS = [
     "upstream_length",
     "unit_area",
     "upstream_area",
+    "water_course",
     "geometry",
 ]
 
@@ -488,6 +489,7 @@ def _mini_attributes(
             "upstream_length": representative["upstream_length"],
             "unit_area": float(group["unit_area"].sum()),
             "upstream_area": representative["upstream_area"],
+            "water_course": representative["water_course"],
         }
     return attrs
 

@@ -14,6 +14,7 @@ EXPECTED_COLUMNS = [
     "upstream_length",
     "unit_area",
     "upstream_area",
+    "water_course",
     "geometry",
 ]
 
@@ -323,6 +324,7 @@ def test_aggregate_cli_writes_stage2_outputs(tmp_path):
         "upstream_length": [2.0, 1.0],
         "unit_area": [1.0, 1.0],
         "upstream_area": [2.0, 1.0],
+        "water_course": [1, 1],
     }
     roi_areas = gpd.GeoDataFrame(
         {

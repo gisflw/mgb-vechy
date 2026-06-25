@@ -30,11 +30,12 @@ Both `--roi-areas` and `--roi-trecs` must have exactly these columns, in this or
 - `upstream_length`
 - `unit_area`
 - `upstream_area`
+- `water_course`
 - `geometry`
 
 Inputs with missing, extra, or reordered columns are rejected before topology or geometry work begins.
 
-`id` may be numeric or string. The metric columns must be numeric, and `geometry` must be the active GeoPandas geometry column.
+`id` and `water_course` may be numeric or string. The metric columns must be numeric, and `geometry` must be the active GeoPandas geometry column.
 
 ## Aggregation Parameters
 
