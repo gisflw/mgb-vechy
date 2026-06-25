@@ -30,8 +30,8 @@ def test_carinhanha_aggregation_regression_properties():
         lmin=6,
     )
 
-    assert len(result.segments) == 556
-    assert len(result.catchments) == 556
+    assert len(result.segments) == 266
+    assert len(result.catchments) == 266
     assert len(result.mapping) == len(roi_catchments)
     assert list(result.segments.columns) == INPUT_COLUMNS
     assert list(result.catchments.columns) == INPUT_COLUMNS
@@ -42,17 +42,19 @@ def test_carinhanha_aggregation_regression_properties():
     assert result.segments["id"].is_unique
     assert result.catchments["id"].is_unique
     assert result.mapping["id"].is_unique
+    assert (result.segments["upstream_area"] < 30).sum() == 0
+    assert (result.segments["unit_length"] < 6).sum() == 0
     assert list(result.segments["id"].head(10)) == [
         100864,
-        103105,
         116794,
         118204,
-        118409,
         91665,
         120326,
-        120819,
-        120832,
-        121339,
+        124562,
+        124656,
+        125562,
+        127420,
+        128532,
     ]
 
 

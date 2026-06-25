@@ -60,36 +60,74 @@ def aggregate_minibasins(
     )
     upstream_by_downstream = _build_reverse_adjacency(segments)
     _downstream_to_upstream_order(segments, downstream_by_id)
+
+    eligible_segments = segments.loc[segments["upstream_area"] >= uparea_min].copy()
+    excluded_segments = segments.loc[segments["upstream_area"] < uparea_min].copy()
+    eligible_ids = set(eligible_segments["id"].tolist())
+    eligible_downstream_by_id = {
+        segment_id: downstream_id if downstream_id in eligible_ids else None
+        for segment_id, downstream_id in eligible_segments[
+            ["id", "id_down"]
+        ].itertuples(index=False, name=None)
+    }
+    eligible_upstream_by_downstream = _build_reverse_adjacency(eligible_segments)
+
     domain_by_id = _aggregation_domain_ids(segments)
-    mini_by_segment = _initial_candidate_groups(segments, uparea_min)
-    mini_by_segment = _assign_remaining_segments(
+    sub_domain_by_id = _sub_domain_ids(segments)
+    mini_by_segment = _initial_candidate_groups(eligible_segments)
+    mini_by_segment = _merge_short_groups(
+        eligible_segments,
+        mini_by_segment,
+        domain_by_id,
+        lmin,
+    )
+    mini_by_segment, short_mini_by_segment = _filter_unmergeable_short_groups(
+        eligible_segments,
         segments,
         downstream_by_id,
         upstream_by_downstream,
         mini_by_segment,
         domain_by_id,
+        sub_domain_by_id,
+        lmin,
     )
-    mini_by_segment = _merge_short_groups(segments, mini_by_segment, domain_by_id, lmin)
-    mini_by_segment = _assign_remaining_segments(
+    excluded_mini_by_segment = _assign_excluded_segments(
+        excluded_segments,
         segments,
         downstream_by_id,
         upstream_by_downstream,
         mini_by_segment,
         domain_by_id,
+        sub_domain_by_id,
     )
+    catchment_mini_by_segment = {
+        **mini_by_segment,
+        **short_mini_by_segment,
+        **excluded_mini_by_segment,
+    }
 
     groups = _groups_from_assignment(mini_by_segment)
-    attributes = _mini_attributes(segments, groups, downstream_by_id, mini_by_segment)
-    catchment_mini = catchments["id"].map(mini_by_segment)
+    catchment_groups = _groups_from_assignment(catchment_mini_by_segment)
+    attributes = _mini_attributes(
+        eligible_segments,
+        groups,
+        eligible_downstream_by_id,
+        mini_by_segment,
+    )
+    catchment_mini = catchments["id"].map(catchment_mini_by_segment)
     if catchment_mini.isna().any():
         missing = catchments.loc[catchment_mini.isna(), "id"].tolist()
         raise InvalidInputSchemaError(
-            "Catchment ID(s) missing from segment topology: "
+            "Catchment ID(s) have no eligible aggregation target in the same sub: "
             + ", ".join(str(value) for value in missing)
         )
 
-    segment_mini = segments["id"].map(mini_by_segment)
-    segment_geometries = _dissolved_geometries(segments, segment_mini, "mini_id")
+    segment_mini = eligible_segments["id"].map(mini_by_segment)
+    segment_geometries = _dissolved_geometries(
+        eligible_segments,
+        segment_mini,
+        "mini_id",
+    )
     catchment_geometries = _dissolved_geometries(catchments, catchment_mini, "mini_id")
 
     segment_rows = []
@@ -98,7 +136,15 @@ def aggregate_minibasins(
         attrs = attributes[mini_id]
         row = {**attrs, "geometry": segment_geometries.loc[mini_id]}
         segment_rows.append(row)
-        catchment_rows.append({**attrs, "geometry": catchment_geometries.loc[mini_id]})
+        catchment_group = catchments.loc[
+            catchments["id"].isin(catchment_groups[mini_id])
+        ]
+        catchment_attrs = {
+            **attrs,
+            "unit_area": float(catchment_group["unit_area"].sum()),
+            "geometry": catchment_geometries.loc[mini_id],
+        }
+        catchment_rows.append(catchment_attrs)
 
     aggregated_segments = gpd.GeoDataFrame(
         segment_rows,
@@ -220,13 +266,15 @@ def _aggregation_domain_ids(
     }
 
 
+def _sub_domain_ids(segments: gpd.GeoDataFrame) -> dict[Hashable, Hashable]:
+    return dict(segments[["id", "sub"]].itertuples(index=False, name=None))
+
+
 def _initial_candidate_groups(
     segments: gpd.GeoDataFrame,
-    uparea_min: float,
 ) -> dict[Hashable, Hashable]:
-    candidate_segments = segments.loc[segments["upstream_area"] >= uparea_min]
     mini_by_segment: dict[Hashable, Hashable] = {}
-    for segment_id in candidate_segments["id"]:
+    for segment_id in segments["id"]:
         mini_by_segment[segment_id] = segment_id
     return mini_by_segment
 
@@ -281,59 +329,96 @@ def _merge_short_groups(
     return mini_by_segment
 
 
-def _assign_remaining_segments(
-    segments: gpd.GeoDataFrame,
+def _assign_excluded_segments(
+    excluded_segments: gpd.GeoDataFrame,
+    all_segments: gpd.GeoDataFrame,
     downstream_by_id: dict[Hashable, Hashable],
     upstream_by_downstream: dict[Hashable, list[Hashable]],
     mini_by_segment: dict[Hashable, Hashable],
     domain_by_id: dict[Hashable, tuple[Hashable, Hashable]],
+    fallback_domain_by_id: dict[Hashable, Hashable],
 ) -> dict[Hashable, Hashable]:
-    ids = set(segments["id"].tolist())
-    if not mini_by_segment:
-        for _, group in segments.assign(domain=segments["id"].map(domain_by_id)).groupby(
-            ["sub", "domain"],
-            sort=False,
-        ):
-            representative_id = _representative_id(group)
-            for segment_id in group["id"]:
-                mini_by_segment[segment_id] = representative_id
-        return mini_by_segment
+    if excluded_segments.empty or not mini_by_segment:
+        return {}
 
-    pending = ids - set(mini_by_segment)
-    unit_length = segments.set_index("id")["unit_length"]
-    while pending:
-        progressed = False
-        groups = _groups_from_assignment(mini_by_segment)
-        lengths = {
-            mini_id: float(unit_length.loc[list(member_ids)].sum())
-            for mini_id, member_ids in groups.items()
-        }
-        for segment_id in sorted(pending, key=_stable_key):
+    unit_length = all_segments.set_index("id")["unit_length"]
+    groups = _groups_from_assignment(mini_by_segment)
+    lengths = {
+        mini_id: float(unit_length.loc[list(member_ids)].sum())
+        for mini_id, member_ids in groups.items()
+    }
+    excluded_mini_by_segment: dict[Hashable, Hashable] = {}
+    for segment_id in sorted(excluded_segments["id"], key=_stable_key):
+        target = _best_adjacent_group(
+            {segment_id},
+            None,
+            mini_by_segment,
+            downstream_by_id,
+            upstream_by_downstream,
+            domain_by_id,
+            lengths,
+        )
+        if target is None:
             target = _best_adjacent_group(
                 {segment_id},
                 None,
                 mini_by_segment,
                 downstream_by_id,
                 upstream_by_downstream,
-                domain_by_id,
+                fallback_domain_by_id,
                 lengths,
             )
-            if target is None:
-                continue
-            mini_by_segment[segment_id] = target
-            pending.remove(segment_id)
-            progressed = True
-            break
-        if not progressed:
-            fallback_id = sorted(pending, key=_stable_key)[0]
-            component = _unassigned_component(fallback_id, pending, downstream_by_id)
-            group = segments.loc[segments["id"].isin(component)]
-            representative_id = _representative_id(group)
-            for segment_id in component:
-                mini_by_segment[segment_id] = representative_id
-                pending.remove(segment_id)
+        if target is not None:
+            excluded_mini_by_segment[segment_id] = target
 
-    return mini_by_segment
+    return excluded_mini_by_segment
+
+
+def _filter_unmergeable_short_groups(
+    eligible_segments: gpd.GeoDataFrame,
+    all_segments: gpd.GeoDataFrame,
+    downstream_by_id: dict[Hashable, Hashable],
+    upstream_by_downstream: dict[Hashable, list[Hashable]],
+    mini_by_segment: dict[Hashable, Hashable],
+    domain_by_id: dict[Hashable, tuple[Hashable, Hashable]],
+    fallback_domain_by_id: dict[Hashable, Hashable],
+    lmin: float,
+) -> tuple[dict[Hashable, Hashable], dict[Hashable, Hashable]]:
+    if not mini_by_segment:
+        return mini_by_segment, {}
+
+    unit_length = eligible_segments.set_index("id")["unit_length"]
+    groups = _groups_from_assignment(mini_by_segment)
+    short_mini_ids = {
+        mini_id
+        for mini_id, member_ids in groups.items()
+        if float(unit_length.loc[list(member_ids)].sum()) < lmin
+    }
+    if not short_mini_ids:
+        return mini_by_segment, {}
+
+    surviving_mini_by_segment = {
+        segment_id: mini_id
+        for segment_id, mini_id in mini_by_segment.items()
+        if mini_id not in short_mini_ids
+    }
+    short_segments = all_segments.loc[
+        all_segments["id"].isin(
+            segment_id
+            for segment_id, mini_id in mini_by_segment.items()
+            if mini_id in short_mini_ids
+        )
+    ]
+    short_mini_by_segment = _assign_excluded_segments(
+        short_segments,
+        all_segments,
+        downstream_by_id,
+        upstream_by_downstream,
+        surviving_mini_by_segment,
+        domain_by_id,
+        fallback_domain_by_id,
+    )
+    return surviving_mini_by_segment, short_mini_by_segment
 
 
 def _best_adjacent_group(
@@ -342,7 +427,7 @@ def _best_adjacent_group(
     mini_by_segment: dict[Hashable, Hashable],
     downstream_by_id: dict[Hashable, Hashable],
     upstream_by_downstream: dict[Hashable, list[Hashable]],
-    domain_by_id: dict[Hashable, tuple[Hashable, Hashable]],
+    domain_by_id: dict[Hashable, Hashable],
     lengths: dict[Hashable, float],
 ) -> Hashable | None:
     candidates: set[Hashable] = set()
@@ -380,28 +465,6 @@ def _best_adjacent_group(
         candidates,
         key=lambda candidate: (lengths[candidate], str(candidate)),
     )
-
-
-def _unassigned_component(
-    start_id: Hashable,
-    pending: set[Hashable],
-    downstream_by_id: dict[Hashable, Hashable],
-) -> set[Hashable]:
-    component = {start_id}
-    changed = True
-    while changed:
-        changed = False
-        for segment_id in list(pending):
-            downstream_id = downstream_by_id.get(segment_id)
-            if downstream_id in component or (
-                segment_id in component and downstream_id in pending
-            ):
-                before = len(component)
-                component.add(segment_id)
-                if downstream_id in pending:
-                    component.add(downstream_id)
-                changed = changed or len(component) != before
-    return component
 
 
 def _groups_from_assignment(
@@ -454,7 +517,11 @@ def _downstream_mini(
     seen = {representative_id}
     all_ids = set(downstream_by_id)
     while downstream_id in all_ids and downstream_id not in seen:
-        downstream_mini = mini_by_segment[downstream_id]
+        downstream_mini = mini_by_segment.get(downstream_id)
+        if downstream_mini is None:
+            seen.add(downstream_id)
+            downstream_id = downstream_by_id.get(downstream_id)
+            continue
         if downstream_mini != current_mini:
             return downstream_mini
         seen.add(downstream_id)

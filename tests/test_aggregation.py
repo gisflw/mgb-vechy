@@ -169,7 +169,8 @@ def test_short_segments_do_not_merge_across_sub_or_water_course():
     )
 
     mapping = dict(zip(result.mapping["id"], result.mapping["mini_id"]))
-    assert mapping[2] == 2
+    assert mapping[2] == 1
+    assert 2 not in set(result.segments["id"])
     assert mapping[3] == 3
     assert mapping[4] == 4
 
@@ -194,9 +195,83 @@ def test_segments_below_uparea_min_are_merged_but_not_output_minis():
     mapping = dict(zip(result.mapping["id"], result.mapping["mini_id"]))
     assert 2 not in set(result.segments["id"])
     assert mapping[2] == 3
+    assert result.segments.loc[result.segments["id"] == 3, "unit_length"].iloc[
+        0
+    ] == pytest.approx(4.0)
     assert result.catchments["unit_area"].sum() == pytest.approx(
         catchments["unit_area"].sum()
     )
+
+
+def test_segments_below_uparea_min_do_not_satisfy_lmin():
+    catchments, segments = _input_fixture(
+        ids=(1, 2, 3),
+        id_down=(None, 1, 2),
+        sub=(1, 1, 1),
+        unit_length=(5.0, 0.6, 0.6),
+        upstream_area=(10.0, 8.0, 2.0),
+        water_course=(1, 1, 1),
+    )
+
+    result = aggregate_minibasins(
+        catchments,
+        segments,
+        uparea_min=5.0,
+        lmin=1.0,
+    )
+
+    mapping = dict(zip(result.mapping["id"], result.mapping["mini_id"]))
+    assert mapping[2] == 1
+    assert mapping[3] == 1
+    assert result.segments.loc[result.segments["id"] == 1, "unit_length"].iloc[
+        0
+    ] == pytest.approx(5.6)
+
+
+def test_excluded_segment_between_eligible_minis_maps_to_smallest_length_target():
+    catchments, segments = _input_fixture(
+        ids=(1, 2, 3),
+        id_down=(None, 1, 2),
+        sub=(1, 1, 1),
+        unit_length=(5.0, 1.0, 2.0),
+        upstream_area=(10.0, 2.0, 8.0),
+        water_course=(1, 1, 1),
+    )
+
+    result = aggregate_minibasins(
+        catchments,
+        segments,
+        uparea_min=5.0,
+        lmin=0,
+    )
+
+    mapping = dict(zip(result.mapping["id"], result.mapping["mini_id"]))
+    assert mapping[2] == 3
+    assert result.segments.loc[result.segments["id"] == 3, "unit_length"].iloc[
+        0
+    ] == pytest.approx(2.0)
+
+
+def test_excluded_segment_without_water_course_target_falls_back_to_same_sub():
+    catchments, segments = _input_fixture(
+        ids=(1, 2),
+        id_down=(None, 1),
+        sub=(1, 1),
+        unit_length=(5.0, 1.0),
+        upstream_area=(10.0, 2.0),
+        water_course=(1, 2),
+    )
+
+    result = aggregate_minibasins(
+        catchments,
+        segments,
+        uparea_min=5.0,
+        lmin=0,
+    )
+
+    mapping = dict(zip(result.mapping["id"], result.mapping["mini_id"]))
+    assert mapping[2] == 1
+    assert set(result.segments["id"]) == {1}
 
 
 def test_lmin_uses_evolving_aggregated_length_until_threshold_is_met():
@@ -222,6 +297,75 @@ def test_lmin_uses_evolving_aggregated_length_until_threshold_is_met():
     assert result.segments.loc[result.segments["id"] == 1, "unit_length"].iloc[
         0
     ] == pytest.approx(5.8)
+
+
+def test_unmergeable_short_mini_is_filtered_and_catchment_is_preserved():
+    catchments, segments = _input_fixture(
+        ids=(1, 2),
+        id_down=(None, 1),
+        sub=(1, 1),
+        unit_length=(5.0, 0.5),
+        upstream_area=(10.0, 8.0),
+        water_course=(1, 2),
+    )
+
+    result = aggregate_minibasins(
+        catchments,
+        segments,
+        uparea_min=0,
+        lmin=1.0,
+    )
+
+    mapping = dict(zip(result.mapping["id"], result.mapping["mini_id"]))
+    assert set(result.segments["id"]) == {1}
+    assert mapping[2] == 1
+    assert result.catchments["unit_area"].sum() == pytest.approx(
+        catchments["unit_area"].sum()
+    )
+
+
+def test_filtered_short_mini_length_does_not_contribute_to_surviving_reach():
+    catchments, segments = _input_fixture(
+        ids=(1, 2),
+        id_down=(None, 1),
+        sub=(1, 1),
+        unit_length=(5.0, 0.5),
+        upstream_area=(10.0, 8.0),
+        water_course=(1, 2),
+    )
+
+    result = aggregate_minibasins(
+        catchments,
+        segments,
+        uparea_min=0,
+        lmin=1.0,
+    )
+
+    assert result.segments.loc[result.segments["id"] == 1, "unit_length"].iloc[
+        0
+    ] == pytest.approx(5.0)
+
+
+def test_all_unmergeable_short_minis_raise_missing_target_error():
+    catchments, segments = _input_fixture(
+        ids=(1,),
+        id_down=(None,),
+        sub=(1,),
+        unit_length=(0.5,),
+        upstream_area=(10.0,),
+        water_course=(1,),
+    )
+
+    with pytest.raises(
+        InvalidInputSchemaError,
+        match="no eligible aggregation target in the same sub",
+    ):
+        aggregate_minibasins(
+            catchments,
+            segments,
+            uparea_min=0,
+            lmin=1.0,
+        )
 
 
 def test_catchments_are_assigned_once():

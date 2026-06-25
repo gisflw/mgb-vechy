@@ -39,9 +39,9 @@ Inputs with missing, extra, or reordered columns are rejected before topology or
 
 ## Aggregation Parameters
 
-`--uparea-min` excludes segments where `upstream_area < uparea_min` from becoming mini-basin anchors. Their catchments are still merged into adjacent mini-basins in the same `sub` and `water_course` domain when one is available. Segments exactly equal to `uparea_min` remain eligible.
+`--uparea-min` filters segments where `upstream_area < uparea_min` out of reach aggregation before `--lmin` is applied. Their catchments are still merged into adjacent mini-basins in the same `sub` and `water_course` domain when one is available; if the filtered catchment's water course has no eligible target, assignment falls back to an adjacent eligible mini-basin in the same `sub`. Segments exactly equal to `uparea_min` remain eligible.
 
-`--lmin` iteratively merges current mini-basins whose aggregated `unit_length` is shorter than the minimum length. Each short mini-basin merges into an adjacent mini-basin in the same `sub` and `water_course` domain with the smallest current `unit_length`; ties use the stable string form of `id`.
+`--lmin` iteratively merges current mini-basins whose aggregated `unit_length` is shorter than the minimum length. Each short mini-basin merges into an adjacent mini-basin in the same `sub` and `water_course` domain with the smallest current `unit_length`; ties use the stable string form of `id`. Short mini-basins that cannot be merged further are removed from reach output, while their catchments are assigned to surviving adjacent mini-basins.
 
 ## Outputs
 
