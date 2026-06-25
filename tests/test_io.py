@@ -3,7 +3,7 @@ import pytest
 from shapely.geometry import Point
 
 from mgb_vec_hydro.exceptions import UnsupportedOutputFormatError
-from mgb_vec_hydro.io import output_paths, read_vector, write_vector
+from mgb_vec_hydro.io import aggregation_output_paths, output_paths, read_vector, write_vector
 
 
 def test_output_paths_use_legacy_roi_names(tmp_path):
@@ -16,6 +16,14 @@ def test_output_paths_use_legacy_roi_names(tmp_path):
 def test_output_paths_reject_unsupported_format(tmp_path):
     with pytest.raises(UnsupportedOutputFormatError, match="xyz"):
         output_paths(tmp_path, "xyz")
+
+
+def test_aggregation_output_paths_use_legacy_stage2_names(tmp_path):
+    paths = aggregation_output_paths(tmp_path, "fgb")
+
+    assert paths.catchments == tmp_path / "mareas.fgb"
+    assert paths.segments == tmp_path / "mtrecs.fgb"
+    assert paths.mapping == tmp_path / "bho2mini.fgb"
 
 
 def test_write_and_read_vector_round_trip_gpkg(tmp_path):

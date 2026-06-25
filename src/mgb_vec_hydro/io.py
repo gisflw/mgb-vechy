@@ -23,6 +23,15 @@ class RoiOutputPaths:
     segments: Path
 
 
+@dataclass(frozen=True)
+class AggregationOutputPaths:
+    """Output paths for Stage 2 aggregation files."""
+
+    catchments: Path
+    segments: Path
+    mapping: Path
+
+
 def read_vector(path: str | Path) -> gpd.GeoDataFrame:
     """Read a vector layer into a GeoDataFrame."""
 
@@ -44,6 +53,28 @@ def output_paths(output_dir: str | Path, output_format: str) -> RoiOutputPaths:
     return RoiOutputPaths(
         catchments=output_dir / f"roi_areas{suffix}",
         segments=output_dir / f"roi_trecs{suffix}",
+    )
+
+
+def aggregation_output_paths(
+    output_dir: str | Path,
+    output_format: str,
+) -> AggregationOutputPaths:
+    """Return legacy Stage 2 output names for the requested format."""
+
+    output_format = output_format.lower()
+    if output_format not in SUPPORTED_OUTPUT_FORMATS:
+        supported = ", ".join(sorted(SUPPORTED_OUTPUT_FORMATS))
+        raise UnsupportedOutputFormatError(
+            f"Unsupported output format '{output_format}'. Supported formats: {supported}"
+        )
+
+    suffix = SUPPORTED_OUTPUT_FORMATS[output_format][1]
+    output_dir = Path(output_dir)
+    return AggregationOutputPaths(
+        catchments=output_dir / f"mareas{suffix}",
+        segments=output_dir / f"mtrecs{suffix}",
+        mapping=output_dir / f"bho2mini{suffix}",
     )
 
 

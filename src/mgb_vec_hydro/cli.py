@@ -4,8 +4,14 @@ from pathlib import Path
 
 import click
 
+from mgb_vec_hydro.aggregation import aggregate_minibasins
 from mgb_vec_hydro.exceptions import MgbVecHydroError
-from mgb_vec_hydro.io import output_paths, read_vector, write_vector
+from mgb_vec_hydro.io import (
+    aggregation_output_paths,
+    output_paths,
+    read_vector,
+    write_vector,
+)
 from mgb_vec_hydro.roi import DEFAULT_STRAHLER_ORDER_COL, define_roi
 from mgb_vec_hydro.topology import resolve_column_name
 
@@ -81,6 +87,58 @@ def define_roi_command(
 
     click.echo(f"Wrote {paths.catchments}")
     click.echo(f"Wrote {paths.segments}")
+
+
+@main.command("aggregate")
+@click.option(
+    "--roi-areas",
+    "roi_areas_path",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    required=True,
+)
+@click.option(
+    "--roi-trecs",
+    "roi_trecs_path",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    required=True,
+)
+@click.option("--uparea-min", type=float, required=True)
+@click.option("--lmin", type=float, required=True)
+@click.option(
+    "--output-dir",
+    type=click.Path(file_okay=False, path_type=Path),
+    required=True,
+)
+@click.option("--output-format", default="fgb", show_default=True)
+def aggregate_command(
+    roi_areas_path: Path,
+    roi_trecs_path: Path,
+    uparea_min: float,
+    lmin: float,
+    output_dir: Path,
+    output_format: str,
+) -> None:
+    """Aggregate normalized ROI catchments and segments into mini-basins."""
+
+    try:
+        paths = aggregation_output_paths(output_dir, output_format)
+        roi_areas = read_vector(roi_areas_path)
+        roi_trecs = read_vector(roi_trecs_path)
+        aggregation = aggregate_minibasins(
+            roi_areas,
+            roi_trecs,
+            uparea_min=uparea_min,
+            lmin=lmin,
+        )
+        write_vector(aggregation.catchments, paths.catchments, output_format=output_format)
+        write_vector(aggregation.segments, paths.segments, output_format=output_format)
+        write_vector(aggregation.mapping, paths.mapping, output_format=output_format)
+    except MgbVecHydroError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+    click.echo(f"Wrote {paths.catchments}")
+    click.echo(f"Wrote {paths.segments}")
+    click.echo(f"Wrote {paths.mapping}")
 
 
 def _coerce_outlet_ids(outlet_ids: tuple[str, ...], segment_id_series):

@@ -6,6 +6,10 @@ class MissingColumnsError(MgbVecHydroError):
     """Raised when an input table does not contain required columns."""
 
 
+class InvalidInputSchemaError(MgbVecHydroError):
+    """Raised when vector inputs do not match the expected schema."""
+
+
 class MissingCrsError(MgbVecHydroError):
     """Raised when an input layer has no CRS for geometry measurements."""
 

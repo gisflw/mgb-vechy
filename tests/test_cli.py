@@ -308,3 +308,65 @@ def test_define_roi_cli_accepts_source_crs_for_layers_without_crs(tmp_path):
     assert list(roi_trecs.columns) == EXPECTED_COLUMNS
     assert roi_areas["unit_area"].iloc[0] == 1.0
     assert roi_trecs["unit_length"].iloc[0] == 1.0
+
+
+def test_aggregate_cli_writes_stage2_outputs(tmp_path):
+    roi_areas_path = tmp_path / "roi_areas.gpkg"
+    roi_trecs_path = tmp_path / "roi_trecs.gpkg"
+    output_dir = tmp_path / "out"
+    common = {
+        "id": [1, 2],
+        "id_down": [None, 1],
+        "sub": [1, 1],
+        "strahler_order": [2, 1],
+        "unit_length": [1.0, 1.0],
+        "upstream_length": [2.0, 1.0],
+        "unit_area": [1.0, 1.0],
+        "upstream_area": [2.0, 1.0],
+    }
+    roi_areas = gpd.GeoDataFrame(
+        {
+            **common,
+            "geometry": [
+                Polygon([(0, 0), (1, 0), (1, 1), (0, 1)]),
+                Polygon([(1, 0), (2, 0), (2, 1), (1, 1)]),
+            ],
+        },
+        crs="EPSG:3857",
+    )
+    roi_trecs = gpd.GeoDataFrame(
+        {
+            **common,
+            "geometry": [
+                LineString([(0, 0), (1, 0)]),
+                LineString([(1, 0), (2, 0)]),
+            ],
+        },
+        crs="EPSG:3857",
+    )
+    roi_areas.to_file(roi_areas_path, driver="GPKG")
+    roi_trecs.to_file(roi_trecs_path, driver="GPKG")
+
+    result = CliRunner().invoke(
+        main,
+        [
+            "aggregate",
+            "--roi-areas",
+            str(roi_areas_path),
+            "--roi-trecs",
+            str(roi_trecs_path),
+            "--uparea-min",
+            "0",
+            "--lmin",
+            "0",
+            "--output-dir",
+            str(output_dir),
+            "--output-format",
+            "gpkg",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert (output_dir / "mareas.gpkg").exists()
+    assert (output_dir / "mtrecs.gpkg").exists()
+    assert (output_dir / "bho2mini.gpkg").exists()
