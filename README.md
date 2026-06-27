@@ -28,8 +28,8 @@ mgb-vec-hydro define-roi \
 
 This command writes:
 
-- `roi_areas.<ext>`
-- `roi_trecs.<ext>`
+- `roi_catchments.<ext>`
+- `roi_segments.<ext>`
 
 See [docs/stage1_roi_cli.md](docs/stage1_roi_cli.md) for Stage 1 CLI details.
 
@@ -37,8 +37,8 @@ Aggregate the ROI into mini-basins:
 
 ```bash
 mgb-vec-hydro aggregate \
-  --roi-areas output/roi_areas.fgb \
-  --roi-trecs output/roi_trecs.fgb \
+  --roi-catchments output/roi_catchments.fgb \
+  --roi-segments output/roi_segments.fgb \
   --uparea-min 30 \
   --lmin 6 \
   --output-dir output \
@@ -47,8 +47,8 @@ mgb-vec-hydro aggregate \
 
 This command writes:
 
-- `mareas.<ext>`
-- `mtrecs.<ext>`
+- `mini_catchments.<ext>`
+- `mini_segments.<ext>`
 - `bho2mini.<ext>`
 
 See [docs/stage2_aggregation_cli.md](docs/stage2_aggregation_cli.md) for aggregation CLI details.

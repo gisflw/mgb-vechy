@@ -8,8 +8,8 @@ Mini-basin sampling should create the attributed data needed to write final MGB 
 
 ## Planned Inputs
 
-- Aggregated mini-basin catchments, currently produced as `mareas.<ext>`.
-- Aggregated mini-basin reaches, currently produced as `mtrecs.<ext>`.
+- Aggregated mini-basin catchments, currently produced as `mini_catchments.<ext>`.
+- Aggregated mini-basin reaches, currently produced as `mini_segments.<ext>`.
 - Terrain products such as `hand.tif`, `ltnd.tif`, and DEM-derived slope inputs.
 - HRU class raster and class metadata from the HRU mapping step.
 

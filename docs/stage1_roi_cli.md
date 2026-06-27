@@ -45,8 +45,8 @@ After `upstream_area` is computed, `water_course` is derived independently insid
 
 ```bash
 mgb-vec-hydro define-roi \
-  --catchments data/areas.gpkg \
-  --segments data/trecs.gpkg \
+  --catchments data/catchments.gpkg \
+  --segments data/segments.gpkg \
   --outlet-id 90497 \
   --outlet-id 416 \
   --outlet-id 159713 \
@@ -58,9 +58,9 @@ mgb-vec-hydro define-roi \
   --output-format gpkg
 ```
 
-Outputs use legacy Stage 1 names:
+Outputs use Stage 1 names:
 
-- `roi_areas.<ext>`
-- `roi_trecs.<ext>`
+- `roi_catchments.<ext>`
+- `roi_segments.<ext>`
 
 Supported formats are `fgb` and `gpkg`. New workflows should prefer `fgb`.

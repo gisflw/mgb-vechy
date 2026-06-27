@@ -39,7 +39,7 @@ def read_vector(path: str | Path) -> gpd.GeoDataFrame:
 
 
 def output_paths(output_dir: str | Path, output_format: str) -> RoiOutputPaths:
-    """Return legacy ROI output names for the requested format."""
+    """Return ROI output names for the requested format."""
 
     output_format = output_format.lower()
     if output_format not in SUPPORTED_OUTPUT_FORMATS:
@@ -51,8 +51,8 @@ def output_paths(output_dir: str | Path, output_format: str) -> RoiOutputPaths:
     suffix = SUPPORTED_OUTPUT_FORMATS[output_format][1]
     output_dir = Path(output_dir)
     return RoiOutputPaths(
-        catchments=output_dir / f"roi_areas{suffix}",
-        segments=output_dir / f"roi_trecs{suffix}",
+        catchments=output_dir / f"roi_catchments{suffix}",
+        segments=output_dir / f"roi_segments{suffix}",
     )
 
 
@@ -60,7 +60,7 @@ def aggregation_output_paths(
     output_dir: str | Path,
     output_format: str,
 ) -> AggregationOutputPaths:
-    """Return legacy Stage 2 output names for the requested format."""
+    """Return Stage 2 output names for the requested format."""
 
     output_format = output_format.lower()
     if output_format not in SUPPORTED_OUTPUT_FORMATS:
@@ -72,8 +72,8 @@ def aggregation_output_paths(
     suffix = SUPPORTED_OUTPUT_FORMATS[output_format][1]
     output_dir = Path(output_dir)
     return AggregationOutputPaths(
-        catchments=output_dir / f"mareas{suffix}",
-        segments=output_dir / f"mtrecs{suffix}",
+        catchments=output_dir / f"mini_catchments{suffix}",
+        segments=output_dir / f"mini_segments{suffix}",
         mapping=output_dir / f"bho2mini{suffix}",
     )
 

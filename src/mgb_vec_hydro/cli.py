@@ -91,14 +91,14 @@ def define_roi_command(
 
 @main.command("aggregate")
 @click.option(
-    "--roi-areas",
-    "roi_areas_path",
+    "--roi-catchments",
+    "roi_catchments_path",
     type=click.Path(exists=True, dir_okay=False, path_type=Path),
     required=True,
 )
 @click.option(
-    "--roi-trecs",
-    "roi_trecs_path",
+    "--roi-segments",
+    "roi_segments_path",
     type=click.Path(exists=True, dir_okay=False, path_type=Path),
     required=True,
 )
@@ -111,8 +111,8 @@ def define_roi_command(
 )
 @click.option("--output-format", default="fgb", show_default=True)
 def aggregate_command(
-    roi_areas_path: Path,
-    roi_trecs_path: Path,
+    roi_catchments_path: Path,
+    roi_segments_path: Path,
     uparea_min: float,
     lmin: float,
     output_dir: Path,
@@ -122,11 +122,11 @@ def aggregate_command(
 
     try:
         paths = aggregation_output_paths(output_dir, output_format)
-        roi_areas = read_vector(roi_areas_path)
-        roi_trecs = read_vector(roi_trecs_path)
+        roi_catchments = read_vector(roi_catchments_path)
+        roi_segments = read_vector(roi_segments_path)
         aggregation = aggregate_minibasins(
-            roi_areas,
-            roi_trecs,
+            roi_catchments,
+            roi_segments,
             uparea_min=uparea_min,
             lmin=lmin,
         )

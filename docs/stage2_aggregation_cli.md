@@ -8,8 +8,8 @@ The command expects ROI catchment and segment inputs with the exact input schema
 
 ```bash
 mgb-vec-hydro aggregate \
-  --roi-areas output/roi_areas.fgb \
-  --roi-trecs output/roi_trecs.fgb \
+  --roi-catchments output/roi_catchments.fgb \
+  --roi-segments output/roi_segments.fgb \
   --uparea-min 30 \
   --lmin 6 \
   --output-dir output \
@@ -20,7 +20,7 @@ Aggregation is constrained to segments in the same `sub` and `water_course` doma
 
 ## Input Schema
 
-Both `--roi-areas` and `--roi-trecs` must have exactly these columns, in this order:
+Both `--roi-catchments` and `--roi-segments` must have exactly these columns, in this order:
 
 - `id`
 - `id_down`
@@ -45,13 +45,13 @@ Inputs with missing, extra, or reordered columns are rejected before topology or
 
 ## Outputs
 
-Outputs use legacy Stage 2 names:
+Outputs use Stage 2 names:
 
-- `mareas.<ext>`: aggregated mini-basin catchments
-- `mtrecs.<ext>`: aggregated mini-basin reaches
+- `mini_catchments.<ext>`: aggregated mini-basin catchments
+- `mini_segments.<ext>`: aggregated mini-basin reaches
 - `bho2mini.<ext>`: original catchment-to-mini mapping
 
-`mareas` and `mtrecs` use the same column order as the input schema. `bho2mini` contains:
+`mini_catchments` and `mini_segments` use the same column order as the input schema. `bho2mini` contains:
 
 - `id`
 - `mini_id`
@@ -64,8 +64,8 @@ Supported formats are `fgb` and `gpkg`. New workflows should prefer `fgb`.
 
 ```bash
 mgb-vec-hydro define-roi \
-  --catchments data/areas.gpkg \
-  --segments data/trecs.gpkg \
+  --catchments data/catchments.gpkg \
+  --segments data/segments.gpkg \
   --outlet-id 90497 \
   --outlet-id 416 \
   --outlet-id 159713 \
@@ -77,8 +77,8 @@ mgb-vec-hydro define-roi \
   --output-format fgb
 
 mgb-vec-hydro aggregate \
-  --roi-areas output/roi_areas.fgb \
-  --roi-trecs output/roi_trecs.fgb \
+  --roi-catchments output/roi_catchments.fgb \
+  --roi-segments output/roi_segments.fgb \
   --uparea-min 30 \
   --lmin 6 \
   --output-dir output \

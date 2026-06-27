@@ -1,4 +1,5 @@
 import geopandas as gpd
+import pytest
 from click.testing import CliRunner
 from shapely.geometry import LineString, Polygon
 
@@ -71,17 +72,17 @@ def test_define_roi_cli_writes_outputs(tmp_path):
     )
 
     assert result.exit_code == 0, result.output
-    assert (output_dir / "roi_areas.gpkg").exists()
-    assert (output_dir / "roi_trecs.gpkg").exists()
+    assert (output_dir / "roi_catchments.gpkg").exists()
+    assert (output_dir / "roi_segments.gpkg").exists()
 
-    roi_areas = gpd.read_file(output_dir / "roi_areas.gpkg")
-    roi_trecs = gpd.read_file(output_dir / "roi_trecs.gpkg")
-    assert list(roi_areas.columns) == EXPECTED_COLUMNS
-    assert list(roi_trecs.columns) == EXPECTED_COLUMNS
-    assert roi_areas.crs == "EPSG:3857"
-    assert roi_trecs.crs == "EPSG:3857"
-    assert list(roi_areas["strahler_order"]) == [2, 1]
-    assert list(roi_trecs["strahler_order"]) == [2, 1]
+    roi_catchments = gpd.read_file(output_dir / "roi_catchments.gpkg")
+    roi_segments = gpd.read_file(output_dir / "roi_segments.gpkg")
+    assert list(roi_catchments.columns) == EXPECTED_COLUMNS
+    assert list(roi_segments.columns) == EXPECTED_COLUMNS
+    assert roi_catchments.crs == "EPSG:3857"
+    assert roi_segments.crs == "EPSG:3857"
+    assert list(roi_catchments["strahler_order"]) == [2, 1]
+    assert list(roi_segments["strahler_order"]) == [2, 1]
 
 
 def test_define_roi_cli_reports_package_errors(tmp_path):
@@ -185,14 +186,14 @@ def test_define_roi_cli_accepts_custom_id_columns(tmp_path):
     )
 
     assert result.exit_code == 0, result.output
-    roi_areas = gpd.read_file(output_dir / "roi_areas.gpkg")
-    roi_trecs = gpd.read_file(output_dir / "roi_trecs.gpkg")
-    assert list(roi_areas.columns) == EXPECTED_COLUMNS
-    assert list(roi_trecs.columns) == EXPECTED_COLUMNS
-    assert list(roi_areas["id"]) == [10, 20]
-    assert list(roi_trecs["id"]) == [10, 20]
-    assert list(roi_areas["strahler_order"]) == [2, 1]
-    assert list(roi_trecs["strahler_order"]) == [2, 1]
+    roi_catchments = gpd.read_file(output_dir / "roi_catchments.gpkg")
+    roi_segments = gpd.read_file(output_dir / "roi_segments.gpkg")
+    assert list(roi_catchments.columns) == EXPECTED_COLUMNS
+    assert list(roi_segments.columns) == EXPECTED_COLUMNS
+    assert list(roi_catchments["id"]) == [10, 20]
+    assert list(roi_segments["id"]) == [10, 20]
+    assert list(roi_catchments["strahler_order"]) == [2, 1]
+    assert list(roi_segments["strahler_order"]) == [2, 1]
 
 
 def test_define_roi_cli_resolves_input_columns_case_insensitively(tmp_path):
@@ -249,14 +250,14 @@ def test_define_roi_cli_resolves_input_columns_case_insensitively(tmp_path):
     )
 
     assert result.exit_code == 0, result.output
-    roi_areas = gpd.read_file(output_dir / "roi_areas.gpkg")
-    roi_trecs = gpd.read_file(output_dir / "roi_trecs.gpkg")
-    assert list(roi_areas.columns) == EXPECTED_COLUMNS
-    assert list(roi_trecs.columns) == EXPECTED_COLUMNS
-    assert list(roi_areas["id"]) == [10, 20]
-    assert roi_trecs["id_down"].isna().iloc[0]
-    assert roi_trecs["id_down"].iloc[1] == 10
-    assert list(roi_trecs["strahler_order"]) == [2, 1]
+    roi_catchments = gpd.read_file(output_dir / "roi_catchments.gpkg")
+    roi_segments = gpd.read_file(output_dir / "roi_segments.gpkg")
+    assert list(roi_catchments.columns) == EXPECTED_COLUMNS
+    assert list(roi_segments.columns) == EXPECTED_COLUMNS
+    assert list(roi_catchments["id"]) == [10, 20]
+    assert roi_segments["id_down"].isna().iloc[0]
+    assert roi_segments["id_down"].iloc[1] == 10
+    assert list(roi_segments["strahler_order"]) == [2, 1]
 
 
 def test_define_roi_cli_accepts_source_crs_for_layers_without_crs(tmp_path):
@@ -303,17 +304,17 @@ def test_define_roi_cli_accepts_source_crs_for_layers_without_crs(tmp_path):
     )
 
     assert result.exit_code == 0, result.output
-    roi_areas = gpd.read_file(output_dir / "roi_areas.gpkg")
-    roi_trecs = gpd.read_file(output_dir / "roi_trecs.gpkg")
-    assert list(roi_areas.columns) == EXPECTED_COLUMNS
-    assert list(roi_trecs.columns) == EXPECTED_COLUMNS
-    assert roi_areas["unit_area"].iloc[0] == 1.0
-    assert roi_trecs["unit_length"].iloc[0] == 1.0
+    roi_catchments = gpd.read_file(output_dir / "roi_catchments.gpkg")
+    roi_segments = gpd.read_file(output_dir / "roi_segments.gpkg")
+    assert list(roi_catchments.columns) == EXPECTED_COLUMNS
+    assert list(roi_segments.columns) == EXPECTED_COLUMNS
+    assert roi_catchments["unit_area"].iloc[0] == 1.0
+    assert roi_segments["unit_length"].iloc[0] == 1.0
 
 
 def test_aggregate_cli_writes_stage2_outputs(tmp_path):
-    roi_areas_path = tmp_path / "roi_areas.gpkg"
-    roi_trecs_path = tmp_path / "roi_trecs.gpkg"
+    roi_catchments_path = tmp_path / "roi_catchments.gpkg"
+    roi_segments_path = tmp_path / "roi_segments.gpkg"
     output_dir = tmp_path / "out"
     common = {
         "id": [1, 2],
@@ -326,7 +327,7 @@ def test_aggregate_cli_writes_stage2_outputs(tmp_path):
         "upstream_area": [2.0, 1.0],
         "water_course": [1, 1],
     }
-    roi_areas = gpd.GeoDataFrame(
+    roi_catchments = gpd.GeoDataFrame(
         {
             **common,
             "geometry": [
@@ -336,7 +337,7 @@ def test_aggregate_cli_writes_stage2_outputs(tmp_path):
         },
         crs="EPSG:3857",
     )
-    roi_trecs = gpd.GeoDataFrame(
+    roi_segments = gpd.GeoDataFrame(
         {
             **common,
             "geometry": [
@@ -346,17 +347,17 @@ def test_aggregate_cli_writes_stage2_outputs(tmp_path):
         },
         crs="EPSG:3857",
     )
-    roi_areas.to_file(roi_areas_path, driver="GPKG")
-    roi_trecs.to_file(roi_trecs_path, driver="GPKG")
+    roi_catchments.to_file(roi_catchments_path, driver="GPKG")
+    roi_segments.to_file(roi_segments_path, driver="GPKG")
 
     result = CliRunner().invoke(
         main,
         [
             "aggregate",
-            "--roi-areas",
-            str(roi_areas_path),
-            "--roi-trecs",
-            str(roi_trecs_path),
+            "--roi-catchments",
+            str(roi_catchments_path),
+            "--roi-segments",
+            str(roi_segments_path),
             "--uparea-min",
             "0",
             "--lmin",
@@ -369,6 +370,14 @@ def test_aggregate_cli_writes_stage2_outputs(tmp_path):
     )
 
     assert result.exit_code == 0, result.output
-    assert (output_dir / "mareas.gpkg").exists()
-    assert (output_dir / "mtrecs.gpkg").exists()
+    assert (output_dir / "mini_catchments.gpkg").exists()
+    assert (output_dir / "mini_segments.gpkg").exists()
     assert (output_dir / "bho2mini.gpkg").exists()
+
+
+@pytest.mark.parametrize("legacy_option", ["--roi-areas", "--roi-trecs"])
+def test_aggregate_cli_rejects_legacy_input_options(legacy_option):
+    result = CliRunner().invoke(main, ["aggregate", legacy_option, "input.gpkg"])
+
+    assert result.exit_code != 0
+    assert f"No such option '{legacy_option}'" in result.output

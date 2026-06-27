@@ -109,15 +109,15 @@ Old functions:
 
 Outputs:
 
-- `roi_areas.fgb` or `roi_areas.gpkg`: ROI catchments; keep the base name for regression compatibility.
-- `roi_trecs.fgb` or `roi_trecs.gpkg`: ROI segments/streams; keep the base name for regression compatibility.
+- `roi_catchments.fgb` or `roi_catchments.gpkg`: ROI catchments.
+- `roi_segments.fgb` or `roi_segments.gpkg`: ROI segments/streams.
 
 ### Step 2: Mini-basin aggregation
 
 Inputs:
 
-- `roi_areas`: ROI catchments.
-- `roi_trecs`: ROI stream/segment network.
+- `roi_catchments`: ROI catchments.
+- `roi_segments`: ROI stream/segment network.
 - upstream area threshold: `uparea_min`
 - minimum stream length: `lmin`
 
@@ -129,8 +129,8 @@ Old functions:
 
 Outputs:
 
-- `mtrecs.fgb` or `mtrecs.gpkg`: aggregated stream/segment network.
-- `mareas.fgb` or `mareas.gpkg`: aggregated catchments.
+- `mini_segments.fgb` or `mini_segments.gpkg`: aggregated stream/segment network.
+- `mini_catchments.fgb` or `mini_catchments.gpkg`: aggregated catchments.
 - `bho2mini.fgb` or `bho2mini.gpkg`: legacy regression base name.
 
 ### Step 3: MGB files
@@ -138,8 +138,8 @@ Outputs:
 Inputs:
 
 - DEM raster.
-- Aggregated streams/segments: `mtrecs`.
-- Aggregated catchments: `mareas`.
+- Aggregated streams/segments: `mini_segments`.
+- Aggregated catchments: `mini_catchments`.
 - HRU raster.
 - Geomorphological relation parameters:
   - `a`
@@ -209,16 +209,16 @@ define-roi \
   --output-dir output/
 
 aggregate \
-  --roi-areas output/roi_areas.fgb \
-  --roi-trecs output/roi_trecs.fgb \
+  --roi-catchments output/roi_catchments.fgb \
+  --roi-segments output/roi_segments.fgb \
   --uparea-min 30 \
   --lmin 6 \
   --output-dir output/
 
 build-mini \
   --dem path/to/dem.tif \
-  --mtrecs output/mtrecs.fgb \
-  --mareas output/mareas.fgb \
+  --mini-segments output/mini_segments.fgb \
+  --mini-catchments output/mini_catchments.fgb \
   --hru path/to/hru.tif \
   --geo-a 0.89 \
   --geo-b 0.52 \
@@ -232,7 +232,7 @@ build-mini \
 run-all ...
 ```
 
-BHO users should pass BHO column names explicitly, as shown above, or use a future `--schema bho` preset. Keep output base names like `roi_areas`, `roi_trecs`, `mtrecs`, and `mareas` for now to preserve old regression comparisons, but describe them as generic catchment and segment products in new code and documentation.
+BHO users should pass BHO column names explicitly, as shown above, or use a future `--schema bho` preset. Output names use generic catchment and segment terminology.
 
 ## Dependency Direction
 

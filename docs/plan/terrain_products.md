@@ -13,8 +13,8 @@ The initial outputs are:
 
 ## Planned Inputs
 
-- ROI stream or segment vectors, currently produced as `roi_trecs.<ext>`.
-- ROI catchment polygons, currently produced as `roi_areas.<ext>`.
+- ROI stream or segment vectors, currently produced as `roi_segments.<ext>`.
+- ROI catchment polygons, currently produced as `roi_catchments.<ext>`.
 - DEM raster.
 
 Later implementations may also accept aggregated mini-basin products when that is useful, but the first design target is terrain products from the ROI vectors so the terrain basis remains tied to the selected hydrographic network.
