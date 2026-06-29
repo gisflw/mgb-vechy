@@ -14,6 +14,7 @@ from mgb_vec_hydro.io import (
 )
 from mgb_vec_hydro.roi import DEFAULT_STRAHLER_ORDER_COL, define_roi
 from mgb_vec_hydro.topology import resolve_column_name
+from mgb_vec_hydro.terrain import create_terrain_products
 
 
 @click.group()
@@ -139,6 +140,71 @@ def aggregate_command(
     click.echo(f"Wrote {paths.catchments}")
     click.echo(f"Wrote {paths.segments}")
     click.echo(f"Wrote {paths.mapping}")
+
+
+@main.command("terrain-products")
+@click.option(
+    "--dem",
+    "dem_path",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    required=True,
+)
+@click.option(
+    "--roi-catchments",
+    "roi_catchments_path",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    required=True,
+)
+@click.option(
+    "--roi-segments",
+    "roi_segments_path",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    required=True,
+)
+@click.option("--id-col", default="id", show_default=True)
+@click.option(
+    "--output-dir",
+    type=click.Path(file_okay=False, path_type=Path),
+    required=True,
+)
+@click.option("--write-flow-direction", is_flag=True)
+def terrain_products_command(
+    dem_path: Path,
+    roi_catchments_path: Path,
+    roi_segments_path: Path,
+    id_col: str,
+    output_dir: Path,
+    write_flow_direction: bool,
+) -> None:
+    """Generate catchment-confined HAND and LTND rasters."""
+
+    try:
+        report = create_terrain_products(
+            dem_path,
+            read_vector(roi_catchments_path),
+            read_vector(roi_segments_path),
+            output_dir,
+            id_col=id_col,
+            write_flow_direction=write_flow_direction,
+        )
+    except MgbVecHydroError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+    click.echo(f"Wrote {report.paths.hand}")
+    click.echo(f"Wrote {report.paths.ltnd}")
+    if report.paths.flow_direction:
+        click.echo(f"Wrote {report.paths.flow_direction}")
+    click.echo(
+        f"Cells: {report.owned_cells} owned, {report.drainage_cells} drainage; "
+        f"unreachable components: {report.unreachable_components}"
+    )
+    if report.negative_hand_cells:
+        click.echo(
+            f"Negative HAND: {report.negative_hand_cells} cells, "
+            f"range {report.negative_hand_min:g} to {report.negative_hand_max:g} m"
+        )
+    else:
+        click.echo("Negative HAND: 0 cells")
 
 
 def _coerce_outlet_ids(outlet_ids: tuple[str, ...], segment_id_series):

@@ -53,6 +53,20 @@ This command writes:
 
 See [docs/stage2_aggregation_cli.md](docs/stage2_aggregation_cli.md) for aggregation CLI details.
 
+Generate drainage-rooted terrain products:
+
+```bash
+mgb-vec-hydro terrain-products \
+  --dem path/to/dem.tif \
+  --roi-catchments output/roi_catchments.fgb \
+  --roi-segments output/roi_segments.fgb \
+  --output-dir output \
+  --write-flow-direction
+```
+
+This writes aligned, ROI-cropped `hand.tif` and `ltnd.tif`, and optionally
+`flow_direction.tif`.
+
 ## Development
 
 Use an isolated Python environment for local work. Installation packaging for end users is intentionally deferred while the library API and workflow stabilize.

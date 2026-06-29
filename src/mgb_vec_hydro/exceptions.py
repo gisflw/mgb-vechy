@@ -28,3 +28,7 @@ class TopologyCycleError(MgbVecHydroError):
 
 class UnsupportedOutputFormatError(MgbVecHydroError):
     """Raised when the requested vector output format is unsupported."""
+
+
+class TerrainProductsError(MgbVecHydroError):
+    """Raised when terrain-product inputs cannot be routed safely."""

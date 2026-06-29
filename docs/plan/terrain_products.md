@@ -29,18 +29,25 @@ Later implementations may also accept aggregated mini-basin products when that i
 
 This step should not compute HRU classes, sample mini-basin attributes, or write MGB text files.
 
-## Flow Direction Design
+## Drainage-rooted routing
 
-Flow-direction handling is intentionally deferred.
+The implementation rasterizes explicit pixel ownership and computes an
+eight-neighbour geodesic rank outward from each catchment's matching segment.
+Elevation deterministically selects a parent only among neighbours one rank
+closer to drainage. It prefers the steepest descent, then the least uphill
+breach, with step length and N–NW direction order as tie-breakers.
 
-The first implementation discussion should focus on producing vector-compatible `hand.tif` and `ltnd.tif`. During that work, we should decide whether flow directions are:
+This differs from the legacy workflow in several intentional ways:
 
-- derived internally from a conditioned DEM,
-- provided by the user and validated against vectors,
-- represented as an optional advanced input,
-- or avoided for the first terrain-products implementation.
+- polygon outlines are not excluded, so adjacent catchments have no nodata seam;
+- parent choice is deterministic rather than wavefront-order-sensitive;
+- LTND accumulates floating-point distances rather than truncated integers;
+- distances use the DEM's projected metric CRS and rectangular pixel dimensions;
+- no AGREE burn or DEM fill is needed because ranks guarantee connection.
 
-The documentation should not promise a flow-direction interface until that design is settled.
+`hand.tif` and `ltnd.tif` are always written. `--write-flow-direction` also
+writes codes `-1` nodata, `0` drainage, and `1` through `8` for N, NE, E, SE,
+S, SW, W, and NW.
 
 ## Legacy Mapping
 
