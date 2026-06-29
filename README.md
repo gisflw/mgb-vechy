@@ -2,7 +2,8 @@
 
 MGB-Vec-Hydro is a standalone Python library and command-line interface for preparing vector hydrography inputs for MGB workflows. The project is extracting the computational parts of the legacy BHO2MGB plugin into a reusable package that works from explicit network topology columns instead of QGIS APIs.
 
-The current implemented workflow covers ROI definition and mini-basin aggregation from normalized ROI products.
+The implemented workflow covers ROI definition, mini-basin aggregation, and
+terrain products aligned with the normalized ROI hydrography.
 
 ## Scope
 
@@ -72,6 +73,9 @@ The routing DEM is catchment-confined AGREE-conditioned by default. Use
 stream-incision profile; the buffer is measured in raster pixels. HAND
 elevations continue to come from the unmodified DEM.
 
+See [docs/stage3_terrain_cli.md](docs/stage3_terrain_cli.md) for input
+requirements, output details, and routing behavior.
+
 ## Development
 
 Use an isolated Python environment for local work. Installation packaging for end users is intentionally deferred while the library API and workflow stabilize.
@@ -83,8 +87,12 @@ pytest
 
 ## Roadmap
 
-The refactor goal is documented in [docs/refactor_goal.md](docs/refactor_goal.md). The planned workflow stages are:
+The refactor goal is documented in
+[docs/refactor_goal.md](docs/refactor_goal.md). ROI definition, mini-basin
+aggregation, and terrain-product generation are implemented. The remaining
+planned work is:
 
-1. Define a region of interest from catchment polygons, stream/segment networks, and outlet IDs.
-2. Aggregate vector hydrographic units into MGB mini-basins.
-3. Generate MGB output files such as `MINI.gtp`, `COTA_AREA.flp`, and vector mini-basin products.
+1. Build improved HRU classes from terrain and land-cover rasters.
+2. Sample terrain and HRU attributes onto mini-basins and reaches.
+3. Generate MGB output files such as `MINI.gtp`, `COTA_AREA.flp`, and vector
+   mini-basin products.
