@@ -1,7 +1,8 @@
-"""Terrain-driven basin routing and raster products.
+"""AGREE-conditioned terrain-driven basin routing and raster products.
 
-Natural D8 drainage is retained except on flats and targeted shallow-breach
-corridors that connect trapped basins to the supplied drainage.
+Natural D8 drainage on the conditioned DEM is retained except on flats and
+targeted shallow-breach corridors that connect trapped basins to the supplied
+drainage. HAND elevations continue to use the unmodified DEM.
 """
 
 from __future__ import annotations
@@ -56,6 +57,7 @@ class TerrainProductReport:
     routing_seconds: float = 0.0
     jit_compilation_seconds: float = 0.0
     raster_io_seconds: float = 0.0
+    conditioning_seconds: float = 0.0
 
 
 def _pixel_sizes(transform: Affine) -> tuple[float, float]:
@@ -82,6 +84,87 @@ def _validate_arrays(
         )
     if not np.issubdtype(labels.dtype, np.integer):
         raise TerrainProductsError("Catchment labels must be an integer array")
+
+
+def _validate_agree_parameters(
+    sharp: float,
+    smooth: float,
+    buffer: int,
+) -> None:
+    if not np.isfinite(sharp) or sharp < 0:
+        raise TerrainProductsError("AGREE sharp value must be finite and non-negative")
+    if not np.isfinite(smooth) or smooth < 0:
+        raise TerrainProductsError("AGREE smooth value must be finite and non-negative")
+    if (
+        isinstance(buffer, (bool, np.bool_))
+        or not np.isscalar(buffer)
+        or not np.isfinite(buffer)
+        or int(buffer) != buffer
+        or buffer < 0
+    ):
+        raise TerrainProductsError("AGREE buffer must be a non-negative integer")
+
+
+def _agree_condition_dem(
+    elevation: np.ndarray,
+    catchment_labels: np.ndarray,
+    drainage_mask: np.ndarray,
+    *,
+    sharp: float = 80.0,
+    smooth: float = 8.0,
+    buffer: int = 4,
+) -> np.ndarray:
+    """Return a catchment-confined AGREE-conditioned copy of a DEM."""
+
+    elevation = np.asarray(elevation)
+    labels = np.asarray(catchment_labels)
+    drainage = np.asarray(drainage_mask, dtype=bool)
+    _validate_arrays(elevation, labels, drainage)
+    _validate_agree_parameters(sharp, smooth, buffer)
+    valid = (labels >= 0) & np.isfinite(elevation)
+    if np.any(drainage & ~valid):
+        raise TerrainProductsError("Drainage cells must be finite owned cells")
+    return _agree_condition_kernel(
+        elevation.astype(np.float64, copy=False),
+        labels.astype(np.int64, copy=False),
+        drainage,
+        float(sharp),
+        float(smooth),
+        int(buffer),
+    )
+
+
+@njit(cache=True)
+def _agree_condition_kernel(elevation, labels, drainage, sharp, smooth, buffer):
+    """Apply the AGREE profile using Euclidean distances in raster pixels."""
+    rows, cols = elevation.shape
+    distance = np.full((rows, cols), np.inf, np.float64)
+    for r in range(rows):
+        for c in range(cols):
+            if not drainage[r, c]:
+                continue
+            owner = labels[r, c]
+            for dr in range(-buffer, buffer + 1):
+                nr = r + dr
+                if nr < 0 or nr >= rows:
+                    continue
+                for dc in range(-buffer, buffer + 1):
+                    nc = c + dc
+                    if nc < 0 or nc >= cols:
+                        continue
+                    candidate = math.sqrt(dr * dr + dc * dc)
+                    if (candidate <= buffer and labels[nr, nc] == owner
+                            and np.isfinite(elevation[nr, nc])
+                            and candidate < distance[nr, nc]):
+                        distance[nr, nc] = candidate
+    conditioned = elevation.copy()
+    for r in range(rows):
+        for c in range(cols):
+            if np.isfinite(distance[r, c]):
+                conditioned[r, c] += smooth * (distance[r, c] - buffer)
+                if drainage[r, c]:
+                    conditioned[r, c] -= sharp
+    return conditioned
 
 
 def compute_flow_directions(
@@ -647,6 +730,30 @@ def _routing_rank(direction: np.ndarray) -> np.ndarray:
         raise TerrainProductsError(str(exc)) from exc
 
 
+def _rasterize_drainage(
+    ordered_catchments: gpd.GeoDataFrame,
+    segments: gpd.GeoDataFrame,
+    id_col: str,
+    shape: tuple[int, int],
+    transform: Affine,
+    labels: np.ndarray,
+) -> np.ndarray:
+    """Rasterize matching segments as catchment-confined, all-touched cells."""
+    drainage = np.zeros(shape, dtype=bool)
+    segment_by_id = segments.set_index(id_col)
+    for index, (_, feature) in enumerate(ordered_catchments.iterrows()):
+        geometry = segment_by_id.loc[feature[id_col]].geometry
+        drainage |= rasterize(
+            [(geometry, 1)],
+            out_shape=shape,
+            transform=transform,
+            fill=0,
+            dtype="uint8",
+            all_touched=True,
+        ).astype(bool) & (labels == index)
+    return drainage
+
+
 def create_terrain_products(
     dem_path: str | Path,
     catchments: gpd.GeoDataFrame,
@@ -655,10 +762,14 @@ def create_terrain_products(
     *,
     id_col: str = "id",
     write_flow_direction: bool = False,
+    agree_sharp: float = 80.0,
+    agree_smooth: float = 8.0,
+    agree_buffer: int = 4,
 ) -> TerrainProductReport:
     """Validate vectors, route them on the DEM grid, and publish tiled GeoTIFFs."""
 
     _validate_vectors(catchments, segments, id_col)
+    _validate_agree_parameters(agree_sharp, agree_smooth, agree_buffer)
     dem_path, output_dir = Path(dem_path), Path(output_dir)
     io_started = time.perf_counter()
     with rasterio.open(dem_path) as src:
@@ -684,21 +795,28 @@ def create_terrain_products(
             ((geom, index) for index, geom in enumerate(ordered.geometry)),
             out_shape=shape, transform=transform, fill=-1, dtype="int32",
         )
-        drainage = np.zeros(shape, dtype=bool)
-        segment_by_id = segments.set_index(id_col)
-        for index, (_, feature) in enumerate(ordered.iterrows()):
-            geometry = segment_by_id.loc[feature[id_col]].geometry
-            drainage |= rasterize(
-                [(geometry, 1)], out_shape=shape, transform=transform,
-                fill=0, dtype="uint8",
-            ).astype(bool) & (labels == index)
+        drainage = _rasterize_drainage(
+            ordered, segments, id_col, shape, transform, labels
+        )
 
         raster_io_seconds = time.perf_counter() - io_started
         jit_started = time.perf_counter()
         _warm_routing_kernels()
         jit_compilation_seconds = time.perf_counter() - jit_started
+        conditioning_started = time.perf_counter()
+        routing_elevation = _agree_condition_dem(
+            elevation,
+            labels,
+            drainage,
+            sharp=agree_sharp,
+            smooth=agree_smooth,
+            buffer=agree_buffer,
+        )
+        conditioning_seconds = time.perf_counter() - conditioning_started
         routing_started = time.perf_counter()
-        direction, rank = compute_flow_directions(elevation, labels, drainage, transform)
+        direction, rank = compute_flow_directions(
+            routing_elevation, labels, drainage, transform
+        )
         hand = compute_hand(elevation, direction, rank).astype("float32")
         ltnd = compute_ltnd(direction, transform, rank).astype("float32")
         routing_seconds = time.perf_counter() - routing_started
@@ -729,7 +847,13 @@ def create_terrain_products(
                 with rasterio.open(path, "w", **out_profile) as dst:
                     dst.write(data, 1)
                     dst.update_tags(
-                        routing="terrain-driven basin routing with targeted shallow breaching",
+                        routing=(
+                            "terrain-driven basin routing with catchment-confined "
+                            "AGREE conditioning and targeted shallow breaching"
+                        ),
+                        agree_sharp=agree_sharp,
+                        agree_smooth=agree_smooth,
+                        agree_buffer_pixels=agree_buffer,
                         direction_codes="-1 nodata, 0 drainage, 1-8 N NE E SE S SW W NW",
                     )
                 staged.append((path, output_dir / name))
@@ -749,16 +873,18 @@ def create_terrain_products(
         routing_seconds,
         jit_compilation_seconds,
         raster_io_seconds,
+        conditioning_seconds,
     )
 
 
 def _warm_routing_kernels() -> None:
     """Load/compile cached kernels separately from measured production routing."""
-    if _ltnd_kernel.signatures:
+    if _ltnd_kernel.signatures and _agree_condition_kernel.signatures:
         return
     elevation = np.array([[1.0, 0.0]], dtype=np.float64)
     labels = np.zeros((1, 2), dtype=np.int64)
     drainage = np.array([[False, True]])
+    _agree_condition_dem(elevation, labels, drainage)
     direction, rank = compute_flow_directions(
         elevation, labels, drainage, Affine(1, 0, 0, 0, -1, 0)
     )

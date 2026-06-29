@@ -20,6 +20,18 @@ EXPECTED_COLUMNS = [
 ]
 
 
+def test_terrain_products_cli_exposes_agree_controls():
+    result = CliRunner().invoke(main, ["terrain-products", "--help"])
+
+    assert result.exit_code == 0
+    assert "--agree-sharp" in result.output
+    assert "--agree-smooth" in result.output
+    assert "--agree-buffer" in result.output
+    assert "80" in result.output
+    assert "8" in result.output
+    assert "4" in result.output
+
+
 def test_define_roi_cli_writes_outputs(tmp_path):
     catchments_path = tmp_path / "catchments.gpkg"
     segments_path = tmp_path / "segments.gpkg"

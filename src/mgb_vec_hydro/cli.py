@@ -168,6 +168,27 @@ def aggregate_command(
     required=True,
 )
 @click.option("--write-flow-direction", is_flag=True)
+@click.option(
+    "--agree-sharp",
+    type=click.FloatRange(min=0),
+    default=80.0,
+    show_default=True,
+    help="Additional stream-cell incision in DEM elevation units.",
+)
+@click.option(
+    "--agree-smooth",
+    type=click.FloatRange(min=0),
+    default=8.0,
+    show_default=True,
+    help="AGREE ramp depth per pixel toward the stream.",
+)
+@click.option(
+    "--agree-buffer",
+    type=click.IntRange(min=0),
+    default=4,
+    show_default=True,
+    help="AGREE conditioning radius in raster pixels.",
+)
 def terrain_products_command(
     dem_path: Path,
     roi_catchments_path: Path,
@@ -175,6 +196,9 @@ def terrain_products_command(
     id_col: str,
     output_dir: Path,
     write_flow_direction: bool,
+    agree_sharp: float,
+    agree_smooth: float,
+    agree_buffer: int,
 ) -> None:
     """Generate catchment-confined HAND and LTND rasters."""
 
@@ -186,6 +210,9 @@ def terrain_products_command(
             output_dir,
             id_col=id_col,
             write_flow_direction=write_flow_direction,
+            agree_sharp=agree_sharp,
+            agree_smooth=agree_smooth,
+            agree_buffer=agree_buffer,
         )
     except MgbVecHydroError as exc:
         raise click.ClickException(str(exc)) from exc
@@ -199,7 +226,8 @@ def terrain_products_command(
         f"unreachable components: {report.unreachable_components}"
     )
     click.echo(
-        f"Timing: routing {report.routing_seconds:.3f}s, "
+        f"Timing: conditioning {report.conditioning_seconds:.3f}s, "
+        f"routing {report.routing_seconds:.3f}s, "
         f"JIT/cache initialization {report.jit_compilation_seconds:.3f}s, "
         f"raster I/O {report.raster_io_seconds:.3f}s"
     )

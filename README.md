@@ -67,6 +67,11 @@ mgb-vec-hydro terrain-products \
 This writes aligned, ROI-cropped `hand.tif` and `ltnd.tif`, and optionally
 `flow_direction.tif`.
 
+The routing DEM is catchment-confined AGREE-conditioned by default. Use
+`--agree-sharp`, `--agree-smooth`, and `--agree-buffer` to tune its 80/8/4
+stream-incision profile; the buffer is measured in raster pixels. HAND
+elevations continue to come from the unmodified DEM.
+
 ## Development
 
 Use an isolated Python environment for local work. Installation packaging for end users is intentionally deferred while the library API and workflow stabilize.

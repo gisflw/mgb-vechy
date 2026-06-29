@@ -29,12 +29,19 @@ Later implementations may also accept aggregated mini-basin products when that i
 
 This step should not compute HRU classes, sample mini-basin attributes, or write MGB text files.
 
-## Terrain-driven basin routing with targeted shallow breaching
+## AGREE-conditioned terrain-driven basin routing
+
+Segments are rasterized with all-touched semantics and clipped to their
+matching catchments. Before routing, the DEM is conditioned within each
+catchment using an AGREE profile: stream cells receive a sharp incision and a
+smooth Euclidean-distance ramp extends outward for a configurable number of
+raster pixels. The default profile is 80 elevation units of sharp incision,
+8 elevation units per pixel of smoothing, and a 4-pixel buffer.
 
 Rasterized stream cells are terminals. Every other non-flat cell initially
-keeps its steepest metric downhill D8 direction within its catchment. Equal
-elevation components route toward their lowest natural downslope outlet; closed
-flats and pits remain local depression terminals.
+keeps its steepest metric downhill D8 direction on the conditioned DEM within
+its catchment. Equal elevation components route toward their lowest natural
+downslope outlet; closed flats and pits remain local depression terminals.
 
 The local D8 trees are labeled by terminal and reduced to a basin adjacency
 graph. Trapped basins connect to stream-connected basins by paths minimizing,
@@ -49,7 +56,7 @@ Important implementation properties are:
 - parent choice is deterministic rather than wavefront-order-sensitive;
 - LTND accumulates floating-point distances rather than truncated integers;
 - distances use the DEM's projected metric CRS and rectangular pixel dimensions;
-- no resolution-sensitive AGREE burn is required;
+- AGREE conditioning is catchment-confined and leaves the source DEM unchanged;
 - explicit ownership confines every route to its matching catchment and stream.
 
 Rank and order arrays are internal traversal aids for propagating raster
@@ -57,6 +64,11 @@ products. They do not constrain or select ordinary flow directions. Cell
 traversal, flat resolution, basin labeling, boundary scanning, corridor
 reversal, HAND, and LTND use cached Numba kernels; the priority queue operates
 only on the much smaller basin graph.
+
+HAND values use the unmodified DEM elevations, while directions and breach
+costs use the conditioned routing DEM. The CLI options `--agree-sharp`,
+`--agree-smooth`, and `--agree-buffer` control the profile; buffer distance is
+measured in raster pixels.
 
 `hand.tif` and `ltnd.tif` are always written. `--write-flow-direction` also
 writes codes `-1` nodata, `0` drainage, and `1` through `8` for N, NE, E, SE,
