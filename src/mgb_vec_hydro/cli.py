@@ -198,6 +198,11 @@ def terrain_products_command(
         f"Cells: {report.owned_cells} owned, {report.drainage_cells} drainage; "
         f"unreachable components: {report.unreachable_components}"
     )
+    click.echo(
+        f"Timing: routing {report.routing_seconds:.3f}s, "
+        f"JIT/cache initialization {report.jit_compilation_seconds:.3f}s, "
+        f"raster I/O {report.raster_io_seconds:.3f}s"
+    )
     if report.negative_hand_cells:
         click.echo(
             f"Negative HAND: {report.negative_hand_cells} cells, "

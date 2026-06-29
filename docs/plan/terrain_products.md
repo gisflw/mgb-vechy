@@ -29,27 +29,40 @@ Later implementations may also accept aggregated mini-basin products when that i
 
 This step should not compute HRU classes, sample mini-basin attributes, or write MGB text files.
 
-## Drainage-rooted routing
+## Terrain-driven basin routing with targeted shallow breaching
 
-The implementation rasterizes explicit pixel ownership and computes an
-eight-neighbour geodesic rank outward from each catchment's matching segment.
-Elevation deterministically selects a parent only among neighbours one rank
-closer to drainage. It prefers the steepest descent, then the least uphill
-breach, with step length and N–NW direction order as tie-breakers.
+Rasterized stream cells are terminals. Every other non-flat cell initially
+keeps its steepest metric downhill D8 direction within its catchment. Equal
+elevation components route toward their lowest natural downslope outlet; closed
+flats and pits remain local depression terminals.
 
-This differs from the legacy workflow in several intentional ways:
+The local D8 trees are labeled by terminal and reduced to a basin adjacency
+graph. Trapped basins connect to stream-connected basins by paths minimizing,
+in order, maximum required cut depth, cumulative excavation, and metric
+corridor length. Only the chosen terminal-to-divide corridors are reversed.
+All other natural D8 directions remain unchanged. Row-major boundary position
+is used only as a final deterministic fallback when costs are exactly equal.
+
+Important implementation properties are:
 
 - polygon outlines are not excluded, so adjacent catchments have no nodata seam;
 - parent choice is deterministic rather than wavefront-order-sensitive;
 - LTND accumulates floating-point distances rather than truncated integers;
 - distances use the DEM's projected metric CRS and rectangular pixel dimensions;
-- no AGREE burn or DEM fill is needed because ranks guarantee connection.
+- no resolution-sensitive AGREE burn is required;
+- explicit ownership confines every route to its matching catchment and stream.
+
+Rank and order arrays are internal traversal aids for propagating raster
+products. They do not constrain or select ordinary flow directions. Cell
+traversal, flat resolution, basin labeling, boundary scanning, corridor
+reversal, HAND, and LTND use cached Numba kernels; the priority queue operates
+only on the much smaller basin graph.
 
 `hand.tif` and `ltnd.tif` are always written. `--write-flow-direction` also
 writes codes `-1` nodata, `0` drainage, and `1` through `8` for N, NE, E, SE,
 S, SW, W, and NW.
 
-## Legacy Mapping
+## Historical implementation mapping
 
 The legacy plugin bundled this responsibility into the final MGB task. Relevant legacy pieces include:
 

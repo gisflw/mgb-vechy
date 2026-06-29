@@ -1,21 +1,22 @@
-"""Drainage-rooted terrain routing and raster products.
+"""Terrain-driven basin routing and raster products.
 
-The routing used here is deliberately not D8: topology is established first by
-an eight-neighbour breadth-first search from the supplied drainage, and the DEM
-only chooses a deterministic parent among neighbours one rank closer to it.
+Natural D8 drainage is retained except on flats and targeted shallow-breach
+corridors that connect trapped basins to the supplied drainage.
 """
 
 from __future__ import annotations
 
-from collections import deque
 from dataclasses import dataclass
+import heapq
 import math
 import os
 from pathlib import Path
 import tempfile
+import time
 
 import geopandas as gpd
 import numpy as np
+from numba import njit
 import rasterio
 from affine import Affine
 from rasterio.features import rasterize
@@ -31,6 +32,9 @@ _DIRECTIONS = (
     (5, 1, 0), (6, 1, -1), (7, 0, -1), (8, -1, -1),
 )
 _DELTAS = {code: (dr, dc) for code, dr, dc in _DIRECTIONS}
+_OPPOSITE = {1: 5, 2: 6, 3: 7, 4: 8, 5: 1, 6: 2, 7: 3, 8: 4}
+_DR = np.array([-1, -1, 0, 1, 1, 1, 0, -1], dtype=np.int8)
+_DC = np.array([0, 1, 1, 1, 0, -1, -1, -1], dtype=np.int8)
 
 
 @dataclass(frozen=True)
@@ -49,6 +53,9 @@ class TerrainProductReport:
     negative_hand_cells: int
     negative_hand_min: float | None
     negative_hand_max: float | None
+    routing_seconds: float = 0.0
+    jit_compilation_seconds: float = 0.0
+    raster_io_seconds: float = 0.0
 
 
 def _pixel_sizes(transform: Affine) -> tuple[float, float]:
@@ -83,10 +90,16 @@ def compute_flow_directions(
     drainage_mask: np.ndarray,
     transform: Affine,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Return deterministic drainage-rooted parent directions and BFS ranks.
+    """Return terrain-driven D8 directions with targeted shallow breaching.
 
     Negative catchment labels and non-finite elevations are nodata. Rank is
     ``-1`` there; drainage cells have rank and direction zero.
+
+    Ordinary cells use their steepest metric downhill neighbour. Flats drain to
+    their lowest natural outlet, while pits and closed flats form local basins.
+    Trapped basins are connected on a basin adjacency graph by corridors that
+    minimize maximum cut depth, cumulative excavation, and metric length.
+    Returned ranks are traversal aids only; they never constrain ordinary flow.
     """
 
     elevation = np.asarray(elevation)
@@ -98,69 +111,441 @@ def compute_flow_directions(
     if np.any(drainage & ~valid):
         raise TerrainProductsError("Drainage cells must be finite owned cells")
 
-    rows, cols = elevation.shape
-    rank = np.full((rows, cols), -1, dtype=np.int32)
-    direction = np.full((rows, cols), -1, dtype=np.int8)
-    queue: deque[tuple[int, int]] = deque()
-    for row, col in np.argwhere(drainage & valid):
-        row, col = int(row), int(col)
-        rank[row, col] = 0
-        direction[row, col] = 0
-        queue.append((row, col))
+    direction = _natural_d8_and_flats(
+        elevation.astype(np.float64, copy=False),
+        labels.astype(np.int64, copy=False),
+        drainage,
+        pixel_width,
+        pixel_height,
+    )
+    rank, terminal = _rank_and_terminal(direction)
+    basin, unique_terminals = _label_basins(terminal)
+    stream_basin = np.zeros(unique_terminals.size, dtype=bool)
+    stream_basin[np.unique(basin[drainage])] = True
 
-    # Multi-source geodesic distance, constrained by the owner label.
-    while queue:
-        row, col = queue.popleft()
-        owner = labels[row, col]
-        next_rank = rank[row, col] + 1
-        for _, dr, dc in _DIRECTIONS:
-            nr, nc = row + dr, col + dc
-            if (
-                0 <= nr < rows and 0 <= nc < cols
-                and valid[nr, nc] and labels[nr, nc] == owner
-                and rank[nr, nc] < 0
-            ):
-                rank[nr, nc] = next_rank
-                queue.append((nr, nc))
-
-    unreachable = valid & (rank < 0)
-    if np.any(unreachable):
-        components = _count_components(unreachable, labels)
-        cells = int(unreachable.sum())
+    order = _rank_order(rank)
+    cut_max, cut_sum, corridor_length = _corridor_costs(
+        elevation.astype(np.float64, copy=False), direction, terminal, order,
+        pixel_width, pixel_height,
+    )
+    edge_data = _scan_basin_boundaries(
+        basin, labels.astype(np.int64, copy=False), cut_max, cut_sum,
+        corridor_length, pixel_width, pixel_height,
+    )
+    selected = _basin_paths_to_stream(
+        unique_terminals.size, stream_basin, edge_data
+    )
+    if np.any((~stream_basin) & (selected < 0)):
+        trapped = (~stream_basin) & (selected < 0)
+        cells = int(np.isin(basin, np.flatnonzero(trapped)).sum())
         raise TerrainProductsError(
-            f"{cells} owned cells in {components} raster-connected component(s) "
-            "cannot connect to matching drainage"
+            f"{cells} owned cells in trapped basin(s) cannot connect to matching drainage"
         )
-
-    diagonal = math.hypot(pixel_width, pixel_height)
-    distances = {
-        1: pixel_height, 2: diagonal, 3: pixel_width, 4: diagonal,
-        5: pixel_height, 6: diagonal, 7: pixel_width, 8: diagonal,
-    }
-    # Each cell independently chooses only among rank r-1 neighbours.
-    for row, col in np.argwhere(valid & ~drainage):
-        row, col = int(row), int(col)
-        candidates: list[tuple[tuple[float, ...], int]] = []
-        z = float(elevation[row, col])
-        for code, dr, dc in _DIRECTIONS:
-            nr, nc = row + dr, col + dc
-            if (
-                0 <= nr < rows and 0 <= nc < cols
-                and labels[nr, nc] == labels[row, col]
-                and rank[nr, nc] == rank[row, col] - 1
-            ):
-                dz = z - float(elevation[nr, nc])
-                distance = distances[code]
-                if dz > 0:
-                    key = (0.0, -(dz / distance), distance, float(code))
-                else:
-                    key = (1.0, (-dz / distance), distance, float(code))
-                candidates.append((key, code))
-        if not candidates:  # Defensive: BFS guarantees this cannot occur.
-            raise TerrainProductsError(f"Cell ({row}, {col}) has no valid parent")
-        direction[row, col] = min(candidates, key=lambda item: item[0])[1]
-
+    direction = _reverse_selected_corridors(direction, edge_data, selected)
+    rank, _ = _rank_and_terminal(direction)
     return direction, rank
+
+
+@njit(cache=True)
+def _natural_d8_and_flats(elevation, labels, drainage, width, height):
+    """Assign strict D8 descent, then resolve equal-elevation components."""
+    rows, cols = elevation.shape
+    size = rows * cols
+    direction = np.full((rows, cols), -1, np.int8)
+    unresolved = np.zeros((rows, cols), np.uint8)
+    distances = np.array(
+        [height, math.hypot(width, height), width, math.hypot(width, height),
+         height, math.hypot(width, height), width, math.hypot(width, height)]
+    )
+    for r in range(rows):
+        for c in range(cols):
+            if labels[r, c] < 0 or not np.isfinite(elevation[r, c]):
+                continue
+            if drainage[r, c]:
+                direction[r, c] = 0
+                continue
+            best_slope = 0.0
+            best_index = size
+            best_code = -1
+            for k in range(8):
+                nr, nc = r + _DR[k], c + _DC[k]
+                if (0 <= nr < rows and 0 <= nc < cols
+                        and labels[nr, nc] == labels[r, c]
+                        and np.isfinite(elevation[nr, nc])
+                        and elevation[nr, nc] < elevation[r, c]):
+                    slope = (elevation[r, c] - elevation[nr, nc]) / distances[k]
+                    index = nr * cols + nc
+                    if slope > best_slope or (slope == best_slope and index < best_index):
+                        best_slope, best_index, best_code = slope, index, k + 1
+            if best_code > 0:
+                direction[r, c] = best_code
+            else:
+                unresolved[r, c] = 1
+
+    # Work arrays are reused for every flat, keeping memory linear.
+    seen = np.zeros((rows, cols), np.uint8)
+    in_component = np.zeros((rows, cols), np.uint8)
+    queue = np.empty(size, np.int64)
+    component = np.empty(size, np.int64)
+    for sr in range(rows):
+        for sc in range(cols):
+            if unresolved[sr, sc] == 0 or seen[sr, sc] != 0:
+                continue
+            z = elevation[sr, sc]
+            owner = labels[sr, sc]
+            head, tail, count = 0, 1, 0
+            queue[0] = sr * cols + sc
+            seen[sr, sc] = 1
+            lowest_outlet = np.inf
+            while head < tail:
+                index = queue[head]
+                head += 1
+                r, c = index // cols, index % cols
+                component[count] = index
+                count += 1
+                in_component[r, c] = 1
+                if direction[r, c] > 0:
+                    k = direction[r, c] - 1
+                    lowest_outlet = min(lowest_outlet, elevation[r + _DR[k], c + _DC[k]])
+                elif direction[r, c] == 0:
+                    lowest_outlet = min(lowest_outlet, z)
+                for k in range(8):
+                    nr, nc = r + _DR[k], c + _DC[k]
+                    if (0 <= nr < rows and 0 <= nc < cols and seen[nr, nc] == 0
+                            and labels[nr, nc] == owner
+                            and np.isfinite(elevation[nr, nc])
+                            and elevation[nr, nc] == z):
+                        seen[nr, nc] = 1
+                        queue[tail] = nr * cols + nc
+                        tail += 1
+
+            # Seed a breadth-first routing from natural outlets at the lowest
+            # downslope elevation. Closed flats use their row-major first cell.
+            head, tail = 0, 0
+            for i in range(count):
+                index = component[i]
+                r, c = index // cols, index % cols
+                seed = direction[r, c] == 0
+                if direction[r, c] > 0:
+                    k = direction[r, c] - 1
+                    seed = elevation[r + _DR[k], c + _DC[k]] == lowest_outlet
+                if seed:
+                    queue[tail] = index
+                    tail += 1
+            if tail == 0:
+                root = component[0]
+                direction[root // cols, root % cols] = 0
+                unresolved[root // cols, root % cols] = 0
+                queue[0] = root
+                tail = 1
+            while head < tail:
+                index = queue[head]
+                head += 1
+                r, c = index // cols, index % cols
+                for k in range(8):
+                    nr, nc = r + _DR[k], c + _DC[k]
+                    if (0 <= nr < rows and 0 <= nc < cols
+                            and in_component[nr, nc] != 0
+                            and unresolved[nr, nc] != 0):
+                        # Point toward the already routed flat cell.
+                        direction[nr, nc] = ((k + 4) % 8) + 1
+                        unresolved[nr, nc] = 0
+                        queue[tail] = nr * cols + nc
+                        tail += 1
+            # Cells with their own strict downhill direction are deliberately
+            # not rewritten. Such cells can partition the unresolved part of
+            # a plateau, so use every natural outlet as a fallback seed for
+            # any portion the globally lowest outlet could not reach.
+            head, tail = 0, 0
+            for i in range(count):
+                index = component[i]
+                r, c = index // cols, index % cols
+                if direction[r, c] >= 0:
+                    queue[tail] = index
+                    tail += 1
+            while head < tail:
+                index = queue[head]
+                head += 1
+                r, c = index // cols, index % cols
+                for k in range(8):
+                    nr, nc = r + _DR[k], c + _DC[k]
+                    if (0 <= nr < rows and 0 <= nc < cols
+                            and in_component[nr, nc] != 0
+                            and unresolved[nr, nc] != 0):
+                        direction[nr, nc] = ((k + 4) % 8) + 1
+                        unresolved[nr, nc] = 0
+                        queue[tail] = nr * cols + nc
+                        tail += 1
+            for i in range(count):
+                index = component[i]
+                in_component[index // cols, index % cols] = 0
+    return direction
+
+
+@njit(cache=True)
+def _rank_and_terminal(direction):
+    """Validate routes and return numeric traversal ranks and terminal cells."""
+    rows, cols = direction.shape
+    size = rows * cols
+    rank = np.full(size, -1, np.int32)
+    terminal = np.full(size, -1, np.int64)
+    state = np.zeros(size, np.uint8)
+    path = np.empty(size, np.int64)
+    flat = direction.ravel()
+    for start in range(size):
+        if flat[start] == 0:
+            rank[start], terminal[start], state[start] = 0, start, 2
+        elif flat[start] < 0:
+            state[start] = 2
+    for start in range(size):
+        if flat[start] <= 0 or state[start] == 2:
+            continue
+        current, count = start, 0
+        while state[current] != 2:
+            if state[current] == 1:
+                raise ValueError("Flow-direction raster contains a cycle")
+            state[current] = 1
+            path[count] = current
+            count += 1
+            code = flat[current]
+            if code < 1 or code > 8:
+                raise ValueError("Invalid flow-direction code")
+            r, c = current // cols, current % cols
+            nr, nc = r + _DR[code - 1], c + _DC[code - 1]
+            if nr < 0 or nr >= rows or nc < 0 or nc >= cols:
+                raise ValueError("Flow direction points outside the raster")
+            current = nr * cols + nc
+            if flat[current] < 0:
+                raise ValueError("A route points into nodata")
+        value, root = rank[current], terminal[current]
+        for i in range(count - 1, -1, -1):
+            cell = path[i]
+            value += 1
+            rank[cell], terminal[cell], state[cell] = value, root, 2
+    return rank.reshape((rows, cols)), terminal.reshape((rows, cols))
+
+
+@njit(cache=True)
+def _label_basins(terminal):
+    """Compact terminal cell indices into dense basin labels in linear time."""
+    rows, cols = terminal.shape
+    size = rows * cols
+    root_to_basin = np.full(size, -1, np.int64)
+    basin = np.full(size, -1, np.int64)
+    root_count = 0
+    flat_terminal = terminal.ravel()
+    for cell in range(size):
+        root = flat_terminal[cell]
+        if root >= 0 and root_to_basin[root] < 0:
+            root_to_basin[root] = root_count
+            root_count += 1
+    unique = np.empty(root_count, np.int64)
+    for cell in range(size):
+        root = flat_terminal[cell]
+        if root >= 0:
+            basin[cell] = root_to_basin[root]
+            if cell == root:
+                unique[root_to_basin[root]] = root
+    return basin.reshape((rows, cols)), unique
+
+
+@njit(cache=True)
+def _rank_order(rank):
+    """Counting-sort valid cells by traversal rank in linear time."""
+    flat = rank.ravel()
+    maximum = 0
+    valid_count = 0
+    for i in range(flat.size):
+        if flat[i] >= 0:
+            valid_count += 1
+            maximum = max(maximum, flat[i])
+    counts = np.zeros(maximum + 1, np.int64)
+    for i in range(flat.size):
+        if flat[i] >= 0:
+            counts[flat[i]] += 1
+    offsets = np.empty(maximum + 1, np.int64)
+    position = 0
+    for value in range(maximum + 1):
+        offsets[value] = position
+        position += counts[value]
+    order = np.empty(valid_count, np.int64)
+    for i in range(flat.size):
+        value = flat[i]
+        if value >= 0:
+            position = offsets[value]
+            order[position] = i
+            offsets[value] += 1
+    return order
+
+
+@njit(cache=True)
+def _corridor_costs(elevation, direction, terminal, order, width, height):
+    size = direction.size
+    cols = direction.shape[1]
+    maximum = np.zeros(size, np.float64)
+    cumulative = np.zeros(size, np.float64)
+    length = np.zeros(size, np.float64)
+    elev = elevation.ravel()
+    dirs = direction.ravel()
+    roots = terminal.ravel()
+    diagonal = math.hypot(width, height)
+    steps = np.array([height, diagonal, width, diagonal, height, diagonal, width, diagonal])
+    for oi in range(order.size):
+        cell = order[oi]
+        code = dirs[cell]
+        if code <= 0:
+            continue
+        r, c = cell // cols, cell % cols
+        parent = (r + _DR[code - 1]) * cols + c + _DC[code - 1]
+        depth = max(elev[cell] - elev[roots[cell]], 0.0)
+        maximum[cell] = max(maximum[parent], depth)
+        cumulative[cell] = cumulative[parent] + depth
+        length[cell] = length[parent] + steps[code - 1]
+    return maximum.reshape(direction.shape), cumulative.reshape(direction.shape), length.reshape(direction.shape)
+
+
+@njit(cache=True)
+def _scan_basin_boundaries(basin, labels, cut_max, cut_sum, path_length, width, height):
+    """Return the best numeric corridor for every directed adjacent basin pair."""
+    rows, cols = basin.shape
+    occurrences = 0
+    for r in range(rows):
+        for c in range(cols):
+            if basin[r, c] < 0:
+                continue
+            for k in (2, 3, 4, 5):  # E, SE, S, SW: each pair exactly once.
+                nr, nc = r + _DR[k], c + _DC[k]
+                if (0 <= nr < rows and 0 <= nc < cols and basin[nr, nc] >= 0
+                        and labels[nr, nc] == labels[r, c]
+                        and basin[nr, nc] != basin[r, c]):
+                    occurrences += 2
+    capacity = 1
+    while capacity < max(4, occurrences * 2):
+        capacity *= 2
+    keys = np.full(capacity, -1, np.int64)
+    origins = np.full(capacity, -1, np.int64)
+    destinations = np.full(capacity, -1, np.int64)
+    maxima = np.full(capacity, np.inf)
+    sums = np.full(capacity, np.inf)
+    lengths = np.full(capacity, np.inf)
+    diagonal = math.hypot(width, height)
+    steps = np.array([height, diagonal, width, diagonal, height, diagonal, width, diagonal])
+    mask = capacity - 1
+    for r in range(rows):
+        for c in range(cols):
+            a = basin[r, c]
+            if a < 0:
+                continue
+            for k in (2, 3, 4, 5):
+                nr, nc = r + _DR[k], c + _DC[k]
+                if (nr < 0 or nr >= rows or nc < 0 or nc >= cols
+                        or labels[nr, nc] != labels[r, c]):
+                    continue
+                b = basin[nr, nc]
+                if b < 0 or a == b:
+                    continue
+                for reverse in range(2):
+                    source = a if reverse == 0 else b
+                    target = b if reverse == 0 else a
+                    origin = r * cols + c if reverse == 0 else nr * cols + nc
+                    destination = nr * cols + nc if reverse == 0 else r * cols + c
+                    rr, cc = origin // cols, origin % cols
+                    cm, cs = cut_max[rr, cc], cut_sum[rr, cc]
+                    pl = path_length[rr, cc] + steps[k]
+                    key = (source << 32) | target
+                    slot = (key * 1140071481932319845) & mask
+                    while keys[slot] != -1 and keys[slot] != key:
+                        slot = (slot + 1) & mask
+                    better = (cm < maxima[slot]
+                              or (cm == maxima[slot] and cs < sums[slot])
+                              or (cm == maxima[slot] and cs == sums[slot] and pl < lengths[slot])
+                              or (cm == maxima[slot] and cs == sums[slot] and pl == lengths[slot]
+                                  and origin < origins[slot]))
+                    if keys[slot] == -1 or better:
+                        keys[slot], origins[slot], destinations[slot] = key, origin, destination
+                        maxima[slot], sums[slot], lengths[slot] = cm, cs, pl
+    count = np.sum(keys != -1)
+    result = np.empty((count, 8), np.float64)
+    out = 0
+    for slot in range(capacity):
+        if keys[slot] != -1:
+            result[out, 0] = keys[slot] >> 32
+            result[out, 1] = keys[slot] & 0xffffffff
+            result[out, 2] = maxima[slot]
+            result[out, 3] = sums[slot]
+            result[out, 4] = lengths[slot]
+            result[out, 5] = origins[slot]
+            result[out, 6] = destinations[slot]
+            result[out, 7] = origins[slot]
+            out += 1
+    return result
+
+
+def _basin_paths_to_stream(
+    count: int, stream: np.ndarray, edges: np.ndarray
+) -> np.ndarray:
+    """Run a lexicographic multi-source shortest path on the basin graph."""
+    incoming: list[list[int]] = [[] for _ in range(count)]
+    for edge_index, edge in enumerate(edges):
+        incoming[int(edge[1])].append(edge_index)
+    costs: list[tuple[float, float, float, int, int] | None] = [None] * count
+    selected = np.full(count, -1, dtype=np.int64)
+    settled = np.zeros(count, dtype=bool)
+    queue: list[tuple[float, float, float, int, int, int]] = []
+    for basin_id in np.flatnonzero(stream):
+        costs[int(basin_id)] = (0.0, 0.0, 0.0, -1, -1)
+        heapq.heappush(queue, (0.0, 0.0, 0.0, -1, -1, int(basin_id)))
+    while queue:
+        *raw, basin_id = heapq.heappop(queue)
+        if costs[basin_id] != tuple(raw) or settled[basin_id]:
+            continue
+        settled[basin_id] = True
+        for edge_index in incoming[basin_id]:
+            edge = edges[edge_index]
+            source = int(edge[0])
+            if settled[source]:
+                continue
+            candidate = (
+                max(float(edge[2]), raw[0]),
+                float(edge[3]) + raw[1],
+                float(edge[4]) + raw[2],
+                int(edge[7]),
+                basin_id,
+            )
+            if costs[source] is None or candidate < costs[source]:
+                costs[source] = candidate
+                selected[source] = edge_index
+                heapq.heappush(queue, (*candidate, source))
+    return selected
+
+
+@njit(cache=True)
+def _reverse_selected_corridors(direction, edges, selected):
+    original = direction.copy()
+    result = direction.copy()
+    cols = direction.shape[1]
+    for basin_id in range(selected.size):
+        edge_index = selected[basin_id]
+        if edge_index < 0:
+            continue
+        origin = int(edges[edge_index, 5])
+        destination = int(edges[edge_index, 6])
+        previous = destination
+        current = origin
+        while True:
+            cr, cc = current // cols, current % cols
+            pr, pc = previous // cols, previous % cols
+            dr, dc = pr - cr, pc - cc
+            for k in range(8):
+                if _DR[k] == dr and _DC[k] == dc:
+                    result[cr, cc] = k + 1
+                    break
+            code = original[cr, cc]
+            if code == 0:
+                break
+            previous = current
+            current = (cr + _DR[code - 1]) * cols + cc + _DC[code - 1]
+    return result
 
 
 def compute_hand(
@@ -177,18 +562,10 @@ def compute_hand(
     rank = _routing_rank(direction) if rank is None else np.asarray(rank)
     if rank.shape != direction.shape:
         raise TerrainProductsError("Rank and direction must have equal shapes")
-    result = np.full(elevation.shape, np.nan, dtype=np.float64)
-    terminal = np.full(elevation.shape, np.nan, dtype=np.float64)
-    terminal[direction == 0] = elevation[direction == 0]
-    for r, cells in enumerate(_rank_buckets(rank)):
-        if r == 0:
-            continue
-        for row, col in cells:
-            nr, nc = _parent(int(row), int(col), int(direction[row, col]), direction.shape)
-            terminal[row, col] = terminal[nr, nc]
-    valid = direction >= 0
-    result[valid] = elevation[valid] - terminal[valid]
-    return result
+    order = _rank_order(rank)
+    return _hand_kernel(
+        elevation.astype(np.float64, copy=False), direction, order
+    )
 
 
 def compute_ltnd(
@@ -205,19 +582,51 @@ def compute_ltnd(
     if rank.shape != direction.shape:
         raise TerrainProductsError("Rank and direction must have equal shapes")
     width, height = _pixel_sizes(transform)
-    diagonal = math.hypot(width, height)
-    steps = {1: height, 2: diagonal, 3: width, 4: diagonal,
-             5: height, 6: diagonal, 7: width, 8: diagonal}
-    result = np.full(direction.shape, np.nan, dtype=np.float64)
-    result[direction == 0] = 0.0
-    for r, cells in enumerate(_rank_buckets(rank)):
-        if r == 0:
+    order = _rank_order(rank)
+    return _ltnd_kernel(direction, order, width, height)
+
+
+@njit(cache=True)
+def _hand_kernel(elevation, direction, order):
+    result = np.full(direction.size, np.nan)
+    terminal_z = np.full(direction.size, np.nan)
+    dirs = direction.ravel()
+    elev = elevation.ravel()
+    cols = direction.shape[1]
+    for oi in range(order.size):
+        cell = order[oi]
+        code = dirs[cell]
+        if code < 0:
             continue
-        for row, col in cells:
-            code = int(direction[row, col])
-            nr, nc = _parent(int(row), int(col), code, direction.shape)
-            result[row, col] = result[nr, nc] + steps[code]
-    return result
+        if code == 0:
+            terminal_z[cell] = elev[cell]
+        else:
+            r, c = cell // cols, cell % cols
+            parent = (r + _DR[code - 1]) * cols + c + _DC[code - 1]
+            terminal_z[cell] = terminal_z[parent]
+        result[cell] = elev[cell] - terminal_z[cell]
+    return result.reshape(direction.shape)
+
+
+@njit(cache=True)
+def _ltnd_kernel(direction, order, width, height):
+    result = np.full(direction.size, np.nan)
+    dirs = direction.ravel()
+    cols = direction.shape[1]
+    diagonal = math.hypot(width, height)
+    steps = np.array([height, diagonal, width, diagonal, height, diagonal, width, diagonal])
+    for oi in range(order.size):
+        cell = order[oi]
+        code = dirs[cell]
+        if code < 0:
+            continue
+        if code == 0:
+            result[cell] = 0.0
+        else:
+            r, c = cell // cols, cell % cols
+            parent = (r + _DR[code - 1]) * cols + c + _DC[code - 1]
+            result[cell] = result[parent] + steps[code - 1]
+    return result.reshape(direction.shape)
 
 
 def _parent(row: int, col: int, code: int, shape: tuple[int, int]) -> tuple[int, int]:
@@ -232,65 +641,10 @@ def _parent(row: int, col: int, code: int, shape: tuple[int, int]) -> tuple[int,
 
 def _routing_rank(direction: np.ndarray) -> np.ndarray:
     """Derive ranks while validating that every route terminates."""
-
-    rank = np.full(direction.shape, -1, dtype=np.int32)
-    rank[direction == 0] = 0
-    visiting = np.zeros(direction.shape, dtype=bool)
-    for row, col in np.argwhere(direction > 0):
-        row, col = int(row), int(col)
-        if rank[row, col] >= 0:
-            continue
-        chain: list[tuple[int, int]] = []
-        current = (row, col)
-        while rank[current] < 0:
-            if direction[current] < 0:
-                raise TerrainProductsError("A route points into nodata")
-            if visiting[current]:
-                raise TerrainProductsError("Flow-direction raster contains a cycle")
-            visiting[current] = True
-            chain.append(current)
-            current = _parent(
-                current[0], current[1], int(direction[current]), direction.shape
-            )
-        value = int(rank[current])
-        while chain:
-            cell = chain.pop()
-            value += 1
-            rank[cell] = value
-            visiting[cell] = False
-    return rank
-
-
-def _rank_buckets(rank: np.ndarray) -> list[list[tuple[int, int]]]:
-    """Group cells in linear time so propagation never repeatedly scans a raster."""
-
-    maximum = int(rank.max(initial=0))
-    buckets: list[list[tuple[int, int]]] = [[] for _ in range(maximum + 1)]
-    for row, col in np.argwhere(rank >= 0):
-        buckets[int(rank[row, col])].append((int(row), int(col)))
-    return buckets
-
-
-def _count_components(mask: np.ndarray, labels: np.ndarray) -> int:
-    pending = mask.copy()
-    count = 0
-    rows, cols = mask.shape
-    for start_row, start_col in np.argwhere(pending):
-        if not pending[start_row, start_col]:
-            continue
-        count += 1
-        owner = labels[start_row, start_col]
-        pending[start_row, start_col] = False
-        queue = deque([(int(start_row), int(start_col))])
-        while queue:
-            row, col = queue.popleft()
-            for _, dr, dc in _DIRECTIONS:
-                nr, nc = row + dr, col + dc
-                if (0 <= nr < rows and 0 <= nc < cols and pending[nr, nc]
-                        and labels[nr, nc] == owner):
-                    pending[nr, nc] = False
-                    queue.append((nr, nc))
-    return count
+    try:
+        return _rank_and_terminal(np.asarray(direction))[0]
+    except ValueError as exc:
+        raise TerrainProductsError(str(exc)) from exc
 
 
 def create_terrain_products(
@@ -306,6 +660,7 @@ def create_terrain_products(
 
     _validate_vectors(catchments, segments, id_col)
     dem_path, output_dir = Path(dem_path), Path(output_dir)
+    io_started = time.perf_counter()
     with rasterio.open(dem_path) as src:
         _validate_dem(src)
         catchments = catchments.to_crs(src.crs)
@@ -338,9 +693,15 @@ def create_terrain_products(
                 fill=0, dtype="uint8",
             ).astype(bool) & (labels == index)
 
+        raster_io_seconds = time.perf_counter() - io_started
+        jit_started = time.perf_counter()
+        _warm_routing_kernels()
+        jit_compilation_seconds = time.perf_counter() - jit_started
+        routing_started = time.perf_counter()
         direction, rank = compute_flow_directions(elevation, labels, drainage, transform)
         hand = compute_hand(elevation, direction, rank).astype("float32")
         ltnd = compute_ltnd(direction, transform, rank).astype("float32")
+        routing_seconds = time.perf_counter() - routing_started
         profile = src.profile.copy()
         profile.update(
             width=shape[1], height=shape[0], transform=transform, count=1,
@@ -354,6 +715,7 @@ def create_terrain_products(
         output_dir / "flow_direction.tif" if write_flow_direction else None,
     )
     staged: list[tuple[Path, Path]] = []
+    io_started = time.perf_counter()
     try:
         with tempfile.TemporaryDirectory(prefix=".terrain-", dir=output_dir) as tmp:
             tmpdir = Path(tmp)
@@ -367,7 +729,7 @@ def create_terrain_products(
                 with rasterio.open(path, "w", **out_profile) as dst:
                     dst.write(data, 1)
                     dst.update_tags(
-                        routing="drainage-rooted geodesic rank",
+                        routing="terrain-driven basin routing with targeted shallow breaching",
                         direction_codes="-1 nodata, 0 drainage, 1-8 N NE E SE S SW W NW",
                     )
                 staged.append((path, output_dir / name))
@@ -376,6 +738,7 @@ def create_terrain_products(
     except Exception:
         # Files remain private in the temporary directory until all are complete.
         raise
+    raster_io_seconds += time.perf_counter() - io_started
 
     negatives = hand[np.isfinite(hand) & (hand < 0)]
     return TerrainProductReport(
@@ -383,7 +746,24 @@ def create_terrain_products(
         int(negatives.size),
         float(negatives.min()) if negatives.size else None,
         float(negatives.max()) if negatives.size else None,
+        routing_seconds,
+        jit_compilation_seconds,
+        raster_io_seconds,
     )
+
+
+def _warm_routing_kernels() -> None:
+    """Load/compile cached kernels separately from measured production routing."""
+    if _ltnd_kernel.signatures:
+        return
+    elevation = np.array([[1.0, 0.0]], dtype=np.float64)
+    labels = np.zeros((1, 2), dtype=np.int64)
+    drainage = np.array([[False, True]])
+    direction, rank = compute_flow_directions(
+        elevation, labels, drainage, Affine(1, 0, 0, 0, -1, 0)
+    )
+    compute_hand(elevation, direction, rank)
+    compute_ltnd(direction, Affine(1, 0, 0, 0, -1, 0), rank)
 
 
 def _validate_dem(src: rasterio.io.DatasetReader) -> None:

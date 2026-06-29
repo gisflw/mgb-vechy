@@ -15,6 +15,7 @@ authors = [
 dependencies = [
   "click>=8.1",
   "geopandas>=0.14",
+  "numba>=0.59",
   "pandas>=2.0",
   "pyogrio>=0.7",
   "rasterio>=1.3",

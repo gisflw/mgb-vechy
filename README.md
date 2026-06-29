@@ -53,7 +53,7 @@ This command writes:
 
 See [docs/stage2_aggregation_cli.md](docs/stage2_aggregation_cli.md) for aggregation CLI details.
 
-Generate drainage-rooted terrain products:
+Generate terrain-driven basin products with targeted shallow breaching:
 
 ```bash
 mgb-vec-hydro terrain-products \
