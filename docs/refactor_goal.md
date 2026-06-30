@@ -218,7 +218,7 @@ aggregate \
 build-mini \
   --dem path/to/dem.tif \
   --mini-segments output/mini_segments.fgb \
-  --mini-catchments output/mini_catchments.fgb \
+  --catchments output/mini_catchments.fgb \
   --hru path/to/hru.tif \
   --geo-a 0.89 \
   --geo-b 0.52 \

@@ -2,8 +2,9 @@
 
 MGB-Vec-Hydro is a standalone Python library and command-line interface for preparing vector hydrography inputs for MGB workflows. The project is extracting the computational parts of the legacy BHO2MGB plugin into a reusable package that works from explicit network topology columns instead of QGIS APIs.
 
-The implemented workflow covers ROI definition, mini-basin aggregation, and
-terrain products aligned with the normalized ROI hydrography.
+The implemented workflow covers ROI definition, mini-basin aggregation,
+terrain products aligned with the normalized ROI hydrography, and Stage 5
+mini-basin attribute sampling. Stage 4 HRU construction is currently deferred.
 
 ## Scope
 
@@ -76,6 +77,25 @@ elevations continue to come from the unmodified DEM.
 See [docs/stage3_terrain_cli.md](docs/stage3_terrain_cli.md) for input
 requirements, output details, and routing behavior.
 
+Sample terrain and existing HRU classes onto mini-basins:
+
+```bash
+mgb-vec-hydro sample-minis \
+  --catchments output/mini_catchments.fgb \
+  --segments output/mini_segments.fgb \
+  --dem path/to/dem.tif \
+  --hand output/hand.tif \
+  --ltnd output/ltnd.tif \
+  --hru path/to/hru.tif \
+  --output-dir output/sampled
+```
+
+This writes only `sampled_minis.csv`. HRU IDs are inferred from integer raster
+values in the inclusive domain `1..100`.
+
+See [docs/stage5_mini_sampling_cli.md](docs/stage5_mini_sampling_cli.md) for
+input validation, sampled fields, and output details.
+
 ## Development
 
 Use an isolated Python environment for local work. Installation packaging for end users is intentionally deferred while the library API and workflow stabilize.
@@ -89,10 +109,9 @@ pytest
 
 The refactor goal is documented in
 [docs/refactor_goal.md](docs/refactor_goal.md). ROI definition, mini-basin
-aggregation, and terrain-product generation are implemented. The remaining
-planned work is:
+aggregation, terrain-product generation, and mini-basin sampling are
+implemented. The remaining planned work is:
 
 1. Build improved HRU classes from terrain and land-cover rasters.
-2. Sample terrain and HRU attributes onto mini-basins and reaches.
-3. Generate MGB output files such as `MINI.gtp`, `COTA_AREA.flp`, and vector
+2. Generate MGB output files such as `MINI.gtp`, `COTA_AREA.flp`, and vector
    mini-basin products.

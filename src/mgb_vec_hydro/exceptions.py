@@ -32,3 +32,7 @@ class UnsupportedOutputFormatError(MgbVecHydroError):
 
 class TerrainProductsError(MgbVecHydroError):
     """Raised when terrain-product inputs cannot be routed safely."""
+
+
+class MiniSamplingError(MgbVecHydroError):
+    """Raised when mini-basin attributes cannot be sampled safely."""

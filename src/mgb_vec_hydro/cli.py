@@ -15,6 +15,7 @@ from mgb_vec_hydro.io import (
 from mgb_vec_hydro.roi import DEFAULT_STRAHLER_ORDER_COL, define_roi
 from mgb_vec_hydro.topology import resolve_column_name
 from mgb_vec_hydro.terrain import create_terrain_products
+from mgb_vec_hydro.sampling import sample_minibasins
 
 
 @click.group()
@@ -238,6 +239,46 @@ def terrain_products_command(
         )
     else:
         click.echo("Negative HAND: 0 cells")
+
+
+@main.command("sample-minis")
+@click.option("--catchments", type=click.Path(exists=True, dir_okay=False, path_type=Path), required=True)
+@click.option("--segments", type=click.Path(exists=True, dir_okay=False, path_type=Path), required=True)
+@click.option("--dem", type=click.Path(exists=True, dir_okay=False, path_type=Path), required=True)
+@click.option("--hand", type=click.Path(exists=True, dir_okay=False, path_type=Path), required=True)
+@click.option("--ltnd", type=click.Path(exists=True, dir_okay=False, path_type=Path), required=True)
+@click.option("--hru", type=click.Path(exists=True, dir_okay=False, path_type=Path), required=True)
+@click.option("--output-dir", type=click.Path(file_okay=False, path_type=Path), required=True)
+def sample_minis_command(
+    catchments: Path,
+    segments: Path,
+    dem: Path,
+    hand: Path,
+    ltnd: Path,
+    hru: Path,
+    output_dir: Path,
+) -> None:
+    """Sample terrain and HRU attributes onto mini-basins."""
+    try:
+        result = sample_minibasins(
+            read_vector(catchments), read_vector(segments),
+            dem, hand, ltnd, hru,
+        )
+        output_dir.mkdir(parents=True, exist_ok=True)
+        output = output_dir / "sampled_minis.csv"
+        result.sampled_minis.to_csv(output, index=False)
+    except MgbVecHydroError as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(f"Wrote {output}")
+    click.echo(
+        f"Sampled {result.diagnostics['minis']} minis; "
+        f"{result.diagnostics['catchment_cells']} catchment cells and "
+        f"{result.diagnostics['reach_cells']} reach cells"
+    )
+    click.echo(
+        f"HRU classes ({result.diagnostics['hru_class_count']}): "
+        + ", ".join(str(value) for value in result.diagnostics["hru_class_ids"])
+    )
 
 
 def _coerce_outlet_ids(outlet_ids: tuple[str, ...], segment_id_series):
