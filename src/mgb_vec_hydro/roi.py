@@ -7,7 +7,8 @@ from typing import Hashable
 
 import geopandas as gpd
 import pandas as pd
-from mgb_vec_hydro.exceptions import MissingCrsError, TopologyCycleError
+from mgb_vec_hydro.crs_utils import DEFAULT_CRS, transform_vector
+from mgb_vec_hydro.exceptions import TopologyCycleError
 from mgb_vec_hydro.topology import (
     DEFAULT_ID_COL,
     DEFAULT_ID_DOWN_COL,
@@ -32,7 +33,7 @@ def define_roi(
     segments: gpd.GeoDataFrame,
     *,
     outlet_ids: Iterable[Hashable],
-    destine_crs: str,
+    crs: str = DEFAULT_CRS,
     source_crs: str | None = None,
     id_col: str = DEFAULT_ID_COL,
     id_down_col: str = DEFAULT_ID_DOWN_COL,
@@ -73,13 +74,13 @@ def define_roi(
     projected_roi_segments = _project_for_metrics(
         roi_segments,
         source_crs=source_crs,
-        destine_crs=destine_crs,
+        target_crs=crs,
         layer_name="segments",
     )
     projected_roi_catchments = _project_for_metrics(
         roi_catchments,
         source_crs=source_crs,
-        destine_crs=destine_crs,
+        target_crs=crs,
         layer_name="catchments",
     )
     id_down_by_id = segments.set_index(segment_id_col)[segment_id_down_col]
@@ -147,17 +148,12 @@ def _project_for_metrics(
     gdf: gpd.GeoDataFrame,
     *,
     source_crs: str | None,
-    destine_crs: str,
+    target_crs: str,
     layer_name: str,
 ) -> gpd.GeoDataFrame:
-    if source_crs is not None:
-        gdf = gdf.set_crs(source_crs, allow_override=True)
-    elif gdf.crs is None:
-        raise MissingCrsError(
-            f"{layer_name} layer has no CRS; supply --source-crs before computing metrics"
-        )
-
-    return gdf.to_crs(destine_crs)
+    return transform_vector(
+        gdf, target_crs, name=f"{layer_name} layer", source_crs=source_crs
+    )
 
 
 def _metric_columns(

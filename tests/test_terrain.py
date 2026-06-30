@@ -8,6 +8,7 @@ from shapely.geometry import LineString, Polygon
 from mgb_vec_hydro.exceptions import TerrainProductsError
 from mgb_vec_hydro.terrain import (
     _agree_condition_dem,
+    _buffer_catchment_labels,
     _rasterize_drainage,
     compute_flow_directions,
     compute_hand,
@@ -17,6 +18,31 @@ from mgb_vec_hydro.terrain import (
 
 
 TRANSFORM = Affine(10, 0, 0, 0, -10, 0)
+
+
+def test_buffer_labels_uses_nearest_source_and_stable_label_ties():
+    labels = np.array(
+        [
+            [-1, -1, -1, -1, -1],
+            [-1, 1, -1, 0, -1],
+            [-1, -1, -1, -1, -1],
+        ],
+        dtype=np.int32,
+    )
+
+    expanded = _buffer_catchment_labels(labels, 1)
+
+    assert expanded[1, 1] == 1
+    assert expanded[1, 3] == 0
+    assert expanded[1, 2] == 0
+    assert expanded[0, 0] == 1
+    assert np.array_equal(_buffer_catchment_labels(labels, 0), labels)
+
+
+@pytest.mark.parametrize("value", [-1, 1.5, True])
+def test_buffer_labels_rejects_invalid_cell_counts(value):
+    with pytest.raises(TerrainProductsError, match="non-negative integer"):
+        _buffer_catchment_labels(np.array([[0]], dtype=np.int32), value)
 
 
 def _route(direction, start):

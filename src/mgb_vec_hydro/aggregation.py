@@ -6,6 +6,7 @@ from typing import Hashable
 
 import geopandas as gpd
 import pandas as pd
+from mgb_vec_hydro.crs_utils import DEFAULT_CRS, transform_vector
 
 from mgb_vec_hydro.exceptions import (
     DuplicateSegmentIdError,
@@ -44,9 +45,12 @@ def aggregate_minibasins(
     *,
     uparea_min: float,
     lmin: float,
+    crs: str = DEFAULT_CRS,
 ) -> AggregationResult:
     """Aggregate normalized ROI products into mini-basins."""
 
+    roi_catchments = transform_vector(roi_catchments, crs, name="roi_catchments")
+    roi_segments = transform_vector(roi_segments, crs, name="roi_segments")
     _validate_input_schema(roi_catchments, "roi_catchments")
     _validate_input_schema(roi_segments, "roi_segments")
     _validate_unique_ids(roi_segments, "roi_segments")

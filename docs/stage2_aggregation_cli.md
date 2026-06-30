@@ -12,6 +12,7 @@ mgb-vec-hydro aggregate \
   --roi-segments output/roi_segments.fgb \
   --uparea-min 30 \
   --lmin 6 \
+  --crs EPSG:6933 \
   --output-dir output \
   --output-format fgb
 ```
@@ -72,7 +73,7 @@ mgb-vec-hydro define-roi \
   --id-col cotrecho \
   --id-down-col nutrjus \
   --strahler-order-col nustrahler \
-  --destine-crs ESRI:102033 \
+  --crs ESRI:102033 \
   --output-dir output \
   --output-format fgb
 

@@ -8,10 +8,14 @@ import numpy as np
 import pandas as pd
 import rasterio
 from rasterio.features import geometry_mask
+from rasterio.enums import Resampling
 from shapely.geometry import box, mapping
 
 from mgb_vec_hydro.aggregation import INPUT_COLUMNS
 from mgb_vec_hydro.exceptions import MiniSamplingError
+from mgb_vec_hydro.crs_utils import (
+    DEFAULT_CRS, raster_grid, require_aligned_sources, transform_vector, warped_vrt,
+)
 
 
 @dataclass(frozen=True)
@@ -34,9 +38,13 @@ def sample_minibasins(
     hand: str | Path,
     ltnd: str | Path,
     hru: str | Path,
+    *,
+    crs: str = DEFAULT_CRS,
 ) -> MiniSamplingResult:
     """Sample terrain and categorical HRU attributes for Stage 2 mini-basins."""
 
+    catchments = transform_vector(catchments, crs, name="catchments")
+    segments = transform_vector(segments, crs, name="segments")
     _validate_vectors(catchments, segments)
     reaches = segments.set_index("id", drop=False)
     centroids = catchments.geometry.centroid
@@ -45,9 +53,23 @@ def sample_minibasins(
     rows: list[dict] = []
     sampled_counts = {"minis": len(catchments), "catchment_cells": 0, "reach_cells": 0}
     with ExitStack() as stack:
-        rasters = {
+        sources = {
             name: stack.enter_context(rasterio.open(path))
             for name, path in {"dem": dem, "hand": hand, "ltnd": ltnd, "hru": hru}.items()
+        }
+        require_aligned_sources(sources["hand"], sources["ltnd"])
+        shared_grid = raster_grid(sources["hand"], crs)
+        rasters = {
+            "dem": stack.enter_context(warped_vrt(sources["dem"], crs, resampling=Resampling.bilinear)),
+            "hand": stack.enter_context(warped_vrt(
+                sources["hand"], crs, resampling=Resampling.bilinear, grid=shared_grid
+            )),
+            "ltnd": stack.enter_context(warped_vrt(
+                sources["ltnd"], crs, resampling=Resampling.bilinear, grid=shared_grid
+            )),
+            "hru": stack.enter_context(warped_vrt(
+                sources["hru"], crs, resampling=Resampling.nearest
+            )),
         }
         _validate_rasters(rasters, catchments)
         classes = _discover_hru_classes(rasters["hru"])
@@ -141,7 +163,7 @@ def _validate_rasters(rasters, catchments) -> None:
         if dataset.count != 1 or dataset.crs is None:
             raise MiniSamplingError(f"{name.upper()} must be a single-band georeferenced raster")
         if dataset.crs != catchments.crs:
-            raise MiniSamplingError(f"{name.upper()} CRS does not match mini vectors")
+            raise MiniSamplingError(f"{name.upper()} CRS does not match requested CRS")
     hand, ltnd = rasters["hand"], rasters["ltnd"]
     if hand.shape != ltnd.shape or hand.transform != ltnd.transform or hand.crs != ltnd.crs:
         raise MiniSamplingError("HAND and LTND rasters are not aligned")

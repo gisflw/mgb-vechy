@@ -5,6 +5,7 @@ from pathlib import Path
 import click
 
 from mgb_vec_hydro.aggregation import aggregate_minibasins
+from mgb_vec_hydro.crs_utils import DEFAULT_CRS, transform_vector
 from mgb_vec_hydro.exceptions import MgbVecHydroError
 from mgb_vec_hydro.io import (
     aggregation_output_paths,
@@ -45,7 +46,7 @@ def main() -> None:
     show_default=True,
 )
 @click.option("--source-crs")
-@click.option("--destine-crs", required=True)
+@click.option("--crs", default=DEFAULT_CRS, show_default=True)
 @click.option(
     "--output-dir",
     type=click.Path(file_okay=False, path_type=Path),
@@ -60,7 +61,7 @@ def define_roi_command(
     id_down_col: str,
     strahler_order_col: str,
     source_crs: str | None,
-    destine_crs: str,
+    crs: str,
     output_dir: Path,
     output_format: str,
 ) -> None:
@@ -76,7 +77,7 @@ def define_roi_command(
             catchments,
             segments,
             outlet_ids=coerced_outlet_ids,
-            destine_crs=destine_crs,
+            crs=crs,
             source_crs=source_crs,
             id_col=id_col,
             id_down_col=id_down_col,
@@ -106,6 +107,7 @@ def define_roi_command(
 )
 @click.option("--uparea-min", type=float, required=True)
 @click.option("--lmin", type=float, required=True)
+@click.option("--crs", default=DEFAULT_CRS, show_default=True)
 @click.option(
     "--output-dir",
     type=click.Path(file_okay=False, path_type=Path),
@@ -117,6 +119,7 @@ def aggregate_command(
     roi_segments_path: Path,
     uparea_min: float,
     lmin: float,
+    crs: str,
     output_dir: Path,
     output_format: str,
 ) -> None:
@@ -131,6 +134,7 @@ def aggregate_command(
             roi_segments,
             uparea_min=uparea_min,
             lmin=lmin,
+            crs=crs,
         )
         write_vector(aggregation.catchments, paths.catchments, output_format=output_format)
         write_vector(aggregation.segments, paths.segments, output_format=output_format)
@@ -163,12 +167,20 @@ def aggregate_command(
     required=True,
 )
 @click.option("--id-col", default="id", show_default=True)
+@click.option("--crs", default=DEFAULT_CRS, show_default=True)
 @click.option(
     "--output-dir",
     type=click.Path(file_okay=False, path_type=Path),
     required=True,
 )
 @click.option("--write-flow-direction", is_flag=True)
+@click.option(
+    "--buffer-cells",
+    type=click.IntRange(min=0),
+    default=1,
+    show_default=True,
+    help="Raster cells of output coverage beyond catchment edges.",
+)
 @click.option(
     "--agree-sharp",
     type=click.FloatRange(min=0),
@@ -195,8 +207,10 @@ def terrain_products_command(
     roi_catchments_path: Path,
     roi_segments_path: Path,
     id_col: str,
+    crs: str,
     output_dir: Path,
     write_flow_direction: bool,
+    buffer_cells: int,
     agree_sharp: float,
     agree_smooth: float,
     agree_buffer: int,
@@ -209,7 +223,9 @@ def terrain_products_command(
             read_vector(roi_catchments_path),
             read_vector(roi_segments_path),
             output_dir,
+            crs=crs,
             id_col=id_col,
+            buffer_cells=buffer_cells,
             write_flow_direction=write_flow_direction,
             agree_sharp=agree_sharp,
             agree_smooth=agree_smooth,
@@ -249,6 +265,7 @@ def terrain_products_command(
 @click.option("--ltnd", type=click.Path(exists=True, dir_okay=False, path_type=Path), required=True)
 @click.option("--hru", type=click.Path(exists=True, dir_okay=False, path_type=Path), required=True)
 @click.option("--output-dir", type=click.Path(file_okay=False, path_type=Path), required=True)
+@click.option("--crs", default=DEFAULT_CRS, show_default=True)
 def sample_minis_command(
     catchments: Path,
     segments: Path,
@@ -257,12 +274,14 @@ def sample_minis_command(
     ltnd: Path,
     hru: Path,
     output_dir: Path,
+    crs: str,
 ) -> None:
     """Sample terrain and HRU attributes onto mini-basins."""
     try:
         result = sample_minibasins(
             read_vector(catchments), read_vector(segments),
             dem, hand, ltnd, hru,
+            crs=crs,
         )
         output_dir.mkdir(parents=True, exist_ok=True)
         output = output_dir / "sampled_minis.csv"

@@ -12,9 +12,11 @@ mgb-vec-hydro terrain-products \
   --dem path/to/dem.tif \
   --roi-catchments output/roi_catchments.fgb \
   --roi-segments output/roi_segments.fgb \
+  --crs EPSG:6933 \
   --id-col id \
   --output-dir output \
   --write-flow-direction \
+  --buffer-cells 1 \
   --agree-sharp 80 \
   --agree-smooth 8 \
   --agree-buffer 4
@@ -25,14 +27,17 @@ required. The remaining options are:
 
 - `--id-col TEXT`: matching catchment and segment ID column; default `id`.
 - `--write-flow-direction`: also write the optional D8 direction raster.
+- `--buffer-cells INTEGER`: output-coverage cells beyond catchment edges;
+  default `1`. This is separate from AGREE conditioning.
 - `--agree-sharp FLOAT`: additional stream-cell incision in DEM elevation
   units; default `80.0`.
 - `--agree-smooth FLOAT`: AGREE ramp depth per pixel toward the stream;
   default `8.0`.
 - `--agree-buffer INTEGER`: conditioning radius in raster pixels; default `4`.
 
-All three AGREE values must be non-negative. A zero buffer applies only the
-sharp stream-cell incision.
+All three AGREE values and `--buffer-cells` must be non-negative. An AGREE
+buffer of zero applies only the sharp stream-cell incision. An output buffer
+of zero preserves the catchment-bounds crop.
 
 ## Input Requirements
 
@@ -55,7 +60,8 @@ outputs, keeping the raster drainage tied to the selected source network.
 ## Outputs
 
 The output directory is created when needed. The command always writes tiled,
-Deflate-compressed GeoTIFFs cropped to the ROI on the source DEM grid:
+Deflate-compressed GeoTIFFs cropped to the buffered ROI on the transformed DEM
+grid:
 
 - `hand.tif`: `float32` height above the nearest drainage cell, in the DEM's
   elevation units. Values are calculated from the unmodified DEM; nodata is

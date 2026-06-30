@@ -23,7 +23,7 @@ mgb-vec-hydro define-roi \
   --outlet-id 123 \
   --id-col id \
   --id-down-col id_down \
-  --destine-crs ESRI:102033 \
+  --crs ESRI:102033 \
   --output-dir output \
   --output-format fgb
 ```
@@ -43,6 +43,7 @@ mgb-vec-hydro aggregate \
   --roi-segments output/roi_segments.fgb \
   --uparea-min 30 \
   --lmin 6 \
+  --crs EPSG:6933 \
   --output-dir output \
   --output-format fgb
 ```
@@ -62,6 +63,8 @@ mgb-vec-hydro terrain-products \
   --dem path/to/dem.tif \
   --roi-catchments output/roi_catchments.fgb \
   --roi-segments output/roi_segments.fgb \
+  --crs EPSG:6933 \
+  --buffer-cells 1 \
   --output-dir output \
   --write-flow-direction
 ```
@@ -87,6 +90,7 @@ mgb-vec-hydro sample-minis \
   --hand output/hand.tif \
   --ltnd output/ltnd.tif \
   --hru path/to/hru.tif \
+  --crs EPSG:6933 \
   --output-dir output/sampled
 ```
 

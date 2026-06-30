@@ -15,7 +15,7 @@ mgb-vec-hydro define-roi \
   --id-col id \
   --id-down-col id_down \
   --strahler-order-col strahler_order \
-  --destine-crs ESRI:102033 \
+  --crs ESRI:102033 \
   --output-dir output \
   --output-format fgb
 ```
@@ -38,7 +38,7 @@ Outputs are normalized to exactly these columns:
 Both inputs must share the configured `--id-col`. The downstream topology column is read from the segment input and copied into both outputs.
 The Strahler order column is required on the segment input and copied into both outputs as `strahler_order`.
 Input column matching is case-insensitive, so `--id-col linkno` can match a source column named `LINKNO`.
-The command computes geometry metrics after resolving input CRS and transforming to `--destine-crs`, which is also the output CRS. If `--source-crs` is supplied, it overrides the CRS metadata on both input layers. If it is omitted, both input layers must already declare a CRS.
+The command computes geometry metrics after resolving input CRS and transforming to `--crs`, which is also the output CRS. If `--source-crs` is supplied, it overrides the CRS metadata on both input layers. If it is omitted, both input layers must already declare a CRS.
 After `upstream_area` is computed, `water_course` is derived independently inside each `sub`: at each confluence, the upstream branch with the greatest `upstream_area` continues the downstream course, with ties resolved by greater `unit_length` and then stable `id` string order. Other upstream branches start a new `water_course` from their own segment ID.
 
 ## Custom Schema
@@ -53,7 +53,7 @@ mgb-vec-hydro define-roi \
   --id-col cotrecho \
   --id-down-col nutrjus \
   --strahler-order-col ordem \
-  --destine-crs ESRI:102033 \
+  --crs ESRI:102033 \
   --output-dir output \
   --output-format gpkg
 ```

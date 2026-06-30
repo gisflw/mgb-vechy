@@ -17,6 +17,7 @@ mgb-vec-hydro sample-minis \
   --hand output/hand.tif \
   --ltnd output/ltnd.tif \
   --hru path/to/hru.tif \
+  --crs EPSG:6933 \
   --output-dir output/sampled
 ```
 

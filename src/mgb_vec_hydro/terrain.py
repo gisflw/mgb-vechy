@@ -22,9 +22,11 @@ import rasterio
 from affine import Affine
 from rasterio.features import rasterize
 from rasterio.windows import Window, from_bounds
+from rasterio.enums import Resampling
 from shapely.geometry.base import BaseGeometry
 
 from mgb_vec_hydro.exceptions import TerrainProductsError
+from mgb_vec_hydro.crs_utils import DEFAULT_CRS, transform_vector, warped_vrt
 
 
 # Code, row delta, column delta. This order is also the final tie-break.
@@ -103,6 +105,53 @@ def _validate_agree_parameters(
         or buffer < 0
     ):
         raise TerrainProductsError("AGREE buffer must be a non-negative integer")
+
+
+def _validate_buffer_cells(buffer_cells: int) -> None:
+    if (
+        isinstance(buffer_cells, (bool, np.bool_))
+        or not np.isscalar(buffer_cells)
+        or not np.isfinite(buffer_cells)
+        or int(buffer_cells) != buffer_cells
+        or buffer_cells < 0
+    ):
+        raise TerrainProductsError("Raster buffer cells must be a non-negative integer")
+
+
+def _buffer_catchment_labels(labels: np.ndarray, buffer_cells: int) -> np.ndarray:
+    """Expand labels to nearest owned cells without changing original ownership."""
+
+    _validate_buffer_cells(buffer_cells)
+    if buffer_cells == 0:
+        return labels.copy()
+
+    source = np.asarray(labels)
+    result = source.copy()
+    best_distance = np.full(source.shape, np.inf)
+    best_label = np.full(source.shape, np.iinfo(np.int32).max, dtype=np.int32)
+    rows, cols = source.shape
+    for dr in range(-buffer_cells, buffer_cells + 1):
+        for dc in range(-buffer_cells, buffer_cells + 1):
+            distance = dr * dr + dc * dc
+            source_rows = slice(max(0, -dr), min(rows, rows - dr))
+            source_cols = slice(max(0, -dc), min(cols, cols - dc))
+            target_rows = slice(max(0, dr), min(rows, rows + dr))
+            target_cols = slice(max(0, dc), min(cols, cols + dc))
+            candidates = source[source_rows, source_cols]
+            target_unowned = source[target_rows, target_cols] < 0
+            valid = target_unowned & (candidates >= 0)
+            current_distance = best_distance[target_rows, target_cols]
+            current_label = best_label[target_rows, target_cols]
+            better = valid & (
+                (distance < current_distance)
+                | ((distance == current_distance) & (candidates < current_label))
+            )
+            current_distance[better] = distance
+            current_label[better] = candidates[better]
+
+    expanded = (source < 0) & np.isfinite(best_distance)
+    result[expanded] = best_label[expanded]
+    return result
 
 
 def _agree_condition_dem(
@@ -760,7 +809,9 @@ def create_terrain_products(
     segments: gpd.GeoDataFrame,
     output_dir: str | Path,
     *,
+    crs: str = DEFAULT_CRS,
     id_col: str = "id",
+    buffer_cells: int = 1,
     write_flow_direction: bool = False,
     agree_sharp: float = 80.0,
     agree_smooth: float = 8.0,
@@ -769,21 +820,31 @@ def create_terrain_products(
     """Validate vectors, route them on the DEM grid, and publish tiled GeoTIFFs."""
 
     _validate_vectors(catchments, segments, id_col)
+    catchments = transform_vector(catchments, crs, name="catchments")
+    segments = transform_vector(segments, crs, name="segments")
+    _validate_buffer_cells(buffer_cells)
     _validate_agree_parameters(agree_sharp, agree_smooth, agree_buffer)
     dem_path, output_dir = Path(dem_path), Path(output_dir)
     io_started = time.perf_counter()
-    with rasterio.open(dem_path) as src:
+    with rasterio.open(dem_path) as source, warped_vrt(
+        source, crs, resampling=Resampling.bilinear
+    ) as src:
         _validate_dem(src)
-        catchments = catchments.to_crs(src.crs)
-        segments = segments.to_crs(src.crs)
         bounds = catchments.total_bounds
         db = src.bounds
-        if bounds[0] < db.left or bounds[1] < db.bottom or bounds[2] > db.right or bounds[3] > db.top:
+        pixel_width, pixel_height = _pixel_sizes(src.transform)
+        if (
+            bounds[0] < db.left - pixel_width
+            or bounds[1] < db.bottom - pixel_height
+            or bounds[2] > db.right + pixel_width
+            or bounds[3] > db.top + pixel_height
+        ):
             raise TerrainProductsError("DEM does not cover the complete catchment ROI")
         raw = from_bounds(*bounds, transform=src.transform)
-        col0, row0 = max(0, math.floor(raw.col_off)), max(0, math.floor(raw.row_off))
-        col1 = min(src.width, math.ceil(raw.col_off + raw.width))
-        row1 = min(src.height, math.ceil(raw.row_off + raw.height))
+        col0 = max(0, math.floor(raw.col_off) - buffer_cells)
+        row0 = max(0, math.floor(raw.row_off) - buffer_cells)
+        col1 = min(src.width, math.ceil(raw.col_off + raw.width) + buffer_cells)
+        row1 = min(src.height, math.ceil(raw.row_off + raw.height) + buffer_cells)
         window = Window(col0, row0, col1 - col0, row1 - row0)
         transform = src.window_transform(window)
         elevation = src.read(1, window=window, masked=True).astype(np.float64).filled(np.nan)
@@ -791,10 +852,15 @@ def create_terrain_products(
 
         # Internal sequential labels avoid assumptions about the user ID dtype.
         ordered = catchments.sort_values(id_col, key=lambda s: s.astype(str))
-        labels = rasterize(
+        original_labels = rasterize(
             ((geom, index) for index, geom in enumerate(ordered.geometry)),
             out_shape=shape, transform=transform, fill=-1, dtype="int32",
         )
+        labels = _buffer_catchment_labels(original_labels, buffer_cells)
+        if np.any((labels >= 0) & ~np.isfinite(elevation)):
+            raise TerrainProductsError(
+                "DEM contains nodata within the required buffered catchment cells"
+            )
         drainage = _rasterize_drainage(
             ordered, segments, id_col, shape, transform, labels
         )
@@ -824,7 +890,7 @@ def create_terrain_products(
         profile.update(
             width=shape[1], height=shape[0], transform=transform, count=1,
             driver="GTiff", tiled=True, blockxsize=256, blockysize=256,
-            compress="deflate", BIGTIFF="IF_SAFER",
+            compress="deflate", BIGTIFF="IF_SAFER", crs=src.crs,
         )
 
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -854,6 +920,7 @@ def create_terrain_products(
                         agree_sharp=agree_sharp,
                         agree_smooth=agree_smooth,
                         agree_buffer_pixels=agree_buffer,
+                        buffer_cells=buffer_cells,
                         direction_codes="-1 nodata, 0 drainage, 1-8 N NE E SE S SW W NW",
                     )
                 staged.append((path, output_dir / name))
