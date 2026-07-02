@@ -7,7 +7,7 @@ import geopandas as gpd
 import numpy as np
 import pandas as pd
 import rasterio
-from rasterio.features import geometry_mask
+from rasterio.features import geometry_mask, geometry_window
 from rasterio.enums import Resampling
 from shapely.geometry import box, mapping
 
@@ -120,13 +120,23 @@ def sample_minibasins(
             sampled_counts["reach_cells"] += int(dem_values.size)
 
     result = pd.DataFrame(rows)
-    numeric = result.select_dtypes(include=[np.number])
-    if not np.isfinite(numeric.to_numpy(dtype=float)).all():
-        raise MiniSamplingError("Sampled mini-basin results contain non-finite values")
+    _validate_finite_results(result)
     percentage_columns = [f"hru_{value}_pct" for value in classes]
     if not np.allclose(result[percentage_columns].sum(axis=1), 100.0):
         raise MiniSamplingError("HRU percentages do not sum to 100%")
     return MiniSamplingResult(result, sampled_counts)
+
+
+def _validate_finite_results(result: pd.DataFrame) -> None:
+    """Allow null outlet links while rejecting all other non-finite numbers."""
+
+    numeric = result.select_dtypes(include=[np.number])
+    for column in numeric:
+        values = numeric[column].to_numpy(dtype=float)
+        if column == "id_down":
+            values = values[~np.isnan(values)]
+        if not np.isfinite(values).all():
+            raise MiniSamplingError("Sampled mini-basin results contain non-finite values")
 
 
 def _validate_vectors(catchments: gpd.GeoDataFrame, reaches: gpd.GeoDataFrame) -> None:
@@ -200,16 +210,17 @@ def _sample(dataset, geometry, mini_id, name, all_touched, return_mask=False):
     raster_bounds = box(*dataset.bounds)
     if not raster_bounds.covers(geometry):
         raise MiniSamplingError(f"Mini {mini_id} has incomplete {name} raster coverage")
+    window = geometry_window(dataset, [mapping(geometry)])
+    band = dataset.read(1, window=window, masked=True)
     selected = geometry_mask(
         [mapping(geometry)],
-        out_shape=dataset.shape,
-        transform=dataset.transform,
+        out_shape=band.shape,
+        transform=dataset.window_transform(window),
         invert=True,
         all_touched=all_touched,
     )
     if not selected.any():
         raise MiniSamplingError(f"Mini {mini_id} has no sampled {name} raster cells")
-    band = dataset.read(1, masked=True)
     if np.ma.getmaskarray(band)[selected].any():
         raise MiniSamplingError(f"Mini {mini_id} contains {name} nodata within sampled cells")
     values = np.asarray(band.data[selected])
