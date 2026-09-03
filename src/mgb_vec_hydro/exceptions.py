@@ -40,3 +40,43 @@ class MiniSamplingError(MgbVecHydroError):
 
 class PreparedDataError(MgbVecHydroError):
     """Raised when prepared input data cannot be created or validated."""
+
+
+class ExecutionConfigurationError(MgbVecHydroError):
+    """Raised when shared execution resource limits are invalid."""
+
+
+class WorkMemoryError(MgbVecHydroError):
+    """Raised when a work unit cannot fit in the configured memory budget."""
+
+
+class WorkerExecutionError(MgbVecHydroError):
+    """Raised when a local worker fails while processing a work unit."""
+
+    def __init__(self, message: str, *, report=None):
+        super().__init__(message)
+        self.report = report
+
+
+class ExecutionCancelledError(MgbVecHydroError):
+    """Raised when shared execution is cancelled before completion."""
+
+    def __init__(self, message: str, *, report=None):
+        super().__init__(message)
+        self.report = report
+
+
+class CheckpointError(MgbVecHydroError):
+    """Raised for incompatible, missing, or corrupt checkpoint state."""
+
+
+class RasterGridError(MgbVecHydroError):
+    """Raised when a raster does not match the canonical prepared grid."""
+
+
+class RasterWriteConflictError(MgbVecHydroError):
+    """Raised when raster patches claim the same output cell."""
+
+
+class PublicationError(MgbVecHydroError):
+    """Raised when staged outputs cannot be published atomically."""

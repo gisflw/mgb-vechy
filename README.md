@@ -3,12 +3,12 @@
 MGB-Vec-Hydro is a standalone Python library and command-line interface for preparing vector hydrography inputs for MGB workflows. The project is extracting the computational parts of the legacy BHO2MGB plugin into a reusable package that works from explicit network topology columns instead of QGIS APIs.
 
 The implemented workflow covers ROI definition, mini-basin aggregation,
-terrain products aligned with the normalized ROI hydrography, and Stage 5
-mini-basin attribute sampling. Stage 4 HRU construction is currently deferred.
+terrain products aligned with the normalized ROI hydrography, and
+mini-basin attribute sampling. HRU construction is currently deferred.
 
 ## Scope
 
-This repository targets the Python package and CLI only. It must stay independent from QGIS, PyQt, QGIS Processing, and desktop GIS project/task APIs.
+This repository targets the Python package and CLI.
 
 BHO remains the first regression target, but the package should support any vector network with configurable segment ID and downstream ID columns. New vector outputs should use FlatGeobuf (`fgb`) or GeoPackage (`gpkg`); Shapefile is not part of the forward-looking format direction.
 
@@ -35,6 +35,13 @@ vectors, and aligned COG rasters. Segments with null, non-finite, or less-than-o
 Strahler values and their corresponding catchments are omitted. See
 [docs/stage0_prepare_data.md](docs/stage0_prepare_data.md) for the complete
 staging contract.
+
+The internal shared execution layer now provides bounded local-process
+execution, resumable coordinator checkpoints, atomic output publication,
+spatially indexed vector batches, canonical raster-window planning, cached COG
+reads, and exclusive raster assembly. It is intentionally not a CLI or
+package-root API yet. See
+[docs/shared_execution.md](docs/shared_execution.md) for its contracts.
 
 The commands below retain their current interfaces until their corresponding
 larger-than-memory work areas are implemented; they do not act as fallbacks for

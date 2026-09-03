@@ -177,6 +177,12 @@ Outputs:
 src/mgb-vec-hydro/
   __init__.py
   cli.py
+  execution/
+    executor.py
+    checkpoints.py
+    publication.py
+    vector.py
+    raster.py
   pipeline.py
   utils.py
   io.py

@@ -2,7 +2,9 @@
 
 ## Status
 
-Implementation plan.
+Implementation in progress. Work areas 1 and 2 are implemented; the existing
+scientific stages retain their old interfaces until their corresponding work
+areas are replaced.
 
 ## Compatibility policy
 
