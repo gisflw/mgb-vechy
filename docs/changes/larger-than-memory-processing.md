@@ -209,6 +209,15 @@ completed system must demonstrate:
 - Separate reporting of input reads, rasterization, computation, coordination,
   compression, and output writes.
 
+The workspace includes integration-test data under `scratch`. The
+first validation round will use the parameters recorded in the
+`scratch/bhae/stage_*.sh` scripts and evaluate the newly generated products
+against the reference data in `scratch/bhae/expected_output`. These comparisons
+will cover each implemented stage before testing broader extents and parallel
+scaling. Any intentional difference introduced by the new processing contract
+must be identified and accepted explicitly; it must not be hidden behind a
+fallback to the previous implementation.
+
 Performance targets and default partition sizes will be selected from profiling
 rather than fixed in this plan.
 
