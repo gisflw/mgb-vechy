@@ -1,20 +1,27 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from collections.abc import Hashable
 from dataclasses import dataclass
-from typing import Hashable
+from pathlib import Path
 
 import geopandas as gpd
 import pandas as pd
-from mgb_vec_hydro.crs_utils import DEFAULT_CRS, transform_vector
+from pyproj import CRS
 
 from mgb_vec_hydro.exceptions import (
     DuplicateSegmentIdError,
     InvalidInputSchemaError,
     TopologyCycleError,
 )
+from mgb_vec_hydro.execution.checkpoints import (
+    CheckpointStore,
+    JsonCheckpointCodec,
+    execution_fingerprint,
+)
+from mgb_vec_hydro.execution.publication import AtomicOutputDirectory
+from mgb_vec_hydro.roi import ROI_COLUMNS, RoiDataset
 from mgb_vec_hydro.topology import _is_sink_value
-
 
 INPUT_COLUMNS = [
     "id",
@@ -36,7 +43,28 @@ class AggregationResult:
 
     catchments: gpd.GeoDataFrame
     segments: gpd.GeoDataFrame
-    mapping: gpd.GeoDataFrame
+    mapping: pd.DataFrame
+
+
+@dataclass(frozen=True)
+class AggregationSpec:
+    roi: Path
+    uparea_min: float
+    lmin: float
+    output_dir: Path
+    workers: int = 4
+    memory_limit_mb: int = 512
+    io_slots: int = 2
+    batch_size: int = 10_000
+    checkpoint_dir: Path | None = None
+
+
+@dataclass(frozen=True)
+class AggregationReport:
+    output_dir: Path
+    catchment_count: int
+    segment_count: int
+    mapping_count: int
 
 
 def aggregate_minibasins(
@@ -45,12 +73,9 @@ def aggregate_minibasins(
     *,
     uparea_min: float,
     lmin: float,
-    crs: str = DEFAULT_CRS,
 ) -> AggregationResult:
     """Aggregate normalized ROI products into mini-basins."""
 
-    roi_catchments = transform_vector(roi_catchments, crs, name="roi_catchments")
-    roi_segments = transform_vector(roi_segments, crs, name="roi_segments")
     _validate_input_schema(roi_catchments, "roi_catchments")
     _validate_input_schema(roi_segments, "roi_segments")
     _validate_unique_ids(roi_segments, "roi_segments")
@@ -58,7 +83,6 @@ def aggregate_minibasins(
 
     segments = roi_segments.reset_index(drop=True).copy()
     catchments = roi_catchments.reset_index(drop=True).copy()
-    ids = set(segments["id"].tolist())
     downstream_by_id = dict(
         segments[["id", "id_down"]].itertuples(index=False, name=None)
     )
@@ -74,8 +98,6 @@ def aggregate_minibasins(
             ["id", "id_down"]
         ].itertuples(index=False, name=None)
     }
-    eligible_upstream_by_downstream = _build_reverse_adjacency(eligible_segments)
-
     domain_by_id = _aggregation_domain_ids(segments)
     sub_domain_by_id = _sub_domain_ids(segments)
     mini_by_segment = _initial_candidate_groups(eligible_segments)
@@ -162,14 +184,18 @@ def aggregate_minibasins(
         geometry="geometry",
         crs=catchments.crs,
     )
-    mapping = gpd.GeoDataFrame(
+    # Centroids are computed in the canonical projected CRS, then transformed.
+    centroid = gpd.GeoSeries(catchments.geometry.centroid, crs=catchments.crs).to_crs(
+        "EPSG:4326"
+    )
+    mapping = pd.DataFrame(
         {
             "id": catchments["id"].to_numpy(),
             "mini_id": catchment_mini.to_numpy(),
             "sub": catchments["sub"].to_numpy(),
-        },
-        geometry=catchments.geometry.to_numpy(),
-        crs=catchments.crs,
+            "longitude": centroid.x.to_numpy(),
+            "latitude": centroid.y.to_numpy(),
+        }
     )
 
     return AggregationResult(
@@ -177,6 +203,94 @@ def aggregate_minibasins(
         segments=aggregated_segments.reset_index(drop=True),
         mapping=mapping.reset_index(drop=True),
     )
+
+
+def aggregate_roi_dataset(spec: AggregationSpec) -> AggregationReport:
+    """Aggregate one versioned ROI and atomically publish fixed Stage 2 assets."""
+    if spec.workers <= 0 or spec.workers > 4:
+        raise InvalidInputSchemaError("workers must be between one and four")
+    if spec.memory_limit_mb <= 0 or spec.io_slots <= 0 or spec.batch_size <= 0:
+        raise InvalidInputSchemaError("execution limits must be positive")
+    if spec.uparea_min < 0 or spec.lmin < 0:
+        raise InvalidInputSchemaError("uparea-min and lmin must be non-negative")
+    dataset = RoiDataset.open(spec.roi)
+    dataset.validate()
+    checkpoint = None
+    if spec.checkpoint_dir is not None:
+        fingerprint = execution_fingerprint(
+            algorithm="aggregate",
+            version="1",
+            prepared_manifest=dataset.manifest,
+            parameters={"uparea_min": spec.uparea_min, "lmin": spec.lmin},
+            work_items=(),
+        )
+        checkpoint = CheckpointStore(
+            spec.checkpoint_dir, fingerprint, JsonCheckpointCodec()
+        )
+    catchments = gpd.read_file(dataset.path("catchments"))
+    segments = gpd.read_file(dataset.path("segments"))
+    expected_crs = CRS.from_wkt(dataset.manifest["crs_wkt"])
+    if (
+        catchments.crs is None
+        or segments.crs is None
+        or CRS.from_user_input(catchments.crs) != expected_crs
+        or CRS.from_user_input(segments.crs) != expected_crs
+    ):
+        raise InvalidInputSchemaError("ROI assets do not use the manifest CRS")
+    result = aggregate_minibasins(
+        catchments, segments, uparea_min=spec.uparea_min, lmin=spec.lmin
+    )
+    output = Path(spec.output_dir)
+    publisher = AtomicOutputDirectory(output)
+    with publisher as staging:
+        catchment_path = staging / "mini_catchments.fgb"
+        segment_path = staging / "mini_segments.fgb"
+        mapping_path = staging / "source_to_mini.csv"
+        result.catchments.to_file(
+            catchment_path, driver="FlatGeobuf", index=False, SPATIAL_INDEX="YES"
+        )
+        result.segments.to_file(
+            segment_path, driver="FlatGeobuf", index=False, SPATIAL_INDEX="YES"
+        )
+        mapping = result.mapping.sort_values(
+            "id", key=lambda values: values.astype(str), kind="stable"
+        ).reset_index(drop=True)
+        mapping.to_csv(mapping_path, index=False)
+        _validate_aggregation_outputs(
+            catchment_path, segment_path, mapping_path,
+            expected_crs=expected_crs, source_ids=set(catchments["id"]),
+        )
+        publisher.publish(
+            ("mini_catchments.fgb", "mini_segments.fgb", "source_to_mini.csv")
+        )
+    if checkpoint is not None:
+        checkpoint.cleanup()
+    return AggregationReport(
+        output, len(result.catchments), len(result.segments), len(result.mapping)
+    )
+
+
+def _validate_aggregation_outputs(
+    catchments: Path,
+    segments: Path,
+    mapping: Path,
+    *,
+    expected_crs: CRS,
+    source_ids: set[Hashable],
+) -> None:
+    for name, path in (("mini_catchments", catchments), ("mini_segments", segments)):
+        frame = gpd.read_file(path)
+        if list(frame.columns) != ROI_COLUMNS:
+            raise InvalidInputSchemaError(f"{name} output schema is invalid")
+        if frame.crs is None or CRS.from_user_input(frame.crs) != expected_crs:
+            raise InvalidInputSchemaError(f"{name} output CRS is invalid")
+    table = pd.read_csv(mapping)
+    if list(table.columns) != ["id", "mini_id", "sub", "longitude", "latitude"]:
+        raise InvalidInputSchemaError("source_to_mini.csv schema is invalid")
+    if len(table) != len(source_ids) or table["id"].duplicated().any():
+        raise InvalidInputSchemaError("source_to_mini.csv does not contain each source once")
+    if {str(value) for value in table["id"]} != {str(value) for value in source_ids}:
+        raise InvalidInputSchemaError("source_to_mini.csv source IDs do not match the ROI")
 
 
 def _validate_input_schema(gdf: gpd.GeoDataFrame, name: str) -> None:

@@ -6,7 +6,7 @@ vector networks that expose explicit segment and downstream topology columns;
 BHO is supported as the initial regression dataset rather than as a fixed
 schema.
 
-The implemented workflow prepares canonical vector and raster inputs, selects
+The implemented workflow prepares canonical raster inputs, selects raw vectors into
 a region of interest, aggregates source units into mini-basins, generates HAND
 and local terrain-to-drainage products, and samples terrain and existing HRU
 classes onto mini-basins. HRU class construction and final MGB file generation
@@ -25,17 +25,12 @@ python -m pip install -e .
 
 ### Prepare canonical inputs
 
-Convert raw sources into filtered, indexed FlatGeobuf vectors and aligned COG
-rasters on one authoritative grid:
+Create aligned COG rasters on one authoritative grid (Stage 0 does not read
+vectors):
 
 ```bash
 mgb-vec-hydro prepare \
-  --catchments data/catchments.gpkg \
-  --segments data/segments.gpkg \
   --dem data/dem.tif \
-  --id-col id \
-  --id-down-col id_down \
-  --strahler-order-col strahler_order \
   --crs EPSG:6933 \
   --resolution 30 \
   --categorical-raster hru data/hru.tif \
@@ -48,15 +43,15 @@ Select all catchments and segments upstream of one or more outlets:
 
 ```bash
 mgb-vec-hydro define-roi \
-  --catchments prepared/vectors/catchments.fgb \
-  --segments prepared/vectors/segments.fgb \
+  --prepared prepared \
+  --catchments data/catchments.gpkg \
+  --segments data/segments.gpkg \
   --outlet-id 123 \
   --id-col id \
   --id-down-col id_down \
   --strahler-order-col strahler_order \
-  --crs EPSG:6933 \
-  --output-dir output/roi \
-  --output-format fgb
+  --upstream-area-col upstream_area \
+  --output-dir output/roi
 ```
 
 ### Aggregate mini-basins
@@ -65,13 +60,10 @@ Aggregate the normalized ROI using upstream-area and minimum-length thresholds:
 
 ```bash
 mgb-vec-hydro aggregate \
-  --roi-catchments output/roi/roi_catchments.fgb \
-  --roi-segments output/roi/roi_segments.fgb \
+  --roi output/roi \
   --uparea-min 30 \
   --lmin 6 \
-  --crs EPSG:6933 \
-  --output-dir output/minis \
-  --output-format fgb
+  --output-dir output/minis
 ```
 
 ### Generate terrain products

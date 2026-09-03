@@ -7,6 +7,7 @@ from mgb_vec_hydro.preparation import (
     PreparedDataset,
     prepare_dataset,
 )
+from mgb_vec_hydro.roi import RoiDataset, RoiReport, RoiSpec, define_roi_dataset
 from mgb_vec_hydro.sampling import MiniSamplingResult, sample_minibasins
 from mgb_vec_hydro.terrain import (
     compute_flow_directions,
@@ -22,9 +23,13 @@ __all__ = [
     "PreparationReport",
     "PreparationSpec",
     "PreparedDataset",
+    "RoiDataset",
+    "RoiReport",
+    "RoiSpec",
     "compute_flow_directions",
     "compute_hand",
     "compute_ltnd",
+    "define_roi_dataset",
     "prepare_dataset",
     "sample_minibasins",
 ]

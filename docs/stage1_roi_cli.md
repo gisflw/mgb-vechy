@@ -1,66 +1,54 @@
-# Stage 1 ROI CLI
+# Stage 1: define ROI
 
-`mgb-vec-hydro define-roi` selects catchment and segment features upstream of one or more outlet IDs.
-
-The command expects prepared vector inputs. It does not clip to a DEM extent and it does not call QGIS.
-
-## Generic Schema
+`mgb-vec-hydro define-roi` reads raw GeoPackage or FlatGeobuf providers and
+selects topology upstream of one or more outlets. Its target CRS comes only
+from the Stage 0 manifest.
 
 ```bash
 mgb-vec-hydro define-roi \
-  --catchments path/to/catchments.gpkg \
-  --segments path/to/segments.gpkg \
-  --outlet-id 123 \
-  --outlet-id 456 \
-  --id-col id \
-  --id-down-col id_down \
-  --strahler-order-col strahler_order \
-  --crs ESRI:102033 \
-  --output-dir output \
-  --output-format fgb
-```
-
-Supply repeated `--outlet-id` values in downstream-to-upstream order. The first outlet gets the highest `sub` value, and later upstream outlet selections overwrite overlapping `sub` assignments.
-
-Outputs are normalized to exactly these columns:
-
-- `id`
-- `id_down`
-- `sub`
-- `strahler_order`
-- `unit_length`
-- `upstream_length`
-- `unit_area`
-- `upstream_area`
-- `water_course`
-- `geometry`
-
-Both inputs must share the configured `--id-col`. The downstream topology column is read from the segment input and copied into both outputs.
-The Strahler order column is required on the segment input and copied into both outputs as `strahler_order`.
-Input column matching is case-insensitive, so `--id-col linkno` can match a source column named `LINKNO`.
-The command computes geometry metrics after resolving input CRS and transforming to `--crs`, which is also the output CRS. If `--source-crs` is supplied, it overrides the CRS metadata on both input layers. If it is omitted, both input layers must already declare a CRS.
-After `upstream_area` is computed, `water_course` is derived independently inside each `sub`: at each confluence, the upstream branch with the greatest `upstream_area` continues the downstream course, with ties resolved by greater `unit_length` and then stable `id` string order. Other upstream branches start a new `water_course` from their own segment ID.
-
-## Custom Schema
-
-```bash
-mgb-vec-hydro define-roi \
+  --prepared prepared \
   --catchments data/catchments.gpkg \
   --segments data/segments.gpkg \
   --outlet-id 90497 \
-  --outlet-id 416 \
-  --outlet-id 159713 \
   --id-col cotrecho \
   --id-down-col nutrjus \
-  --strahler-order-col ordem \
-  --crs ESRI:102033 \
-  --output-dir output \
-  --output-format gpkg
+  --strahler-order-col nustrahler \
+  --upstream-area-col nuareamont \
+  --output-dir roi
 ```
 
-Outputs use Stage 1 names:
+Use `--catchments-layer` and `--segments-layer` for multi-layer containers.
+The independent `--catchments-source-crs` and `--segments-source-crs` options
+replace missing or incorrect provider metadata. There is no target-CRS option.
+Column matching is case-insensitive.
 
-- `roi_catchments.<ext>`
-- `roi_segments.<ext>`
+Topology attributes are streamed without geometry in batches of 10,000.
+Null, non-finite, and below-one Strahler rows are removed before traversal;
+selected values must then be integral. Selected provider upstream-area values
+must be finite and non-negative. Null downstream IDs are sinks. An outlet may
+drain outside the ROI, while every other selected segment must connect toward
+a selected outlet. Duplicate IDs, cycles, missing source pairs, and invalid
+polygon/line geometries are rejected.
 
-Supported formats are `fgb` and `gpkg`. New workflows should prefer `fgb`.
+Only selected geometry is decoded and reprojected. The output columns are:
+
+`id`, `id_down`, `sub`, `strahler_order`, `unit_length`, `upstream_length`,
+`unit_area`, `upstream_area`, `water_course`, `geometry`.
+
+Lengths (km), areas (km²), and upstream length are computed after reprojection.
+`upstream_area` is copied directly from the required provider column.
+Repeated outlets are ordered downstream to upstream; later overlapping outlet
+domains overwrite `sub` assignments.
+
+The versioned directory is atomically published as:
+
+```text
+roi/
+├── manifest.json
+└── vectors/
+    ├── roi_catchments.fgb
+    └── roi_segments.fgb
+```
+
+Published vectors are spatially indexed FlatGeobuf. Execution defaults are
+512 MB, four workers, two concurrent I/O operations, and 10,000-row scans.

@@ -22,7 +22,10 @@ from shapely.geometry import LineString
 
 from mgb_vec_hydro.execution.executor import WorkerContext
 from mgb_vec_hydro.execution.raster import PreparedRasterReader
-from mgb_vec_hydro.execution.vector import plan_vector_partitions
+from mgb_vec_hydro.execution.vector import (
+    inspect_vector_provider,
+    iter_provider_batches,
+)
 
 pytestmark = pytest.mark.skipif(
     os.environ.get("RUN_EXECUTION_BENCHMARKS") != "1",
@@ -66,13 +69,6 @@ def _write_prepared(root, feature_count, raster_size):
     copy_raster(working, root / "rasters" / "dem.tif", driver="COG", BLOCKSIZE=512)
     working.unlink()
 
-    vector_asset = lambda name: {
-        "path": f"vectors/{name}.fgb",
-        "role": "vector",
-        "driver": "FlatGeobuf",
-        "fields": ["id", "group"],
-        "feature_count": feature_count,
-    }
     raster_asset = {
         "path": "rasters/dem.tif",
         "role": "continuous",
@@ -80,7 +76,7 @@ def _write_prepared(root, feature_count, raster_size):
     }
     manifest = {
         "contract": "mgb-prepared-dataset",
-        "version": 2,
+        "version": 3,
         "grid": {
             "crs_wkt": CRS.from_epsg(3857).to_wkt(),
             "transform": list(transform)[:6],
@@ -90,23 +86,22 @@ def _write_prepared(root, feature_count, raster_size):
             "height": raster_size,
             "nodata": "internal-mask",
         },
-        "assets": {
-            "vectors": {
-                "catchments": vector_asset("catchments"),
-                "segments": vector_asset("segments"),
-            },
-            "rasters": {"dem": raster_asset},
-        },
+        "sources": {"rasters": {}},
+        "assets": {"rasters": {"dem": raster_asset}},
     }
     (root / "manifest.json").write_text(json.dumps(manifest))
 
 
 def _measure_vector(root, result_queue):
     started = time.perf_counter()
-    partitions = plan_vector_partitions(root, "segments", "group", batch_size=128)
-    result_queue.put(
-        (sum(item.feature_count for item in partitions), time.perf_counter() - started)
+    provider = inspect_vector_provider(root / "vectors/segments.fgb")
+    count = sum(
+        batch.num_rows
+        for batch in iter_provider_batches(
+            provider, columns=("group",), batch_size=128
+        )
     )
+    result_queue.put((count, time.perf_counter() - started))
 
 
 def _measure_raster(root, result_queue):

@@ -7,6 +7,7 @@ import rasterio
 from rasterio.windows import Window
 
 from mgb_vec_hydro.exceptions import (
+    PreparedDataError,
     RasterGridError,
     RasterWriteConflictError,
     WorkMemoryError,
@@ -75,9 +76,8 @@ def test_prepared_raster_reader_rejects_manifest_grid_mismatch(
 
     context = WorkerContext(mp.get_context("spawn").BoundedSemaphore(1), 2)
     try:
-        reader = PreparedRasterReader(prepared_execution_dataset, context)
-        with pytest.raises(RasterGridError, match="canonical grid"):
-            reader.source("dem")
+        with pytest.raises(PreparedDataError, match="canonical grid/COG"):
+            PreparedRasterReader(prepared_execution_dataset, context)
     finally:
         context.close()
 

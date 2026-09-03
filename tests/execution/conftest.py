@@ -50,13 +50,10 @@ def prepared_execution_dataset(tmp_path):
         target.write(np.arange(6, dtype="float32").reshape(2, 3), 1)
     report = prepare_dataset(
         PreparationSpec(
-            catchments=catchments_path,
-            segments=segments_path,
             dem=dem_path,
             crs="EPSG:3857",
             resolution=10,
             output_dir=tmp_path / "prepared",
-            vector_batch_size=1,
             memory_limit_mb=16,
         )
     )

@@ -1,4 +1,4 @@
-"""Lightweight staging of prepared vector and raster datasets."""
+"""Raster-only staging of canonical prepared datasets."""
 
 from __future__ import annotations
 
@@ -10,15 +10,10 @@ import re
 import shutil
 import tempfile
 from dataclasses import dataclass, field
-from itertools import chain
 from pathlib import Path
 from typing import Any, Literal
 
-import geopandas as gpd
 import numpy as np
-import pyarrow as pa
-import pyarrow.compute as pc
-import pyogrio
 import rasterio
 from pyproj import CRS
 from rasterio.enums import Resampling
@@ -31,7 +26,7 @@ from mgb_vec_hydro.crs_utils import parse_metric_crs
 from mgb_vec_hydro.exceptions import PreparedDataError
 
 CONTRACT = "mgb-prepared-dataset"
-CONTRACT_VERSION = 2
+CONTRACT_VERSION = 3
 BLOCK_SIZE = 512
 NAME_RE = re.compile(r"^[a-z][a-z0-9_-]*$")
 RESERVED_RASTER_NAMES = {"dem", "d8"}
@@ -48,25 +43,15 @@ class NamedRaster:
 
 @dataclass(frozen=True)
 class PreparationSpec:
-    """Inputs and normalization choices for a prepared dataset."""
+    """Raster inputs and normalization choices for a prepared dataset."""
 
-    catchments: Path
-    segments: Path
     dem: Path
     crs: str
     resolution: float
     output_dir: Path
-    id_col: str = "id"
-    id_down_col: str = "id_down"
-    strahler_order_col: str = "strahler_order"
-    catchments_layer: str | None = None
-    segments_layer: str | None = None
-    catchments_source_crs: str | None = None
-    segments_source_crs: str | None = None
     rasters: tuple[NamedRaster, ...] = field(default_factory=tuple)
     d8: Path | None = None
     d8_encoding: Literal["canonical", "esri"] | None = None
-    vector_batch_size: int = 10_000
     memory_limit_mb: int = 512
 
 
@@ -76,10 +61,7 @@ class PreparationReport:
 
     output_dir: Path
     manifest: Path
-    catchment_count: int
-    segment_count: int
-    filtered_catchments: int
-    filtered_segments: int
+    raster_count: int
 
 
 @dataclass(frozen=True)
@@ -170,25 +152,41 @@ class PreparedDataset:
             raise PreparedDataError(
                 "Prepared manifest has an unsupported nodata convention"
             )
-        vectors = assets.get("vectors")
         rasters = assets.get("rasters")
-        if not isinstance(vectors, dict) or set(vectors) != {"catchments", "segments"}:
-            raise PreparedDataError(
-                "Prepared manifest must define catchments and segments"
-            )
+        if set(assets) != {"rasters"}:
+            raise PreparedDataError("Prepared manifest must be raster-only")
         if not isinstance(rasters, dict) or "dem" not in rasters:
             raise PreparedDataError("Prepared manifest must define a DEM")
         try:
-            Affine(*grid["transform"])
-            CRS.from_wkt(grid["crs_wkt"])
+            transform = Affine(*grid["transform"])
+            crs = CRS.from_wkt(grid["crs_wkt"])
             int(grid["width"])
             int(grid["height"])
         except (KeyError, TypeError, ValueError) as exc:
             raise PreparedDataError(
                 "Prepared manifest grid metadata is invalid"
             ) from exc
-        for asset in [*vectors.values(), *rasters.values()]:
-            self._validate_asset(asset)
+        for name, asset in rasters.items():
+            path = self._validate_asset(asset)
+            if asset.get("driver") != "COG":
+                raise PreparedDataError(f"Prepared raster {name} is not declared as COG")
+            try:
+                with rasterio.open(path) as source:
+                    if (
+                        source.count != 1
+                        or source.crs is None
+                        or CRS.from_user_input(source.crs) != crs
+                        or source.transform != transform
+                        or source.width != int(grid["width"])
+                        or source.height != int(grid["height"])
+                        or source.tags(ns="IMAGE_STRUCTURE").get("LAYOUT") != "COG"
+                        or source.nodata is not None
+                    ):
+                        raise PreparedDataError(
+                            f"Prepared raster {name} does not match the canonical grid/COG contract"
+                        )
+            except rasterio.errors.RasterioError as exc:
+                raise PreparedDataError(f"Cannot inspect prepared raster: {name}") from exc
 
     def _validate_asset(self, asset: dict[str, Any]) -> Path:
         if not isinstance(asset, dict) or "path" not in asset:
@@ -233,10 +231,8 @@ def prepare_dataset(spec: PreparationSpec) -> PreparationReport:
     output.parent.mkdir(parents=True, exist_ok=True)
     staging = Path(tempfile.mkdtemp(prefix=f".{output.name}.tmp-", dir=output.parent))
     try:
-        (staging / "vectors").mkdir()
         (staging / "rasters").mkdir()
         grid = canonical_grid(spec.dem, spec.crs, spec.resolution)
-        vector_result = _prepare_vectors(spec, grid, staging)
 
         raster_assets: dict[str, dict[str, Any]] = {}
         dem_path = staging / "rasters" / "dem.tif"
@@ -262,18 +258,8 @@ def prepare_dataset(spec: PreparationSpec) -> PreparationReport:
             "version": CONTRACT_VERSION,
             "producer": _producer_version(),
             "grid": grid.to_manifest(),
-            "filtered": {
-                "catchments": vector_result["filtered_catchments"],
-                "segments": vector_result["filtered_segments"],
-            },
-            "sources": {
-                "vectors": _vector_sources(spec),
-                "rasters": _raster_sources(spec),
-            },
-            "assets": {
-                "vectors": vector_result["assets"],
-                "rasters": raster_assets,
-            },
+            "sources": {"rasters": _raster_sources(spec)},
+            "assets": {"rasters": raster_assets},
         }
         manifest_path = staging / "manifest.json"
         manifest_path.write_text(
@@ -287,6 +273,7 @@ def prepare_dataset(spec: PreparationSpec) -> PreparationReport:
             + "\n",
             encoding="utf-8",
         )
+        PreparedDataset(staging, manifest).validate()
         os.replace(staging, output)
     except BaseException:
         shutil.rmtree(staging, ignore_errors=True)
@@ -295,23 +282,13 @@ def prepare_dataset(spec: PreparationSpec) -> PreparationReport:
     return PreparationReport(
         output_dir=output,
         manifest=output / "manifest.json",
-        catchment_count=vector_result["catchment_count"],
-        segment_count=vector_result["segment_count"],
-        filtered_catchments=vector_result["filtered_catchments"],
-        filtered_segments=vector_result["filtered_segments"],
+        raster_count=len(raster_assets),
     )
 
 
 def _validate_spec(spec: PreparationSpec) -> None:
-    for label, value in (("catchments", spec.catchments), ("segments", spec.segments)):
-        if not Path(value).exists():
-            raise PreparedDataError(
-                f"{label} input is not a local data source: {value}"
-            )
     if not Path(spec.dem).is_file():
         raise PreparedDataError(f"DEM input is not a local file: {spec.dem}")
-    if spec.vector_batch_size <= 0:
-        raise PreparedDataError("Vector batch size must be positive")
     if spec.memory_limit_mb <= 0:
         raise PreparedDataError("Memory limit must be positive")
     names: set[str] = set()
@@ -331,193 +308,6 @@ def _validate_spec(spec: PreparationSpec) -> None:
         raise PreparedDataError(f"Unsupported D8 encoding: {spec.d8_encoding}")
     if spec.d8 is not None and not Path(spec.d8).is_file():
         raise PreparedDataError(f"D8 input is not a local file: {spec.d8}")
-
-
-def _prepare_vectors(
-    spec: PreparationSpec, grid: GridSpec, staging: Path
-) -> dict[str, Any]:
-    catchment_info = pyogrio.read_info(spec.catchments, layer=spec.catchments_layer)
-    segment_info = pyogrio.read_info(spec.segments, layer=spec.segments_layer)
-    catchment_id = _resolve_field(catchment_info, spec.id_col, "catchments")
-    segment_id = _resolve_field(segment_info, spec.id_col, "segments")
-    segment_down = _resolve_field(segment_info, spec.id_down_col, "segments")
-    segment_order = _resolve_field(segment_info, spec.strahler_order_col, "segments")
-
-    segment_output = staging / "vectors" / "segments.fgb"
-    retained_ids: list[pa.Array] = []
-    segment_counts = {"input": 0, "output": 0}
-
-    def segment_batches():
-        with pyogrio.open_arrow(
-            spec.segments,
-            layer=spec.segments_layer,
-            columns=[segment_id, segment_down, segment_order],
-            batch_size=spec.vector_batch_size,
-            use_pyarrow=True,
-        ) as (metadata, batches):
-            source_crs = _source_crs(
-                spec.segments_source_crs, metadata.get("crs"), "segments"
-            )
-            for batch in batches:
-                segment_counts["input"] += batch.num_rows
-                mask = _valid_strahler_mask(batch[segment_order])
-                batch = batch.filter(mask)
-                if batch.num_rows == 0:
-                    continue
-                retained_ids.append(batch[segment_id])
-                segment_counts["output"] += batch.num_rows
-                yield _project_batch(
-                    batch,
-                    source_crs,
-                    grid.crs,
-                    {
-                        segment_id: "id",
-                        segment_down: "id_down",
-                        segment_order: "strahler_order",
-                    },
-                    ["id", "id_down", "strahler_order"],
-                )
-
-    _write_vector_batches(
-        segment_batches(),
-        segment_output,
-        grid.crs,
-        segment_info["geometry_type"],
-        "segments",
-    )
-    valid_ids = _sorted_unique_ids(retained_ids)
-
-    catchment_output = staging / "vectors" / "catchments.fgb"
-    catchment_counts = {"input": 0, "output": 0}
-
-    def catchment_batches():
-        with pyogrio.open_arrow(
-            spec.catchments,
-            layer=spec.catchments_layer,
-            columns=[catchment_id],
-            batch_size=spec.vector_batch_size,
-            use_pyarrow=True,
-        ) as (metadata, batches):
-            source_crs = _source_crs(
-                spec.catchments_source_crs, metadata.get("crs"), "catchments"
-            )
-            for batch in batches:
-                catchment_counts["input"] += batch.num_rows
-                mask = _id_membership_mask(batch[catchment_id], valid_ids)
-                batch = batch.filter(mask)
-                if batch.num_rows == 0:
-                    continue
-                catchment_counts["output"] += batch.num_rows
-                yield _project_batch(
-                    batch,
-                    source_crs,
-                    grid.crs,
-                    {catchment_id: "id"},
-                    ["id"],
-                )
-
-    _write_vector_batches(
-        catchment_batches(),
-        catchment_output,
-        grid.crs,
-        catchment_info["geometry_type"],
-        "catchments",
-    )
-
-    return {
-        "catchment_count": catchment_counts["output"],
-        "segment_count": segment_counts["output"],
-        "filtered_catchments": catchment_counts["input"] - catchment_counts["output"],
-        "filtered_segments": segment_counts["input"] - segment_counts["output"],
-        "assets": {
-            "catchments": _vector_asset(
-                catchment_output, staging, catchment_counts["output"]
-            ),
-            "segments": _vector_asset(
-                segment_output, staging, segment_counts["output"]
-            ),
-        },
-    }
-
-
-def _valid_strahler_mask(values: pa.Array) -> pa.Array:
-    if not (
-        pa.types.is_integer(values.type)
-        or pa.types.is_floating(values.type)
-        or pa.types.is_decimal(values.type)
-    ):
-        raise PreparedDataError("Strahler order must be a numeric field")
-    mask = pc.greater_equal(values, pa.scalar(1, type=values.type))
-    if pa.types.is_floating(values.type):
-        mask = pc.and_(mask, pc.is_finite(values))
-    return pc.fill_null(mask, False)
-
-
-def _sorted_unique_ids(chunks: list[pa.Array]) -> np.ndarray:
-    values = pa.concat_arrays(chunks)
-    values = values.filter(pc.is_valid(values))
-    return np.unique(values.to_numpy(zero_copy_only=False))
-
-
-def _id_membership_mask(values: pa.Array, retained_ids: np.ndarray) -> pa.Array:
-    valid = np.asarray(pc.is_valid(values))
-    result = np.zeros(len(values), dtype=bool)
-    candidates = values.filter(pa.array(valid)).to_numpy(zero_copy_only=False)
-    positions = np.searchsorted(retained_ids, candidates)
-    matches = positions < len(retained_ids)
-    matches[matches] &= retained_ids[positions[matches]] == candidates[matches]
-    result[np.flatnonzero(valid)] = matches
-    return pa.array(result)
-
-
-def _source_crs(override: str | None, declared: str | None, layer: str) -> CRS:
-    value = override or declared
-    if value is None:
-        raise PreparedDataError(f"{layer} layer has no CRS")
-    return CRS.from_user_input(value)
-
-
-def _project_batch(
-    batch: pa.RecordBatch,
-    source_crs: CRS,
-    target_crs: CRS,
-    renames: dict[str, str],
-    fields: list[str],
-) -> pa.RecordBatch:
-    frame = gpd.GeoDataFrame.from_arrow(batch)
-    frame = frame.set_crs(source_crs, allow_override=True).to_crs(target_crs)
-    frame = frame.rename(columns=renames)
-    geometry_name = frame.geometry.name
-    frame = frame[fields + [geometry_name]]
-    if geometry_name != "geometry":
-        frame = frame.rename_geometry("geometry")
-    table = pa.table(frame.reset_index(drop=True).to_arrow()).replace_schema_metadata(
-        None
-    )
-    return table.to_batches()[0]
-
-
-def _write_vector_batches(
-    batches,
-    output: Path,
-    crs: CRS,
-    geometry_type: str,
-    layer_name: str,
-) -> None:
-    batches = iter(batches)
-    first = next(batches, None)
-    if first is None:
-        raise PreparedDataError(f"{layer_name} layer has no retained features")
-    reader = pa.RecordBatchReader.from_batches(first.schema, chain((first,), batches))
-    pyogrio.write_arrow(
-        reader,
-        output,
-        driver="FlatGeobuf",
-        geometry_name="geometry",
-        geometry_type=geometry_type,
-        crs=crs.to_wkt(),
-        layer_options={"SPATIAL_INDEX": "YES"},
-    )
 
 
 def _prepare_warped_raster(
@@ -654,30 +444,6 @@ def _to_cog(source: Path, output: Path, overview_resampling: Resampling) -> None
         )
 
 
-def _resolve_field(info: dict[str, Any], requested: str, layer: str) -> str:
-    fields = list(info["fields"])
-    if requested in fields:
-        return requested
-    matches = [field for field in fields if field.casefold() == requested.casefold()]
-    if len(matches) == 1:
-        return matches[0]
-    if not matches:
-        raise PreparedDataError(f"{layer} is missing required field: {requested}")
-    raise PreparedDataError(f"{layer} has ambiguous field name: {requested}")
-
-
-def _vector_asset(path: Path, root: Path, count: int) -> dict[str, Any]:
-    info = pyogrio.read_info(path)
-    return {
-        **_file_asset(path, root, role="vector"),
-        "driver": "FlatGeobuf",
-        "fields": list(info["fields"]),
-        "field_types": list(info["ogr_types"]),
-        "geometry_type": info["geometry_type"],
-        "feature_count": count,
-    }
-
-
 def _raster_asset(
     path: Path,
     root: Path,
@@ -705,27 +471,6 @@ def _file_asset(path: Path, root: Path, *, role: str) -> dict[str, Any]:
     return {
         "path": path.relative_to(root).as_posix(),
         "role": role,
-    }
-
-
-def _vector_sources(spec: PreparationSpec) -> dict[str, dict[str, Any]]:
-    return {
-        "catchments": {
-            "path": str(Path(spec.catchments).resolve()),
-            "layer": spec.catchments_layer,
-            "crs_override": spec.catchments_source_crs,
-            "columns": {"id": spec.id_col},
-        },
-        "segments": {
-            "path": str(Path(spec.segments).resolve()),
-            "layer": spec.segments_layer,
-            "crs_override": spec.segments_source_crs,
-            "columns": {
-                "id": spec.id_col,
-                "id_down": spec.id_down_col,
-                "strahler_order": spec.strahler_order_col,
-            },
-        },
     }
 
 

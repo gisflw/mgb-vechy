@@ -6,7 +6,6 @@ import pytest
 
 from mgb_vec_hydro.aggregation import INPUT_COLUMNS, aggregate_minibasins
 
-
 pytest.importorskip("geopandas")
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -35,7 +34,9 @@ def test_carinhanha_aggregation_regression_properties():
     assert len(result.mapping) == len(roi_catchments)
     assert list(result.segments.columns) == INPUT_COLUMNS
     assert list(result.catchments.columns) == INPUT_COLUMNS
-    assert list(result.mapping.columns) == ["id", "mini_id", "sub", "geometry"]
+    assert list(result.mapping.columns) == [
+        "id", "mini_id", "sub", "longitude", "latitude"
+    ]
     assert result.catchments["unit_area"].sum() == pytest.approx(
         roi_catchments["unit_area"].sum()
     )

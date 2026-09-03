@@ -4,20 +4,14 @@ from pathlib import Path
 
 import click
 
-from mgb_vec_hydro.aggregation import aggregate_minibasins
+from mgb_vec_hydro.aggregation import AggregationSpec, aggregate_roi_dataset
 from mgb_vec_hydro.crs_utils import DEFAULT_CRS
 from mgb_vec_hydro.exceptions import MgbVecHydroError
-from mgb_vec_hydro.io import (
-    aggregation_output_paths,
-    output_paths,
-    read_vector,
-    write_vector,
-)
+from mgb_vec_hydro.io import read_vector
 from mgb_vec_hydro.preparation import NamedRaster, PreparationSpec, prepare_dataset
-from mgb_vec_hydro.roi import DEFAULT_STRAHLER_ORDER_COL, define_roi
+from mgb_vec_hydro.roi import RoiSpec, define_roi_dataset
 from mgb_vec_hydro.sampling import sample_minibasins
 from mgb_vec_hydro.terrain import create_terrain_products
-from mgb_vec_hydro.topology import resolve_column_name
 
 
 @click.group()
@@ -32,30 +26,9 @@ _NAMED_RASTER = click.Tuple(
 
 @main.command("prepare")
 @click.option(
-    "--catchments",
-    type=click.Path(exists=True, path_type=Path),
-    required=True,
-)
-@click.option("--catchments-layer")
-@click.option("--catchments-source-crs")
-@click.option(
-    "--segments",
-    type=click.Path(exists=True, path_type=Path),
-    required=True,
-)
-@click.option("--segments-layer")
-@click.option("--segments-source-crs")
-@click.option(
     "--dem",
     type=click.Path(exists=True, dir_okay=False, path_type=Path),
     required=True,
-)
-@click.option("--id-col", default="id", show_default=True)
-@click.option("--id-down-col", default="id_down", show_default=True)
-@click.option(
-    "--strahler-order-col",
-    default=DEFAULT_STRAHLER_ORDER_COL,
-    show_default=True,
 )
 @click.option("--crs", required=True, help="Canonical projected CRS with metre units.")
 @click.option(
@@ -79,12 +52,6 @@ _NAMED_RASTER = click.Tuple(
 @click.option("--d8", type=click.Path(exists=True, dir_okay=False, path_type=Path))
 @click.option("--d8-encoding", type=click.Choice(["canonical", "esri"]))
 @click.option(
-    "--vector-batch-size",
-    type=click.IntRange(min=1),
-    default=10_000,
-    show_default=True,
-)
-@click.option(
     "--memory-limit-mb",
     type=click.IntRange(min=1),
     default=512,
@@ -96,27 +63,17 @@ _NAMED_RASTER = click.Tuple(
     required=True,
 )
 def prepare_command(
-    catchments: Path,
-    catchments_layer: str | None,
-    catchments_source_crs: str | None,
-    segments: Path,
-    segments_layer: str | None,
-    segments_source_crs: str | None,
     dem: Path,
-    id_col: str,
-    id_down_col: str,
-    strahler_order_col: str,
     crs: str,
     resolution: float,
     continuous_raster: tuple[tuple[str, Path], ...],
     categorical_raster: tuple[tuple[str, Path], ...],
     d8: Path | None,
     d8_encoding: str | None,
-    vector_batch_size: int,
     memory_limit_mb: int,
     output_dir: Path,
 ) -> None:
-    """Stage filtered vectors and canonical raster inputs."""
+    """Stage a canonical grid and COG raster inputs."""
     rasters = tuple(
         [NamedRaster(name, path, "continuous") for name, path in continuous_raster]
         + [NamedRaster(name, path, "categorical") for name, path in categorical_raster]
@@ -124,22 +81,12 @@ def prepare_command(
     try:
         report = prepare_dataset(
             PreparationSpec(
-                catchments=catchments,
-                catchments_layer=catchments_layer,
-                catchments_source_crs=catchments_source_crs,
-                segments=segments,
-                segments_layer=segments_layer,
-                segments_source_crs=segments_source_crs,
                 dem=dem,
-                id_col=id_col,
-                id_down_col=id_down_col,
-                strahler_order_col=strahler_order_col,
                 crs=crs,
                 resolution=resolution,
                 rasters=rasters,
                 d8=d8,
                 d8_encoding=d8_encoding,
-                vector_batch_size=vector_batch_size,
                 memory_limit_mb=memory_limit_mb,
                 output_dir=output_dir,
             )
@@ -147,138 +94,145 @@ def prepare_command(
     except MgbVecHydroError as exc:
         raise click.ClickException(str(exc)) from exc
     click.echo(f"Wrote {report.manifest}")
-    click.echo(
-        f"Prepared {report.catchment_count} catchments and {report.segment_count} segments"
-    )
-    click.echo(
-        f"Filtered {report.filtered_catchments} catchments and "
-        f"{report.filtered_segments} segments"
-    )
+    click.echo(f"Prepared {report.raster_count} raster(s)")
 
 
 @main.command("define-roi")
+@click.option(
+    "--prepared",
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
+    required=True,
+)
 @click.option(
     "--catchments",
     "catchments_path",
     type=click.Path(exists=True, dir_okay=False, path_type=Path),
     required=True,
 )
+@click.option("--catchments-layer")
+@click.option("--catchments-source-crs")
 @click.option(
     "--segments",
     "segments_path",
     type=click.Path(exists=True, dir_okay=False, path_type=Path),
     required=True,
 )
+@click.option("--segments-layer")
+@click.option("--segments-source-crs")
 @click.option("--outlet-id", "outlet_ids", multiple=True, required=True)
-@click.option("--id-col", default="id", show_default=True)
-@click.option("--id-down-col", default="id_down", show_default=True)
-@click.option(
-    "--strahler-order-col",
-    default=DEFAULT_STRAHLER_ORDER_COL,
-    show_default=True,
-)
-@click.option("--source-crs")
-@click.option("--crs", default=DEFAULT_CRS, show_default=True)
+@click.option("--id-col", required=True)
+@click.option("--id-down-col", required=True)
+@click.option("--strahler-order-col", required=True)
+@click.option("--upstream-area-col", required=True)
 @click.option(
     "--output-dir",
     type=click.Path(file_okay=False, path_type=Path),
     required=True,
 )
-@click.option("--output-format", default="fgb", show_default=True)
+@click.option("--workers", type=click.IntRange(min=1, max=4), default=4, show_default=True)
+@click.option("--memory-limit-mb", type=click.IntRange(min=1), default=512, show_default=True)
+@click.option("--io-slots", type=click.IntRange(min=1), default=2, show_default=True)
+@click.option("--batch-size", type=click.IntRange(min=1), default=10_000, show_default=True)
+@click.option("--checkpoint-dir", type=click.Path(file_okay=False, path_type=Path))
 def define_roi_command(
+    prepared: Path,
     catchments_path: Path,
+    catchments_layer: str | None,
+    catchments_source_crs: str | None,
     segments_path: Path,
+    segments_layer: str | None,
+    segments_source_crs: str | None,
     outlet_ids: tuple[str, ...],
     id_col: str,
     id_down_col: str,
     strahler_order_col: str,
-    source_crs: str | None,
-    crs: str,
+    upstream_area_col: str,
     output_dir: Path,
-    output_format: str,
+    workers: int,
+    memory_limit_mb: int,
+    io_slots: int,
+    batch_size: int,
+    checkpoint_dir: Path | None,
 ) -> None:
-    """Define ROI catchments and segments from explicit network topology."""
+    """Select and normalize an ROI from raw vector providers."""
 
     try:
-        paths = output_paths(output_dir, output_format)
-        catchments = read_vector(catchments_path)
-        segments = read_vector(segments_path)
-        segment_id_col = resolve_column_name(segments, id_col)
-        coerced_outlet_ids = _coerce_outlet_ids(outlet_ids, segments[segment_id_col])
-        roi = define_roi(
-            catchments,
-            segments,
-            outlet_ids=coerced_outlet_ids,
-            crs=crs,
-            source_crs=source_crs,
+        report = define_roi_dataset(RoiSpec(
+            prepared=prepared,
+            catchments=catchments_path,
+            catchments_layer=catchments_layer,
+            catchments_source_crs=catchments_source_crs,
+            segments=segments_path,
+            segments_layer=segments_layer,
+            segments_source_crs=segments_source_crs,
+            outlet_ids=outlet_ids,
             id_col=id_col,
             id_down_col=id_down_col,
             strahler_order_col=strahler_order_col,
-        )
-        write_vector(roi.catchments, paths.catchments, output_format=output_format)
-        write_vector(roi.segments, paths.segments, output_format=output_format)
+            upstream_area_col=upstream_area_col,
+            output_dir=output_dir,
+            workers=workers,
+            memory_limit_mb=memory_limit_mb,
+            io_slots=io_slots,
+            batch_size=batch_size,
+            checkpoint_dir=checkpoint_dir,
+        ))
     except MgbVecHydroError as exc:
         raise click.ClickException(str(exc)) from exc
 
-    click.echo(f"Wrote {paths.catchments}")
-    click.echo(f"Wrote {paths.segments}")
+    click.echo(f"Wrote {report.manifest}")
+    click.echo(f"Selected {report.segment_count} source pairs")
 
 
 @main.command("aggregate")
 @click.option(
-    "--roi-catchments",
-    "roi_catchments_path",
-    type=click.Path(exists=True, dir_okay=False, path_type=Path),
-    required=True,
-)
-@click.option(
-    "--roi-segments",
-    "roi_segments_path",
-    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    "--roi",
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
     required=True,
 )
 @click.option("--uparea-min", type=float, required=True)
 @click.option("--lmin", type=float, required=True)
-@click.option("--crs", default=DEFAULT_CRS, show_default=True)
 @click.option(
     "--output-dir",
     type=click.Path(file_okay=False, path_type=Path),
     required=True,
 )
-@click.option("--output-format", default="fgb", show_default=True)
+@click.option("--workers", type=click.IntRange(min=1, max=4), default=4, show_default=True)
+@click.option("--memory-limit-mb", type=click.IntRange(min=1), default=512, show_default=True)
+@click.option("--io-slots", type=click.IntRange(min=1), default=2, show_default=True)
+@click.option("--batch-size", type=click.IntRange(min=1), default=10_000, show_default=True)
+@click.option("--checkpoint-dir", type=click.Path(file_okay=False, path_type=Path))
 def aggregate_command(
-    roi_catchments_path: Path,
-    roi_segments_path: Path,
+    roi: Path,
     uparea_min: float,
     lmin: float,
-    crs: str,
     output_dir: Path,
-    output_format: str,
+    workers: int,
+    memory_limit_mb: int,
+    io_slots: int,
+    batch_size: int,
+    checkpoint_dir: Path | None,
 ) -> None:
-    """Aggregate normalized ROI catchments and segments into mini-basins."""
+    """Aggregate a versioned ROI into mini-basins."""
 
     try:
-        paths = aggregation_output_paths(output_dir, output_format)
-        roi_catchments = read_vector(roi_catchments_path)
-        roi_segments = read_vector(roi_segments_path)
-        aggregation = aggregate_minibasins(
-            roi_catchments,
-            roi_segments,
+        report = aggregate_roi_dataset(AggregationSpec(
+            roi=roi,
             uparea_min=uparea_min,
             lmin=lmin,
-            crs=crs,
-        )
-        write_vector(
-            aggregation.catchments, paths.catchments, output_format=output_format
-        )
-        write_vector(aggregation.segments, paths.segments, output_format=output_format)
-        write_vector(aggregation.mapping, paths.mapping, output_format=output_format)
+            output_dir=output_dir,
+            workers=workers,
+            memory_limit_mb=memory_limit_mb,
+            io_slots=io_slots,
+            batch_size=batch_size,
+            checkpoint_dir=checkpoint_dir,
+        ))
     except MgbVecHydroError as exc:
         raise click.ClickException(str(exc)) from exc
 
-    click.echo(f"Wrote {paths.catchments}")
-    click.echo(f"Wrote {paths.segments}")
-    click.echo(f"Wrote {paths.mapping}")
+    click.echo(f"Wrote {report.output_dir / 'mini_catchments.fgb'}")
+    click.echo(f"Wrote {report.output_dir / 'mini_segments.fgb'}")
+    click.echo(f"Wrote {report.output_dir / 'source_to_mini.csv'}")
 
 
 @main.command("terrain-products")
@@ -458,17 +412,6 @@ def sample_minis_command(
         f"HRU classes ({result.diagnostics['hru_class_count']}): "
         + ", ".join(str(value) for value in result.diagnostics["hru_class_ids"])
     )
-
-
-def _coerce_outlet_ids(outlet_ids: tuple[str, ...], segment_id_series):
-    """Convert CLI outlet strings to the dtype used by the segment ID column."""
-
-    dtype = segment_id_series.dtype
-    if dtype.kind in {"i", "u"}:
-        return [int(value) for value in outlet_ids]
-    if dtype.kind == "f":
-        return [float(value) for value in outlet_ids]
-    return list(outlet_ids)
 
 
 if __name__ == "__main__":

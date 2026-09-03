@@ -2,9 +2,8 @@
 
 ## Status
 
-Implementation in progress. Work areas 1 and 2 are implemented; the existing
-scientific stages retain their old interfaces until their corresponding work
-areas are replaced.
+Implementation in progress. Work areas 1 through 3 are implemented with the
+raster-only Stage 0 and raw-provider Stage 1 boundary.
 
 ## Compatibility policy
 
@@ -35,7 +34,7 @@ outputs.
 ## Architectural principles
 
 - Prepared inputs define one authoritative CRS and raster grid.
-- Raw and partially compatible inputs are not accepted by downstream stages.
+- Stage 0 is raster-only; Stage 1 is the sole raw-vector ingestion boundary.
 - Catchment ownership is not expanded beyond the domain rasterization. There
   is no ownership buffer.
 - Vector and raster workflows use domain-specific work units rather than a
@@ -59,22 +58,12 @@ The prepared dataset will establish:
 
 - A single projected CRS, resolution, transform, extent, and nodata convention.
 - Tiled COG raster inputs using a block layout suitable for window access.
-- Minimal, indexed vector layers containing only required attributes and
-  geometry.
-- Segments with finite Strahler order of at least one and their matching
-  catchments.
 - Optional D8 data on exactly the same grid, with an explicit direction encoding.
-- FlatGeobuf spatial indexes needed for bounded vector reads.
-- A minimal manifest recording the staged assets, grid, source mappings, and
-  filtered counts.
+- A minimal version-3 manifest recording only the grid and raster assets.
 
-Large vector layers are filtered, transformed, reduced, and written in Arrow
-batches rather than loaded as one continent-wide GeoDataFrame. Retained segment
-IDs are held compactly to filter the corresponding catchments.
-
-Scientific topology, identifier, Strahler-integrality, and geometry validation
-are deferred to the downstream stage that defines the selected domain. COG is
-the required raster interface and FlatGeobuf is the spatial-vector interface.
+Vector inspection, schema mapping, Strahler filtering, topology selection,
+selected-geometry reprojection, and metric normalization all belong to Stage 1.
+COG is the prepared raster interface.
 
 ### 2. Shared vector and raster execution layers
 
@@ -110,8 +99,9 @@ execution backends is not part of the initial work.
 
 ### 3. Refactor vector ROI selection and basin aggregation
 
-Refactor ROI selection and aggregation to depend on the shared vector execution
-layer and the prepared-data contract.
+ROI selection and aggregation use the shared vector execution and publication
+contracts. ROI takes the raster manifest plus raw GeoPackage/FlatGeobuf inputs;
+aggregation takes only the versioned ROI directory.
 
 ROI selection will separate topology from geometry:
 
@@ -130,8 +120,9 @@ Aggregation will be reorganized around water-course work units:
   after partition-local work.
 - Large intermediate GeoDataFrames will not be required.
 
-The refactor may revise schemas and command interfaces as needed. There will be
-no alternate path retaining the current eager GeoPandas implementation.
+The published mapping is geometry-free `source_to_mini.csv`; it includes every
+selected source, including sources below `uparea_min`, with projected-centroid
+coordinates transformed to EPSG:4326.
 
 ### 4. Refactor terrain processing
 
@@ -222,8 +213,9 @@ scaling. Any intentional difference introduced by the new processing contract
 must be identified and accepted explicitly; it must not be hidden behind a
 fallback to the previous implementation.
 
-Performance targets and default partition sizes will be selected from profiling
-rather than fixed in this plan.
+The BHAE gates are 791 source pairs, 267 minis, ROI at or below 26.2 seconds,
+and aggregation at or below 15.8 seconds and 374 MB peak RSS. Defaults are
+512 MB, 10,000-row scans, no more than four workers, and two I/O slots.
 
 ## Completion condition
 

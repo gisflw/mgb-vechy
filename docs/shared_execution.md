@@ -54,19 +54,18 @@ retained after failure, cancellation, and successful execution. The stage calls
 builds every final product there, validates its expected files, and publishes
 the directory with one rename. Destinations that already exist are rejected.
 
-## Prepared vector access
+## Raw-provider and ROI vector access
 
-`iter_vector_batches` resolves a manifest-declared FlatGeobuf asset and yields
-spatially filtered Arrow record batches. Callers choose columns, bounds, and the
-hard batch-size bound. Validated source metadata is cached in workers; each
-query owns its bounded Arrow stream.
+Stage 1 inspects GeoPackage and FlatGeobuf schemas and CRS without loading
+geometry. Topology attributes are streamed through Arrow. Selected IDs use
+safely quoted provider predicates when practical; otherwise one geometry-free
+ID/FID scan is followed by bounded random-FID reads. Exact IDs, duplicates,
+geometry types, and packet estimates are checked before results are admitted.
 
-`plan_vector_partitions` streams an asset and summarizes any caller-selected
-field into deterministic partition keys, bounds, counts, and conservative
-source byte estimates. The executor assigns no meaning to the field, allowing
-the aggregation stage to use `water_course` without placing scientific rules in
-the shared layer. `iter_partition_batches` combines the spatial index with an
-exact field filter to remove bounding-box false positives.
+Versioned ROI assets are indexed FlatGeobuf. Aggregation partitions them by
+`water_course`; multiple complete courses may share a task when their combined
+estimate remains within the configured budget. Ordered reduction and central
+topology resolution keep serial and parallel output deterministic.
 
 ## Prepared raster access
 
