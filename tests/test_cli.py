@@ -11,8 +11,12 @@ def test_stage_command_contracts():
     assert prepare.exit_code == roi.exit_code == aggregate.exit_code == 0
     assert "--catchments" not in prepare.output and "--segments" not in prepare.output
     for option in (
-        "--prepared", "--catchments-layer", "--segments-layer",
-        "--catchments-source-crs", "--segments-source-crs", "--upstream-area-col",
+        "--prepared",
+        "--catchments-layer",
+        "--segments-layer",
+        "--catchments-source-crs",
+        "--segments-source-crs",
+        "--upstream-area-col",
     ):
         assert option in roi.output
     assert "--crs" not in roi.output and "--output-format" not in roi.output
@@ -29,6 +33,26 @@ def test_stage_command_contracts():
 def test_terrain_products_cli_exposes_agree_controls():
     result = CliRunner().invoke(main, ["terrain-products", "--help"])
     assert result.exit_code == 0
-    assert "--agree-sharp" in result.output
-    assert "--agree-smooth" in result.output
-    assert "--agree-buffer" in result.output
+    for option in (
+        "--prepared",
+        "--minis",
+        "--direction-source",
+        "--agree-sharp",
+        "--agree-smooth",
+        "--agree-buffer",
+        "--workers",
+        "--memory-limit-mb",
+        "--io-slots",
+        "--batch-size",
+        "--checkpoint-dir",
+    ):
+        assert option in result.output
+    for obsolete in (
+        "--dem",
+        "--roi-catchments",
+        "--roi-segments",
+        "--id-col",
+        "--crs",
+        "--buffer-cells",
+    ):
+        assert obsolete not in result.output

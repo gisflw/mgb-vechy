@@ -2,8 +2,9 @@
 
 ## Status
 
-Implementation in progress. Work areas 1 through 3 are implemented with the
-raster-only Stage 0 and raw-provider Stage 1 boundary.
+Implementation in progress. Work areas 1 through 4 are implemented with the
+raster-only Stage 0, raw-provider Stage 1 boundary, and bounded mini-based
+terrain processing.
 
 ## Compatibility policy
 
@@ -126,34 +127,34 @@ coordinates transformed to EPSG:4326.
 
 ### 4. Refactor terrain processing
 
-Refactor terrain processing to depend on the shared raster execution layer and
-the domain produced by ROI selection and basin aggregation.
+Terrain processing depends on the shared raster execution layer, prepared
+rasters, and the aggregated mini products. Aggregated minis are the complete
+terrain and ownership units; `source_to_mini.csv` is not a Stage 4 input.
 
-Before terrain calculations begin, the selected and aggregated domain products
-will be rasterized on the canonical grid. This post-aggregation rasterization
-will produce the catchment ownership and matching drainage inputs required by
-downstream raster processing. It will operate through the shared raster
-execution layer with bounded memory and will not be part of input preparation.
+Before terrain calculations begin, mini catchments and matching mini segments
+are rasterized on the canonical grid. This post-aggregation pass produces
+strict ownership and drainage COGs through the shared execution layer. It is
+not part of input preparation and does not expand ownership.
 
-Each terrain task will process one complete unit catchment, or a bounded packet
-of complete unit catchments, from local COG windows. Catchment and drainage
-geometry will not be rasterized during terrain execution. No cells outside the
-post-aggregation unit-catchment ownership will be added to the routing domain.
+Each terrain task processes one complete mini catchment, or a bounded packet of
+complete minis, from local COG windows. Catchment and drainage geometry is not
+rasterized during terrain execution. A deterministic dense-label Parquet index
+preserves arbitrary mini ID types.
 
-The terrain stage will support two direction sources behind one processing
+The terrain stage supports two explicit direction sources behind one processing
 contract:
 
 - Direction derived from the DEM using the terrain-conditioning workflow.
 - A prepared D8 raster that passes grid, encoding, confinement, termination, and
   cycle validation.
 
-Both paths will produce the same terrain-product interface. Shared computations
-and traversals should be combined where doing so reduces memory or I/O, but the
-specific kernel organization will be guided by profiling and correctness tests.
+Both paths produce the same versioned terrain-dataset interface. Shared
+traversal order, cached COG handles, spatial packets, and compact array dtypes
+reduce memory and I/O.
 
-Results will be assembled into one final COG per terrain product without
-concurrent worker writes to those files. Temporary output representation and
-block assembly details may be refined during implementation.
+Results are assembled into one final COG per terrain product without concurrent
+worker writes. Domain and terrain checkpoints remain resumable until the
+validated directory is atomically published.
 
 ### 5. Refactor mini-basin sampling
 
@@ -162,8 +163,9 @@ the post-aggregation rasterized domain and terrain products.
 
 Sampling will avoid repeated arbitrary polygon-window reads where blockwise or
 unit-based reductions are possible. Unit-catchment labels and the aggregation
-mapping will associate raster cells with mini basins. Per-partition statistics
-will use deterministic, mergeable accumulators where the statistic permits it.
+mini index will associate raster cells with mini basins. Per-partition
+statistics will use deterministic, mergeable accumulators where the statistic
+permits it.
 
 Statistics that cannot be reduced directly, including exact quantiles, will use
 a bounded strategy chosen during implementation. Any change from exact to
@@ -182,8 +184,8 @@ The expected dependency order is:
 3. Refactor ROI selection and aggregation using the vector execution layer.
 4. Rasterize the resulting domain and refactor terrain processing using the
    raster execution layer.
-5. Refactor mini-basin sampling using the raster execution layer, aggregation
-   mapping, and terrain products.
+5. Refactor mini-basin sampling using the raster execution layer, mini index,
+   and terrain products.
 
 Work areas 3, 4, and 5 must not introduce independent chunking, scheduling,
 worker-management, or output-publication implementations. Missing capabilities
@@ -214,8 +216,9 @@ must be identified and accepted explicitly; it must not be hidden behind a
 fallback to the previous implementation.
 
 The BHAE gates are 791 source pairs, 267 minis, ROI at or below 26.2 seconds,
-and aggregation at or below 15.8 seconds and 374 MB peak RSS. Defaults are
-512 MB, 10,000-row scans, no more than four workers, and two I/O slots.
+aggregation at or below 15.8 seconds and 374 MB peak RSS, and a warm-cache
+terrain target at or below 60 seconds. Defaults are 512 MB, 10,000-row scans,
+no more than four workers, and two I/O slots.
 
 ## Completion condition
 

@@ -68,16 +68,15 @@ mgb-vec-hydro aggregate \
 
 ### Generate terrain products
 
-Create catchment-confined HAND and local terrain-to-drainage rasters. Add
-`--write-flow-direction` to retain the computed D8 raster.
+Create strict mini-confined HAND and local terrain-to-drainage COGs. Add
+`--write-flow-direction` to publish the selected D8 raster, or use
+`--direction-source d8` to route from a prepared D8 input.
 
 ```bash
 mgb-vec-hydro terrain-products \
-  --dem prepared/rasters/dem.tif \
-  --roi-catchments output/roi/roi_catchments.fgb \
-  --roi-segments output/roi/roi_segments.fgb \
-  --crs EPSG:6933 \
-  --buffer-cells 1 \
+  --prepared prepared \
+  --minis output/minis \
+  --direction-source dem \
   --output-dir output/terrain
 ```
 
@@ -91,8 +90,8 @@ mgb-vec-hydro sample-minis \
   --catchments output/minis/mini_catchments.fgb \
   --segments output/minis/mini_segments.fgb \
   --dem prepared/rasters/dem.tif \
-  --hand output/terrain/hand.tif \
-  --ltnd output/terrain/ltnd.tif \
+  --hand output/terrain/rasters/hand.tif \
+  --ltnd output/terrain/rasters/ltnd.tif \
   --hru prepared/rasters/hru.tif \
   --crs EPSG:6933 \
   --output-dir output/sampled

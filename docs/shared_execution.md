@@ -77,12 +77,25 @@ limits; it never splits a unit.
 
 `PreparedRasterReader` verifies every named COG against the canonical CRS,
 transform, shape, and band contract, then reuses its Rasterio handle inside the
-worker. Reads require bounded integer windows.
+worker. `AlignedRasterReader` provides the same cached access for derived COGs
+that have already been tied to a canonical grid. Reads require bounded integer
+windows.
 
 `RasterAssembler` is coordinator-only. It merges valid cells from bounded
 `RasterPatch` values into tiled working rasters, reading the existing mask to
 reject duplicate cell ownership without a continent-wide ownership array. On
-completion it creates one internally masked COG per `RasterProductSpec`.
+the first patch it creates the mask lazily, leaving untouched blocks invalid
+instead of initializing the complete grid. On completion it creates one
+internally masked COG per `RasterProductSpec`, with a bounded number of GDAL
+compression threads.
+
+Stage 4 first rasterizes complete aggregated minis into ownership and matching
+drainage COGs. A second bounded execution pass reads those products with the
+prepared DEM or D8 COG; terrain workers never receive vector geometry and only
+the coordinator assembles final products. Both passes use independent,
+compatible checkpoints. Stage 4 also caps GDAL's otherwise machine-relative
+block cache in the coordinator and each worker; task admission estimates still
+exclude fixed Python and imported-library process overhead.
 
 Scientific work areas remain responsible for work payloads, memory factors,
 checkpoint codecs, topology and ownership rules, and product schemas.

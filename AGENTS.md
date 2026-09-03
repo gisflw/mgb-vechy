@@ -81,5 +81,5 @@ RUN_EXECUTION_BENCHMARKS=1 pytest tests/benchmark/execution
 RUN_TERRAIN_BENCHMARKS=1 pytest tests/benchmark/test_terrain_scaling.py
 ```
 
-Some terrain benchmark cases also require `BHAE_ROUTING_INPUT` to identify a
-local integration dataset.
+The full terrain benchmark also requires `BHAE_PREPARED` and `BHAE_MINIS` to
+identify the local Stage 0 and Stage 2 integration datasets.

@@ -14,8 +14,8 @@ mgb-vec-hydro sample-minis \
   --catchments output/mini_catchments.fgb \
   --segments output/mini_segments.fgb \
   --dem path/to/dem.tif \
-  --hand output/hand.tif \
-  --ltnd output/ltnd.tif \
+  --hand output/terrain/rasters/hand.tif \
+  --ltnd output/terrain/rasters/ltnd.tif \
   --hru path/to/hru.tif \
   --crs EPSG:6933 \
   --output-dir output/sampled

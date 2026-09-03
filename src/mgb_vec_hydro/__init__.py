@@ -10,9 +10,13 @@ from mgb_vec_hydro.preparation import (
 from mgb_vec_hydro.roi import RoiDataset, RoiReport, RoiSpec, define_roi_dataset
 from mgb_vec_hydro.sampling import MiniSamplingResult, sample_minibasins
 from mgb_vec_hydro.terrain import (
+    TerrainDataset,
+    TerrainReport,
+    TerrainSpec,
     compute_flow_directions,
     compute_hand,
     compute_ltnd,
+    create_terrain_dataset,
 )
 
 __version__ = "0.1.0"
@@ -26,9 +30,13 @@ __all__ = [
     "RoiDataset",
     "RoiReport",
     "RoiSpec",
+    "TerrainDataset",
+    "TerrainReport",
+    "TerrainSpec",
     "compute_flow_directions",
     "compute_hand",
     "compute_ltnd",
+    "create_terrain_dataset",
     "define_roi_dataset",
     "prepare_dataset",
     "sample_minibasins",

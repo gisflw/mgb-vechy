@@ -13,8 +13,8 @@ The implemented commands are:
 3. `aggregate`, which writes aggregated mini-basin catchments, reaches, and
    source-to-mini mapping. See the
    [Stage 2 CLI guide](../stage2_aggregation_cli.md).
-4. `terrain-products`, which writes vector-compatible HAND and local
-   terrain-to-drainage rasters. See the
+4. `terrain-products`, which writes a versioned canonical-grid domain, HAND,
+   and local terrain-to-drainage dataset. See the
    [Stage 3 CLI guide](../stage3_terrain_cli.md).
 5. `sample-minis`, which samples terrain and existing HRU classes into a
    mini-basin attribute table. See the

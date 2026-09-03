@@ -11,7 +11,7 @@ from mgb_vec_hydro.io import read_vector
 from mgb_vec_hydro.preparation import NamedRaster, PreparationSpec, prepare_dataset
 from mgb_vec_hydro.roi import RoiSpec, define_roi_dataset
 from mgb_vec_hydro.sampling import sample_minibasins
-from mgb_vec_hydro.terrain import create_terrain_products
+from mgb_vec_hydro.terrain import TerrainSpec, create_terrain_dataset
 
 
 @click.group()
@@ -129,10 +129,16 @@ def prepare_command(
     type=click.Path(file_okay=False, path_type=Path),
     required=True,
 )
-@click.option("--workers", type=click.IntRange(min=1, max=4), default=4, show_default=True)
-@click.option("--memory-limit-mb", type=click.IntRange(min=1), default=512, show_default=True)
+@click.option(
+    "--workers", type=click.IntRange(min=1, max=4), default=4, show_default=True
+)
+@click.option(
+    "--memory-limit-mb", type=click.IntRange(min=1), default=512, show_default=True
+)
 @click.option("--io-slots", type=click.IntRange(min=1), default=2, show_default=True)
-@click.option("--batch-size", type=click.IntRange(min=1), default=10_000, show_default=True)
+@click.option(
+    "--batch-size", type=click.IntRange(min=1), default=10_000, show_default=True
+)
 @click.option("--checkpoint-dir", type=click.Path(file_okay=False, path_type=Path))
 def define_roi_command(
     prepared: Path,
@@ -157,26 +163,28 @@ def define_roi_command(
     """Select and normalize an ROI from raw vector providers."""
 
     try:
-        report = define_roi_dataset(RoiSpec(
-            prepared=prepared,
-            catchments=catchments_path,
-            catchments_layer=catchments_layer,
-            catchments_source_crs=catchments_source_crs,
-            segments=segments_path,
-            segments_layer=segments_layer,
-            segments_source_crs=segments_source_crs,
-            outlet_ids=outlet_ids,
-            id_col=id_col,
-            id_down_col=id_down_col,
-            strahler_order_col=strahler_order_col,
-            upstream_area_col=upstream_area_col,
-            output_dir=output_dir,
-            workers=workers,
-            memory_limit_mb=memory_limit_mb,
-            io_slots=io_slots,
-            batch_size=batch_size,
-            checkpoint_dir=checkpoint_dir,
-        ))
+        report = define_roi_dataset(
+            RoiSpec(
+                prepared=prepared,
+                catchments=catchments_path,
+                catchments_layer=catchments_layer,
+                catchments_source_crs=catchments_source_crs,
+                segments=segments_path,
+                segments_layer=segments_layer,
+                segments_source_crs=segments_source_crs,
+                outlet_ids=outlet_ids,
+                id_col=id_col,
+                id_down_col=id_down_col,
+                strahler_order_col=strahler_order_col,
+                upstream_area_col=upstream_area_col,
+                output_dir=output_dir,
+                workers=workers,
+                memory_limit_mb=memory_limit_mb,
+                io_slots=io_slots,
+                batch_size=batch_size,
+                checkpoint_dir=checkpoint_dir,
+            )
+        )
     except MgbVecHydroError as exc:
         raise click.ClickException(str(exc)) from exc
 
@@ -197,10 +205,16 @@ def define_roi_command(
     type=click.Path(file_okay=False, path_type=Path),
     required=True,
 )
-@click.option("--workers", type=click.IntRange(min=1, max=4), default=4, show_default=True)
-@click.option("--memory-limit-mb", type=click.IntRange(min=1), default=512, show_default=True)
+@click.option(
+    "--workers", type=click.IntRange(min=1, max=4), default=4, show_default=True
+)
+@click.option(
+    "--memory-limit-mb", type=click.IntRange(min=1), default=512, show_default=True
+)
 @click.option("--io-slots", type=click.IntRange(min=1), default=2, show_default=True)
-@click.option("--batch-size", type=click.IntRange(min=1), default=10_000, show_default=True)
+@click.option(
+    "--batch-size", type=click.IntRange(min=1), default=10_000, show_default=True
+)
 @click.option("--checkpoint-dir", type=click.Path(file_okay=False, path_type=Path))
 def aggregate_command(
     roi: Path,
@@ -216,17 +230,19 @@ def aggregate_command(
     """Aggregate a versioned ROI into mini-basins."""
 
     try:
-        report = aggregate_roi_dataset(AggregationSpec(
-            roi=roi,
-            uparea_min=uparea_min,
-            lmin=lmin,
-            output_dir=output_dir,
-            workers=workers,
-            memory_limit_mb=memory_limit_mb,
-            io_slots=io_slots,
-            batch_size=batch_size,
-            checkpoint_dir=checkpoint_dir,
-        ))
+        report = aggregate_roi_dataset(
+            AggregationSpec(
+                roi=roi,
+                uparea_min=uparea_min,
+                lmin=lmin,
+                output_dir=output_dir,
+                workers=workers,
+                memory_limit_mb=memory_limit_mb,
+                io_slots=io_slots,
+                batch_size=batch_size,
+                checkpoint_dir=checkpoint_dir,
+            )
+        )
     except MgbVecHydroError as exc:
         raise click.ClickException(str(exc)) from exc
 
@@ -237,38 +253,27 @@ def aggregate_command(
 
 @main.command("terrain-products")
 @click.option(
-    "--dem",
-    "dem_path",
-    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    "--prepared",
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
     required=True,
 )
 @click.option(
-    "--roi-catchments",
-    "roi_catchments_path",
-    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    "--minis",
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
     required=True,
 )
-@click.option(
-    "--roi-segments",
-    "roi_segments_path",
-    type=click.Path(exists=True, dir_okay=False, path_type=Path),
-    required=True,
-)
-@click.option("--id-col", default="id", show_default=True)
-@click.option("--crs", default=DEFAULT_CRS, show_default=True)
 @click.option(
     "--output-dir",
     type=click.Path(file_okay=False, path_type=Path),
     required=True,
 )
-@click.option("--write-flow-direction", is_flag=True)
 @click.option(
-    "--buffer-cells",
-    type=click.IntRange(min=0),
-    default=1,
+    "--direction-source",
+    type=click.Choice(["dem", "d8"], case_sensitive=False),
+    default="dem",
     show_default=True,
-    help="Raster cells of output coverage beyond catchment edges.",
 )
+@click.option("--write-flow-direction", is_flag=True)
 @click.option(
     "--agree-sharp",
     type=click.FloatRange(min=0),
@@ -290,51 +295,63 @@ def aggregate_command(
     show_default=True,
     help="AGREE conditioning radius in raster pixels.",
 )
+@click.option(
+    "--workers", type=click.IntRange(min=1, max=4), default=4, show_default=True
+)
+@click.option(
+    "--memory-limit-mb", type=click.IntRange(min=1), default=512, show_default=True
+)
+@click.option("--io-slots", type=click.IntRange(min=1), default=2, show_default=True)
+@click.option(
+    "--batch-size", type=click.IntRange(min=1), default=10_000, show_default=True
+)
+@click.option("--checkpoint-dir", type=click.Path(file_okay=False, path_type=Path))
 def terrain_products_command(
-    dem_path: Path,
-    roi_catchments_path: Path,
-    roi_segments_path: Path,
-    id_col: str,
-    crs: str,
+    prepared: Path,
+    minis: Path,
     output_dir: Path,
+    direction_source: str,
     write_flow_direction: bool,
-    buffer_cells: int,
     agree_sharp: float,
     agree_smooth: float,
     agree_buffer: int,
+    workers: int,
+    memory_limit_mb: int,
+    io_slots: int,
+    batch_size: int,
+    checkpoint_dir: Path | None,
 ) -> None:
-    """Generate catchment-confined HAND and LTND rasters."""
+    """Generate bounded mini-confined terrain products."""
 
     try:
-        report = create_terrain_products(
-            dem_path,
-            read_vector(roi_catchments_path),
-            read_vector(roi_segments_path),
-            output_dir,
-            crs=crs,
-            id_col=id_col,
-            buffer_cells=buffer_cells,
-            write_flow_direction=write_flow_direction,
-            agree_sharp=agree_sharp,
-            agree_smooth=agree_smooth,
-            agree_buffer=agree_buffer,
+        report = create_terrain_dataset(
+            TerrainSpec(
+                prepared=prepared,
+                minis=minis,
+                output_dir=output_dir,
+                direction_source=direction_source.lower(),
+                write_flow_direction=write_flow_direction,
+                agree_sharp=agree_sharp,
+                agree_smooth=agree_smooth,
+                agree_buffer=agree_buffer,
+                workers=workers,
+                memory_limit_mb=memory_limit_mb,
+                io_slots=io_slots,
+                batch_size=batch_size,
+                checkpoint_dir=checkpoint_dir,
+            )
         )
     except MgbVecHydroError as exc:
         raise click.ClickException(str(exc)) from exc
 
-    click.echo(f"Wrote {report.paths.hand}")
-    click.echo(f"Wrote {report.paths.ltnd}")
-    if report.paths.flow_direction:
-        click.echo(f"Wrote {report.paths.flow_direction}")
+    click.echo(f"Wrote {report.manifest}")
+    click.echo(f"Processed {report.mini_count} complete minis")
+    click.echo(f"Cells: {report.owned_cells} owned, {report.drainage_cells} drainage")
     click.echo(
-        f"Cells: {report.owned_cells} owned, {report.drainage_cells} drainage; "
-        f"unreachable components: {report.unreachable_components}"
-    )
-    click.echo(
-        f"Timing: conditioning {report.conditioning_seconds:.3f}s, "
-        f"routing {report.routing_seconds:.3f}s, "
-        f"JIT/cache initialization {report.jit_compilation_seconds:.3f}s, "
-        f"raster I/O {report.raster_io_seconds:.3f}s"
+        "Timing: "
+        + ", ".join(
+            f"{name} {seconds:.3f}s" for name, seconds in report.timings.items()
+        )
     )
     if report.negative_hand_cells:
         click.echo(

@@ -15,6 +15,7 @@ from mgb_vec_hydro.exceptions import (
 from mgb_vec_hydro.execution.executor import WorkerContext
 from mgb_vec_hydro.execution.publication import AtomicOutputDirectory
 from mgb_vec_hydro.execution.raster import (
+    AlignedRasterReader,
     PreparedRasterReader,
     RasterAssembler,
     RasterPatch,
@@ -117,8 +118,20 @@ def test_raster_assembler_rejects_overlap_and_publishes_cog_atomically(
         assert result.tags()["kind"] == "test"
         assert result.tags(ns="IMAGE_STRUCTURE")["LAYOUT"] == "COG"
         np.testing.assert_array_equal(result.dataset_mask()[0], [255, 255, 255])
+        np.testing.assert_array_equal(result.dataset_mask()[1], [0, 0, 0])
         np.testing.assert_array_equal(result.read(1)[0], [1, 3, 4])
     assert [path.name for path in (tmp_path / "products").iterdir()] == ["hand.tif"]
+
+    context = WorkerContext(mp.get_context("spawn").BoundedSemaphore(1), 2)
+    try:
+        reader = AlignedRasterReader(
+            grid, {"hand": tmp_path / "products" / "hand.tif"}, context
+        )
+        values = reader.read("hand", Window(0, 0, 3, 1))
+        np.testing.assert_array_equal(values, [[1, 3, 4]])
+        assert reader.source("hand") is reader.source("hand")
+    finally:
+        context.close()
 
 
 def test_raster_planner_rejects_units_outside_grid(prepared_execution_dataset):

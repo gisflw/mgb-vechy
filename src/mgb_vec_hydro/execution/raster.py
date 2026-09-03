@@ -205,6 +205,44 @@ class PreparedRasterReader:
             return source.read(1, window=window, masked=masked)
 
 
+class AlignedRasterReader:
+    """Read named COGs that use an already validated canonical grid."""
+
+    def __init__(
+        self,
+        grid: GridSpec,
+        assets: dict[str, str | Path],
+        context: WorkerContext,
+    ):
+        self.grid = grid
+        self.assets = {name: Path(path).resolve() for name, path in assets.items()}
+        self.context = context
+
+    def source(self, name: str):
+        try:
+            path = self.assets[name]
+        except KeyError as exc:
+            raise RasterGridError(f"Unknown aligned raster asset: {name}") from exc
+        key = f"aligned-raster:{path}"
+
+        def open_source():
+            source = rasterio.open(path)
+            try:
+                _require_grid(source, self.grid, name)
+            except Exception:
+                source.close()
+                raise
+            return source
+
+        return self.context.resources.get(key, open_source)
+
+    def read(self, name: str, window: Window, *, masked: bool = True) -> np.ndarray:
+        source = self.source(name)
+        _require_integer_window(window, self.grid)
+        with self.context.io_bound():
+            return source.read(1, window=window, masked=masked)
+
+
 class RasterAssembler:
     """Single-process writer for non-overlapping patches and final COGs."""
 
@@ -215,10 +253,12 @@ class RasterAssembler:
         products: Iterable[RasterProductSpec],
         *,
         block_size: int = BLOCK_SIZE,
+        compression_threads: int = 1,
     ):
         self.root = Path(staging_dir)
         self.grid = grid
         self.block_size = block_size
+        self.compression_threads = compression_threads
         product_list = tuple(products)
         self.specs = {spec.name: spec for spec in product_list}
         if not self.specs or len(self.specs) != len(product_list):
@@ -238,6 +278,12 @@ class RasterAssembler:
             raise RasterGridError(
                 "Raster block size must be a power of two from 128 through 4096"
             )
+        if (
+            isinstance(compression_threads, bool)
+            or not isinstance(compression_threads, int)
+            or compression_threads <= 0
+        ):
+            raise RasterGridError("Raster compression threads must be positive")
         for spec in product_list:
             try:
                 np.dtype(spec.dtype)
@@ -247,6 +293,7 @@ class RasterAssembler:
                 ) from exc
         self.root.mkdir(parents=True, exist_ok=True)
         self._sources: dict[str, Any] = {}
+        self._mask_initialized: set[str] = set()
         self._finished = False
         try:
             for spec in self.specs.values():
@@ -269,13 +316,6 @@ class RasterAssembler:
                     BIGTIFF="IF_SAFER",
                 )
                 self._sources[spec.name] = source
-                for _, window in source.block_windows(1):
-                    source.write_mask(
-                        np.zeros(
-                            (int(window.height), int(window.width)), dtype="uint8"
-                        ),
-                        window=window,
-                    )
         except Exception:
             self.close()
             raise
@@ -292,7 +332,13 @@ class RasterAssembler:
         if data.shape != shape or valid.shape != shape:
             raise RasterGridError("Raster patch arrays do not match their window")
         source = self._sources[patch.product]
-        existing_valid = source.read_masks(1, window=patch.window) != 0
+        if patch.product in self._mask_initialized:
+            existing_valid = source.read_masks(1, window=patch.window) != 0
+        else:
+            # The first partial mask write creates a per-dataset mask whose
+            # untouched blocks are invalid. Avoid eagerly touching every block
+            # of a continental grid merely to initialize it to zero.
+            existing_valid = np.zeros(shape, dtype=bool)
         if np.any(existing_valid & valid):
             raise RasterWriteConflictError(
                 f"Raster patch {patch.product} overlaps previously owned cells"
@@ -303,6 +349,7 @@ class RasterAssembler:
         source.write_mask(
             ((existing_valid | valid) * 255).astype("uint8"), window=patch.window
         )
+        self._mask_initialized.add(patch.product)
 
     def finish(self) -> dict[str, Path]:
         if self._finished:
@@ -327,6 +374,7 @@ class RasterAssembler:
                         BLOCKSIZE=self.block_size,
                         COMPRESS="DEFLATE",
                         BIGTIFF="IF_SAFER",
+                        NUM_THREADS=str(self.compression_threads),
                         RESAMPLING=spec.overview_resampling.name.upper(),
                         OVERVIEW_RESAMPLING=spec.overview_resampling.name.upper(),
                     )
@@ -342,6 +390,7 @@ class RasterAssembler:
             source.close()
             path.unlink(missing_ok=True)
         self._sources.clear()
+        self._mask_initialized.clear()
 
     def __enter__(self):
         return self
