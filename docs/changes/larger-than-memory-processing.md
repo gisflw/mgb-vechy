@@ -59,18 +59,20 @@ The prepared dataset will establish:
 - Tiled COG raster inputs using a block layout suitable for window access.
 - Minimal, indexed vector layers containing only required attributes and
   geometry.
-- Stable and validated identifiers shared by catchments and drainage segments.
+- Segments with finite Strahler order of at least one and their matching
+  catchments.
 - Optional D8 data on exactly the same grid, with an explicit direction encoding.
-- Spatial indexes and lookup information needed for bounded vector reads.
-- A manifest recording the prepared-data contract and source provenance.
+- FlatGeobuf spatial indexes needed for bounded vector reads.
+- A minimal manifest recording the staged assets, grid, source mappings, and
+  filtered counts.
 
-Preparation must itself operate with bounded memory. Large vector layers will be
-validated, transformed, reduced, and written incrementally rather than loaded as
-one continent-wide GeoDataFrame.
+Large vector layers are filtered, transformed, reduced, and written in Arrow
+batches rather than loaded as one continent-wide GeoDataFrame. Retained segment
+IDs are held compactly to filter the corresponding catchments.
 
-The precise storage representation of indexes and lookup tables may evolve as
-the implementation is benchmarked. COG is the required raster interface and
-FlatGeobuf is the default spatial-vector interface.
+Scientific topology, identifier, Strahler-integrality, and geometry validation
+are deferred to the downstream stage that defines the selected domain. COG is
+the required raster interface and FlatGeobuf is the spatial-vector interface.
 
 ### 2. Shared vector and raster execution layers
 

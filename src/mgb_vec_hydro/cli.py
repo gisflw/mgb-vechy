@@ -33,14 +33,14 @@ _NAMED_RASTER = click.Tuple(
 @main.command("prepare")
 @click.option(
     "--catchments",
-    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    type=click.Path(exists=True, path_type=Path),
     required=True,
 )
 @click.option("--catchments-layer")
 @click.option("--catchments-source-crs")
 @click.option(
     "--segments",
-    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    type=click.Path(exists=True, path_type=Path),
     required=True,
 )
 @click.option("--segments-layer")
@@ -78,7 +78,6 @@ _NAMED_RASTER = click.Tuple(
 )
 @click.option("--d8", type=click.Path(exists=True, dir_okay=False, path_type=Path))
 @click.option("--d8-encoding", type=click.Choice(["canonical", "esri"]))
-@click.option("--repair-invalid-geometries", is_flag=True)
 @click.option(
     "--vector-batch-size",
     type=click.IntRange(min=1),
@@ -113,12 +112,11 @@ def prepare_command(
     categorical_raster: tuple[tuple[str, Path], ...],
     d8: Path | None,
     d8_encoding: str | None,
-    repair_invalid_geometries: bool,
     vector_batch_size: int,
     memory_limit_mb: int,
     output_dir: Path,
 ) -> None:
-    """Prepare canonical vector, raster, lookup, and manifest inputs."""
+    """Stage filtered vectors and canonical raster inputs."""
     rasters = tuple(
         [NamedRaster(name, path, "continuous") for name, path in continuous_raster]
         + [NamedRaster(name, path, "categorical") for name, path in categorical_raster]
@@ -141,7 +139,6 @@ def prepare_command(
                 rasters=rasters,
                 d8=d8,
                 d8_encoding=d8_encoding,
-                repair_invalid_geometries=repair_invalid_geometries,
                 vector_batch_size=vector_batch_size,
                 memory_limit_mb=memory_limit_mb,
                 output_dir=output_dir,
@@ -150,14 +147,12 @@ def prepare_command(
     except MgbVecHydroError as exc:
         raise click.ClickException(str(exc)) from exc
     click.echo(f"Wrote {report.manifest}")
-    click.echo(f"Prepared {report.feature_count} shared catchment/segment IDs")
     click.echo(
-        "Dropped null IDs: "
-        f"{report.dropped_catchments} catchments, {report.dropped_segments} segments"
+        f"Prepared {report.catchment_count} catchments and {report.segment_count} segments"
     )
     click.echo(
-        "Repaired geometries: "
-        f"{report.repaired_catchments} catchments, {report.repaired_segments} segments"
+        f"Filtered {report.filtered_catchments} catchments and "
+        f"{report.filtered_segments} segments"
     )
 
 
@@ -273,7 +268,9 @@ def aggregate_command(
             lmin=lmin,
             crs=crs,
         )
-        write_vector(aggregation.catchments, paths.catchments, output_format=output_format)
+        write_vector(
+            aggregation.catchments, paths.catchments, output_format=output_format
+        )
         write_vector(aggregation.segments, paths.segments, output_format=output_format)
         write_vector(aggregation.mapping, paths.mapping, output_format=output_format)
     except MgbVecHydroError as exc:
@@ -395,13 +392,35 @@ def terrain_products_command(
 
 
 @main.command("sample-minis")
-@click.option("--catchments", type=click.Path(exists=True, dir_okay=False, path_type=Path), required=True)
-@click.option("--segments", type=click.Path(exists=True, dir_okay=False, path_type=Path), required=True)
-@click.option("--dem", type=click.Path(exists=True, dir_okay=False, path_type=Path), required=True)
-@click.option("--hand", type=click.Path(exists=True, dir_okay=False, path_type=Path), required=True)
-@click.option("--ltnd", type=click.Path(exists=True, dir_okay=False, path_type=Path), required=True)
-@click.option("--hru", type=click.Path(exists=True, dir_okay=False, path_type=Path), required=True)
-@click.option("--output-dir", type=click.Path(file_okay=False, path_type=Path), required=True)
+@click.option(
+    "--catchments",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    required=True,
+)
+@click.option(
+    "--segments",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    required=True,
+)
+@click.option(
+    "--dem", type=click.Path(exists=True, dir_okay=False, path_type=Path), required=True
+)
+@click.option(
+    "--hand",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    required=True,
+)
+@click.option(
+    "--ltnd",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    required=True,
+)
+@click.option(
+    "--hru", type=click.Path(exists=True, dir_okay=False, path_type=Path), required=True
+)
+@click.option(
+    "--output-dir", type=click.Path(file_okay=False, path_type=Path), required=True
+)
 @click.option("--crs", default=DEFAULT_CRS, show_default=True)
 def sample_minis_command(
     catchments: Path,
@@ -416,8 +435,12 @@ def sample_minis_command(
     """Sample terrain and HRU attributes onto mini-basins."""
     try:
         result = sample_minibasins(
-            read_vector(catchments), read_vector(segments),
-            dem, hand, ltnd, hru,
+            read_vector(catchments),
+            read_vector(segments),
+            dem,
+            hand,
+            ltnd,
+            hru,
             crs=crs,
         )
         output_dir.mkdir(parents=True, exist_ok=True)

@@ -30,9 +30,11 @@ mgb-vec-hydro prepare \
   --output-dir prepared
 ```
 
-This publishes a versioned manifest, normalized and indexed FlatGeobuf vectors,
-aligned COG rasters, and a typed feature lookup. See
-[docs/prepared_data.md](docs/prepared_data.md) for the complete contract.
+This publishes a minimal versioned manifest, Strahler-filtered FlatGeobuf
+vectors, and aligned COG rasters. Segments with null, non-finite, or less-than-one
+Strahler values and their corresponding catchments are omitted. See
+[docs/stage0_prepare_data.md](docs/stage0_prepare_data.md) for the complete
+staging contract.
 
 The commands below retain their current interfaces until their corresponding
 larger-than-memory work areas are implemented; they do not act as fallbacks for
