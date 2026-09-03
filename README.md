@@ -1,154 +1,123 @@
 # MGB-Vec-Hydro
 
-MGB-Vec-Hydro is a standalone Python library and command-line interface for preparing vector hydrography inputs for MGB workflows. The project is extracting the computational parts of the legacy BHO2MGB plugin into a reusable package that works from explicit network topology columns instead of QGIS APIs.
+MGB-Vec-Hydro is a standalone Python library and command-line interface for
+preparing vector hydrography inputs for MGB workflows. It works with generic
+vector networks that expose explicit segment and downstream topology columns;
+BHO is supported as the initial regression dataset rather than as a fixed
+schema.
 
-The implemented workflow covers ROI definition, mini-basin aggregation,
-terrain products aligned with the normalized ROI hydrography, and
-mini-basin attribute sampling. HRU construction is currently deferred.
+The implemented workflow prepares canonical vector and raster inputs, selects
+a region of interest, aggregates source units into mini-basins, generates HAND
+and local terrain-to-drainage products, and samples terrain and existing HRU
+classes onto mini-basins. HRU class construction and final MGB file generation
+remain planned work.
 
-## Scope
+## Installation
 
-This repository targets the Python package and CLI.
+MGB-Vec-Hydro requires Python 3.11 or newer. From a repository checkout, install
+the package into an isolated environment:
 
-BHO remains the first regression target, but the package should support any vector network with configurable segment ID and downstream ID columns. New vector outputs should use FlatGeobuf (`fgb`) or GeoPackage (`gpkg`); Shapefile is not part of the forward-looking format direction.
+```bash
+python -m pip install -e .
+```
 
-## Current CLI
+## Commands
 
-Prepare canonical inputs for the larger-than-memory workflow:
+### Prepare canonical inputs
+
+Convert raw sources into filtered, indexed FlatGeobuf vectors and aligned COG
+rasters on one authoritative grid:
 
 ```bash
 mgb-vec-hydro prepare \
-  --catchments path/to/catchments.gpkg \
-  --segments path/to/segments.gpkg \
-  --dem path/to/dem.tif \
+  --catchments data/catchments.gpkg \
+  --segments data/segments.gpkg \
+  --dem data/dem.tif \
   --id-col id \
   --id-down-col id_down \
   --strahler-order-col strahler_order \
   --crs EPSG:6933 \
   --resolution 30 \
-  --categorical-raster hru path/to/hru.tif \
+  --categorical-raster hru data/hru.tif \
   --output-dir prepared
 ```
 
-This publishes a minimal versioned manifest, Strahler-filtered FlatGeobuf
-vectors, and aligned COG rasters. Segments with null, non-finite, or less-than-one
-Strahler values and their corresponding catchments are omitted. See
-[docs/stage0_prepare_data.md](docs/stage0_prepare_data.md) for the complete
-staging contract.
+### Define a region of interest
 
-The internal shared execution layer now provides bounded local-process
-execution, resumable coordinator checkpoints, atomic output publication,
-spatially indexed vector batches, canonical raster-window planning, cached COG
-reads, and exclusive raster assembly. It is intentionally not a CLI or
-package-root API yet. See
-[docs/shared_execution.md](docs/shared_execution.md) for its contracts.
-
-The commands below retain their current interfaces until their corresponding
-larger-than-memory work areas are implemented; they do not act as fallbacks for
-the prepared-data path.
-
-Define an ROI:
+Select all catchments and segments upstream of one or more outlets:
 
 ```bash
 mgb-vec-hydro define-roi \
-  --catchments path/to/catchments.gpkg \
-  --segments path/to/segments.gpkg \
+  --catchments prepared/vectors/catchments.fgb \
+  --segments prepared/vectors/segments.fgb \
   --outlet-id 123 \
   --id-col id \
   --id-down-col id_down \
-  --crs ESRI:102033 \
-  --output-dir output \
+  --strahler-order-col strahler_order \
+  --crs EPSG:6933 \
+  --output-dir output/roi \
   --output-format fgb
 ```
 
-This command writes:
+### Aggregate mini-basins
 
-- `roi_catchments.<ext>`
-- `roi_segments.<ext>`
-
-See [docs/stage1_roi_cli.md](docs/stage1_roi_cli.md) for Stage 1 CLI details.
-
-Aggregate the ROI into mini-basins:
+Aggregate the normalized ROI using upstream-area and minimum-length thresholds:
 
 ```bash
 mgb-vec-hydro aggregate \
-  --roi-catchments output/roi_catchments.fgb \
-  --roi-segments output/roi_segments.fgb \
+  --roi-catchments output/roi/roi_catchments.fgb \
+  --roi-segments output/roi/roi_segments.fgb \
   --uparea-min 30 \
   --lmin 6 \
   --crs EPSG:6933 \
-  --output-dir output \
+  --output-dir output/minis \
   --output-format fgb
 ```
 
-This command writes:
+### Generate terrain products
 
-- `mini_catchments.<ext>`
-- `mini_segments.<ext>`
-- `bho2mini.<ext>`
-
-See [docs/stage2_aggregation_cli.md](docs/stage2_aggregation_cli.md) for aggregation CLI details.
-
-Generate terrain-driven basin products with targeted shallow breaching:
+Create catchment-confined HAND and local terrain-to-drainage rasters. Add
+`--write-flow-direction` to retain the computed D8 raster.
 
 ```bash
 mgb-vec-hydro terrain-products \
-  --dem path/to/dem.tif \
-  --roi-catchments output/roi_catchments.fgb \
-  --roi-segments output/roi_segments.fgb \
+  --dem prepared/rasters/dem.tif \
+  --roi-catchments output/roi/roi_catchments.fgb \
+  --roi-segments output/roi/roi_segments.fgb \
   --crs EPSG:6933 \
   --buffer-cells 1 \
-  --output-dir output \
-  --write-flow-direction
+  --output-dir output/terrain
 ```
 
-This writes aligned, ROI-cropped `hand.tif` and `ltnd.tif`, and optionally
-`flow_direction.tif`.
+### Sample mini-basin attributes
 
-The routing DEM is catchment-confined AGREE-conditioned by default. Use
-`--agree-sharp`, `--agree-smooth`, and `--agree-buffer` to tune its 80/8/4
-stream-incision profile; the buffer is measured in raster pixels. HAND
-elevations continue to come from the unmodified DEM.
-
-See [docs/stage3_terrain_cli.md](docs/stage3_terrain_cli.md) for input
-requirements, output details, and routing behavior.
-
-Sample terrain and existing HRU classes onto mini-basins:
+Sample DEM, HAND, local terrain-to-drainage distance, and an existing
+categorical HRU raster into a geometry-free CSV:
 
 ```bash
 mgb-vec-hydro sample-minis \
-  --catchments output/mini_catchments.fgb \
-  --segments output/mini_segments.fgb \
-  --dem path/to/dem.tif \
-  --hand output/hand.tif \
-  --ltnd output/ltnd.tif \
-  --hru path/to/hru.tif \
+  --catchments output/minis/mini_catchments.fgb \
+  --segments output/minis/mini_segments.fgb \
+  --dem prepared/rasters/dem.tif \
+  --hand output/terrain/hand.tif \
+  --ltnd output/terrain/ltnd.tif \
+  --hru prepared/rasters/hru.tif \
   --crs EPSG:6933 \
   --output-dir output/sampled
 ```
 
-This writes only `sampled_minis.csv`. HRU IDs are inferred from integer raster
-values in the inclusive domain `1..100`.
+Use `mgb-vec-hydro COMMAND --help` for the complete option list.
 
-See [docs/stage5_mini_sampling_cli.md](docs/stage5_mini_sampling_cli.md) for
-input validation, sampled fields, and output details.
+## Documentation
 
-## Development
+- [Prepare-data contract](docs/stage0_prepare_data.md)
+- [ROI CLI and normalized schema](docs/stage1_roi_cli.md)
+- [Mini-basin aggregation CLI](docs/stage2_aggregation_cli.md)
+- [Terrain-products CLI](docs/stage3_terrain_cli.md)
+- [Mini-basin sampling CLI](docs/stage5_mini_sampling_cli.md)
+- [Remaining workflow plans](docs/plan/README.md)
+- [Larger-than-memory processing change](docs/changes/larger-than-memory-processing.md)
 
-Use an isolated Python environment for local work. Installation packaging for end users is intentionally deferred while the library API and workflow stabilize.
-
-```bash
-python -m pip install -e ".[test]"
-pytest
-```
-
-## Roadmap
-
-The refactor goal is documented in
-[docs/refactor_goal.md](docs/refactor_goal.md). ROI definition, mini-basin
-aggregation, terrain-product generation, and mini-basin sampling are
-implemented. The remaining planned work is:
-
-1. Build improved HRU classes from terrain and land-cover rasters.
-2. Generate MGB output files such as `MINI.gtp`, `COTA_AREA.flp`, and vector
-   mini-basin products.
+Internal shared execution contracts are documented in
+[docs/shared_execution.md](docs/shared_execution.md). Contributor and coding
+guidance lives in [AGENTS.md](AGENTS.md).

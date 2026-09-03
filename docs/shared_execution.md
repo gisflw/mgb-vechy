@@ -1,10 +1,10 @@
 # Shared vector and raster execution
 
-Work area 2 provides internal infrastructure for the larger-than-memory stages.
-It does not change the current CLI and is not exported from the package root.
-Later stages import the contracts from `mgb_vec_hydro.execution.executor`,
-`mgb_vec_hydro.execution.checkpoints`, `mgb_vec_hydro.execution.vector`,
-`mgb_vec_hydro.execution.raster`, and
+The shared execution layer provides internal infrastructure for bounded vector
+and raster processing. It is not a CLI and is not exported from the package
+root. Processing stages import the contracts from
+`mgb_vec_hydro.execution.executor`, `mgb_vec_hydro.execution.checkpoints`,
+`mgb_vec_hydro.execution.vector`, `mgb_vec_hydro.execution.raster`, and
 `mgb_vec_hydro.execution.publication`.
 
 ## Local execution
