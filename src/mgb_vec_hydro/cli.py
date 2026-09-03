@@ -5,7 +5,7 @@ from pathlib import Path
 import click
 
 from mgb_vec_hydro.aggregation import aggregate_minibasins
-from mgb_vec_hydro.crs_utils import DEFAULT_CRS, transform_vector
+from mgb_vec_hydro.crs_utils import DEFAULT_CRS
 from mgb_vec_hydro.exceptions import MgbVecHydroError
 from mgb_vec_hydro.io import (
     aggregation_output_paths,
@@ -13,15 +13,152 @@ from mgb_vec_hydro.io import (
     read_vector,
     write_vector,
 )
+from mgb_vec_hydro.preparation import NamedRaster, PreparationSpec, prepare_dataset
 from mgb_vec_hydro.roi import DEFAULT_STRAHLER_ORDER_COL, define_roi
-from mgb_vec_hydro.topology import resolve_column_name
-from mgb_vec_hydro.terrain import create_terrain_products
 from mgb_vec_hydro.sampling import sample_minibasins
+from mgb_vec_hydro.terrain import create_terrain_products
+from mgb_vec_hydro.topology import resolve_column_name
 
 
 @click.group()
 def main() -> None:
     """MGB vector hydrography preprocessing tools."""
+
+
+_NAMED_RASTER = click.Tuple(
+    [click.STRING, click.Path(exists=True, dir_okay=False, path_type=Path)]
+)
+
+
+@main.command("prepare")
+@click.option(
+    "--catchments",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    required=True,
+)
+@click.option("--catchments-layer")
+@click.option("--catchments-source-crs")
+@click.option(
+    "--segments",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    required=True,
+)
+@click.option("--segments-layer")
+@click.option("--segments-source-crs")
+@click.option(
+    "--dem",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    required=True,
+)
+@click.option("--id-col", default="id", show_default=True)
+@click.option("--id-down-col", default="id_down", show_default=True)
+@click.option(
+    "--strahler-order-col",
+    default=DEFAULT_STRAHLER_ORDER_COL,
+    show_default=True,
+)
+@click.option("--crs", required=True, help="Canonical projected CRS with metre units.")
+@click.option(
+    "--resolution",
+    type=click.FloatRange(min=0, min_open=True),
+    required=True,
+    help="Canonical square-cell resolution in metres.",
+)
+@click.option(
+    "--continuous-raster",
+    type=_NAMED_RASTER,
+    multiple=True,
+    metavar="NAME PATH",
+)
+@click.option(
+    "--categorical-raster",
+    type=_NAMED_RASTER,
+    multiple=True,
+    metavar="NAME PATH",
+)
+@click.option("--d8", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.option("--d8-encoding", type=click.Choice(["canonical", "esri"]))
+@click.option("--repair-invalid-geometries", is_flag=True)
+@click.option(
+    "--vector-batch-size",
+    type=click.IntRange(min=1),
+    default=10_000,
+    show_default=True,
+)
+@click.option(
+    "--memory-limit-mb",
+    type=click.IntRange(min=1),
+    default=512,
+    show_default=True,
+)
+@click.option(
+    "--output-dir",
+    type=click.Path(file_okay=False, path_type=Path),
+    required=True,
+)
+def prepare_command(
+    catchments: Path,
+    catchments_layer: str | None,
+    catchments_source_crs: str | None,
+    segments: Path,
+    segments_layer: str | None,
+    segments_source_crs: str | None,
+    dem: Path,
+    id_col: str,
+    id_down_col: str,
+    strahler_order_col: str,
+    crs: str,
+    resolution: float,
+    continuous_raster: tuple[tuple[str, Path], ...],
+    categorical_raster: tuple[tuple[str, Path], ...],
+    d8: Path | None,
+    d8_encoding: str | None,
+    repair_invalid_geometries: bool,
+    vector_batch_size: int,
+    memory_limit_mb: int,
+    output_dir: Path,
+) -> None:
+    """Prepare canonical vector, raster, lookup, and manifest inputs."""
+    rasters = tuple(
+        [NamedRaster(name, path, "continuous") for name, path in continuous_raster]
+        + [NamedRaster(name, path, "categorical") for name, path in categorical_raster]
+    )
+    try:
+        report = prepare_dataset(
+            PreparationSpec(
+                catchments=catchments,
+                catchments_layer=catchments_layer,
+                catchments_source_crs=catchments_source_crs,
+                segments=segments,
+                segments_layer=segments_layer,
+                segments_source_crs=segments_source_crs,
+                dem=dem,
+                id_col=id_col,
+                id_down_col=id_down_col,
+                strahler_order_col=strahler_order_col,
+                crs=crs,
+                resolution=resolution,
+                rasters=rasters,
+                d8=d8,
+                d8_encoding=d8_encoding,
+                repair_invalid_geometries=repair_invalid_geometries,
+                vector_batch_size=vector_batch_size,
+                memory_limit_mb=memory_limit_mb,
+                output_dir=output_dir,
+            )
+        )
+    except MgbVecHydroError as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(f"Wrote {report.manifest}")
+    click.echo(f"Prepared {report.feature_count} shared catchment/segment IDs")
+    click.echo(
+        "Dropped null IDs: "
+        f"{report.dropped_catchments} catchments, {report.dropped_segments} segments"
+    )
+    click.echo(
+        "Repaired geometries: "
+        f"{report.repaired_catchments} catchments, {report.repaired_segments} segments"
+    )
 
 
 @main.command("define-roi")

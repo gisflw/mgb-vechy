@@ -2,7 +2,8 @@ import geopandas as gpd
 import pytest
 from shapely.geometry import LineString, Polygon
 
-from mgb_vec_hydro.exceptions import MissingColumnsError, MissingCrsError
+from mgb_vec_hydro.crs_utils import CrsError
+from mgb_vec_hydro.exceptions import MissingColumnsError
 from mgb_vec_hydro.roi import define_roi
 
 
@@ -63,7 +64,7 @@ def test_define_roi_returns_union_of_upstream_segments_and_catchments():
         _catchments_gdf(),
         _segments_gdf(),
         outlet_ids=[2, 4],
-        destine_crs="EPSG:3857",
+        crs="EPSG:3857",
     )
 
     assert set(roi.segments["id"]) == {2, 3, 4, 5}
@@ -75,7 +76,7 @@ def test_define_roi_outputs_normalized_columns_with_strahler_order():
         _catchments_gdf(),
         _segments_gdf(),
         outlet_ids=[2, 4],
-        destine_crs="EPSG:3857",
+        crs="EPSG:3857",
     )
 
     assert list(roi.segments.columns) == EXPECTED_COLUMNS
@@ -108,7 +109,7 @@ def test_define_roi_assigns_sub_from_downstream_to_upstream_order():
         _catchments_gdf(),
         _segments_gdf(),
         outlet_ids=[1, 2],
-        destine_crs="EPSG:3857",
+        crs="EPSG:3857",
     )
 
     segment_sub = dict(zip(roi.segments["id"], roi.segments["sub"]))
@@ -158,7 +159,7 @@ def test_define_roi_supports_custom_input_column_names_with_normalized_output():
         catchments,
         segments,
         outlet_ids=[20],
-        destine_crs="EPSG:3857",
+        crs="EPSG:3857",
         id_col="cotrecho",
         id_down_col="nutrjus",
         strahler_order_col="stream_order",
@@ -206,7 +207,7 @@ def test_define_roi_resolves_input_columns_case_insensitively():
         catchments,
         segments,
         outlet_ids=[20],
-        destine_crs="EPSG:3857",
+        crs="EPSG:3857",
         id_col="linkno",
         id_down_col="dslinkno",
     )
@@ -223,14 +224,14 @@ def test_define_roi_requires_shared_id_column_on_catchments():
     catchments = _catchments_gdf().rename(columns={"id": "area_id"})
 
     with pytest.raises(MissingColumnsError, match="id"):
-        define_roi(catchments, _segments_gdf(), outlet_ids=[2], destine_crs="EPSG:3857")
+        define_roi(catchments, _segments_gdf(), outlet_ids=[2], crs="EPSG:3857")
 
 
 def test_define_roi_requires_strahler_order_column_on_segments():
     segments = _segments_gdf().drop(columns=["strahler_order"])
 
     with pytest.raises(MissingColumnsError, match="strahler_order"):
-        define_roi(_catchments_gdf(), segments, outlet_ids=[2], destine_crs="EPSG:3857")
+        define_roi(_catchments_gdf(), segments, outlet_ids=[2], crs="EPSG:3857")
 
 
 def test_define_roi_computes_unit_and_upstream_metrics():
@@ -259,7 +260,7 @@ def test_define_roi_computes_unit_and_upstream_metrics():
         crs="EPSG:3857",
     )
 
-    roi = define_roi(catchments, segments, outlet_ids=[1], destine_crs="EPSG:3857")
+    roi = define_roi(catchments, segments, outlet_ids=[1], crs="EPSG:3857")
 
     assert list(roi.segments["unit_length"]) == [1.0, 2.0, 3.0]
     assert list(roi.catchments["unit_length"]) == [1.0, 2.0, 3.0]
@@ -299,7 +300,7 @@ def test_define_roi_assigns_water_course_through_dominant_upstream_branch():
         crs="EPSG:3857",
     )
 
-    roi = define_roi(catchments, segments, outlet_ids=[1], destine_crs="EPSG:3857")
+    roi = define_roi(catchments, segments, outlet_ids=[1], crs="EPSG:3857")
 
     segment_water_course = dict(zip(roi.segments["id"], roi.segments["water_course"]))
     catchment_water_course = dict(
@@ -319,7 +320,7 @@ def test_define_roi_assigns_water_course_inside_each_sub_domain():
         _catchments_gdf(),
         _segments_gdf(),
         outlet_ids=[1, 2],
-        destine_crs="EPSG:3857",
+        crs="EPSG:3857",
     )
 
     segment_water_course = dict(zip(roi.segments["id"], roi.segments["water_course"]))
@@ -353,7 +354,7 @@ def test_define_roi_source_crs_overrides_existing_layer_crs():
         segments,
         outlet_ids=[1],
         source_crs="EPSG:3857",
-        destine_crs="EPSG:3857",
+        crs="EPSG:3857",
     )
 
     assert roi.segments.crs == "EPSG:3857"
@@ -365,5 +366,5 @@ def test_define_roi_source_crs_overrides_existing_layer_crs():
 def test_define_roi_requires_source_crs_when_layer_crs_is_missing():
     catchments = _catchments_gdf().set_crs(None, allow_override=True)
 
-    with pytest.raises(MissingCrsError, match="catchments layer has no CRS"):
-        define_roi(catchments, _segments_gdf(), outlet_ids=[2], destine_crs="EPSG:3857")
+    with pytest.raises(CrsError, match="catchments layer has no CRS"):
+        define_roi(catchments, _segments_gdf(), outlet_ids=[2], crs="EPSG:3857")

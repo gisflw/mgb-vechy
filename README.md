@@ -14,6 +14,30 @@ BHO remains the first regression target, but the package should support any vect
 
 ## Current CLI
 
+Prepare canonical inputs for the larger-than-memory workflow:
+
+```bash
+mgb-vec-hydro prepare \
+  --catchments path/to/catchments.gpkg \
+  --segments path/to/segments.gpkg \
+  --dem path/to/dem.tif \
+  --id-col id \
+  --id-down-col id_down \
+  --strahler-order-col strahler_order \
+  --crs EPSG:6933 \
+  --resolution 30 \
+  --categorical-raster hru path/to/hru.tif \
+  --output-dir prepared
+```
+
+This publishes a versioned manifest, normalized and indexed FlatGeobuf vectors,
+aligned COG rasters, and a typed feature lookup. See
+[docs/prepared_data.md](docs/prepared_data.md) for the complete contract.
+
+The commands below retain their current interfaces until their corresponding
+larger-than-memory work areas are implemented; they do not act as fallbacks for
+the prepared-data path.
+
 Define an ROI:
 
 ```bash

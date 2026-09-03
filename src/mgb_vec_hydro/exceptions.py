@@ -36,3 +36,7 @@ class TerrainProductsError(MgbVecHydroError):
 
 class MiniSamplingError(MgbVecHydroError):
     """Raised when mini-basin attributes cannot be sampled safely."""
+
+
+class PreparedDataError(MgbVecHydroError):
+    """Raised when prepared input data cannot be created or validated."""

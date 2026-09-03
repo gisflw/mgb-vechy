@@ -31,7 +31,7 @@ def test_carinhanha_roi_matches_reference_properties():
         catchments,
         segments,
         outlet_ids=OUTLET_SEGMENT_IDS,
-        destine_crs="ESRI:102033",
+        crs="ESRI:102033",
         id_col="cotrecho",
         id_down_col="nutrjus",
         strahler_order_col="nustrahler",
