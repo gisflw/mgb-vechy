@@ -1,6 +1,5 @@
 import json
 
-import geopandas as gpd
 import numpy as np
 import pandas as pd
 import pytest
@@ -15,6 +14,11 @@ from mgb_vec_hydro.exceptions import (
     WorkMemoryError,
 )
 from mgb_vec_hydro.execution.raster import RasterAssembler
+from mgb_vec_hydro.execution.vector import (
+    VectorTable,
+    read_vector_table,
+    write_vector_table,
+)
 from mgb_vec_hydro.preparation import PreparationSpec, prepare_dataset
 from mgb_vec_hydro.terrain import (
     TerrainDataset,
@@ -168,35 +172,68 @@ def _terrain_inputs(tmp_path, *, with_d8=False):
         "upstream_area": [1.0, 2.0],
         "water_course": [1, 1],
     }
-    catchments = gpd.GeoDataFrame(
+    catchments = VectorTable.from_pydict(
         values,
-        geometry=[
+        [
             Polygon([(0, 0), (30, 0), (30, 40), (0, 40)]),
             Polygon([(40, 0), (70, 0), (70, 40), (40, 40)]),
         ],
         crs="EPSG:3857",
+        geometry_type="Polygon",
     )
-    segments = gpd.GeoDataFrame(
+    segments = VectorTable.from_pydict(
         values,
-        geometry=[
+        [
             LineString([(25, 0), (25, 40)]),
             LineString([(65, 0), (65, 40)]),
         ],
         crs="EPSG:3857",
+        geometry_type="LineString",
     )
     minis = tmp_path / "minis"
     minis.mkdir()
-    catchments.to_file(minis / "mini_catchments.fgb", driver="FlatGeobuf", index=False)
-    segments.to_file(minis / "mini_segments.fgb", driver="FlatGeobuf", index=False)
+    write_vector_table(catchments, minis / "mini_catchments.fgb", driver="FlatGeobuf")
+    write_vector_table(segments, minis / "mini_segments.fgb", driver="FlatGeobuf")
     # Stage 4 must not inspect this user-facing provenance file.
     (minis / "source_to_mini.csv").write_text("deliberately,invalid\n")
     roi = tmp_path / "roi"
     (roi / "vectors").mkdir(parents=True)
-    catchments.to_file(roi / "vectors" / "roi_catchments.fgb", driver="FlatGeobuf", index=False)
-    (roi / "manifest.json").write_text(json.dumps({"crs_wkt": CRS.from_epsg(3857).to_wkt(), "assets": {"catchments": {"path": "vectors/roi_catchments.fgb"}}}))
-    (minis / "manifest.json").write_text(json.dumps({"roi": str(roi.resolve()), "crs_wkt": CRS.from_epsg(3857).to_wkt(), "assets": {"catchments": {"path": "mini_catchments.fgb"}, "segments": {"path": "mini_segments.fgb"}}}))
+    write_vector_table(
+        catchments, roi / "vectors" / "roi_catchments.fgb", driver="FlatGeobuf"
+    )
+    (roi / "manifest.json").write_text(
+        json.dumps(
+            {
+                "crs_wkt": CRS.from_epsg(3857).to_wkt(),
+                "assets": {"catchments": {"path": "vectors/roi_catchments.fgb"}},
+            }
+        )
+    )
+    (minis / "manifest.json").write_text(
+        json.dumps(
+            {
+                "contract": "mgb-aggregation-dataset",
+                "version": 2,
+                "roi": str(roi.resolve()),
+                "crs_wkt": CRS.from_epsg(3857).to_wkt(),
+                "assets": {
+                    "catchments": {"path": "mini_catchments.fgb"},
+                    "segments": {"path": "mini_segments.fgb"},
+                },
+            }
+        )
+    )
     prepared = tmp_path / "prepared"
-    prepare_dataset(PreparationSpec(dem=dem_path, minis=minis, output_dir=prepared, d8=d8_path, d8_encoding="canonical" if with_d8 else None, buffer_cells=0))
+    prepare_dataset(
+        PreparationSpec(
+            dem=dem_path,
+            minis=minis,
+            output_dir=prepared,
+            d8=d8_path,
+            d8_encoding="canonical" if with_d8 else None,
+            buffer_cells=0,
+        )
+    )
     return prepared, minis
 
 
@@ -402,14 +439,23 @@ def test_domain_and_terrain_checkpoints_resume_after_failed_publication(
 def test_prepared_domain_is_not_rebuilt_from_mutated_minis(tmp_path):
     prepared, minis = _terrain_inputs(tmp_path)
     segment_path = minis / "mini_segments.fgb"
-    segments = gpd.read_file(segment_path)
-    segments.loc[segments["id"] == "a", "geometry"] = LineString([(70, 0), (70, 40)])
+    segments = read_vector_table(segment_path)
+    attrs = segments.table.drop([segments.geometry_column]).to_pydict()
+    geometries = segments.geometries()
+    geometries[attrs["id"].index("a")] = LineString([(70, 0), (70, 40)])
     segment_path.unlink()
-    segments.to_file(segment_path, driver="FlatGeobuf", index=False)
+    write_vector_table(
+        VectorTable.from_pydict(
+            attrs, geometries, crs=segments.crs, geometry_type="LineString"
+        ),
+        segment_path,
+        driver="FlatGeobuf",
+    )
     output = tmp_path / "terrain"
 
     create_terrain_dataset(TerrainSpec(prepared=prepared, output_dir=output, workers=1))
     assert output.exists()
+
 
 def test_longer_valley_route_wins_over_short_ridge_breach():
     elevation = np.array(

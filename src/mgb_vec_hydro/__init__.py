@@ -18,6 +18,7 @@ from mgb_vec_hydro.terrain import (
     compute_ltnd,
     create_terrain_dataset,
 )
+from mgb_vec_hydro.execution.vector import VectorTable
 
 __version__ = "0.1.0"
 
@@ -33,6 +34,7 @@ __all__ = [
     "TerrainDataset",
     "TerrainReport",
     "TerrainSpec",
+    "VectorTable",
     "compute_flow_directions",
     "compute_hand",
     "compute_ltnd",

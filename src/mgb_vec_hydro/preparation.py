@@ -16,16 +16,19 @@ from typing import Any, Literal
 
 import numpy as np
 import rasterio
-import geopandas as gpd
 import pandas as pd
+import pyarrow as pa
+import pyogrio
 from pyproj import CRS
 from rasterio.enums import Resampling
 from rasterio.shutil import copy as copy_raster
 from rasterio.transform import Affine
 from rasterio.features import rasterize
 from rasterio.windows import from_bounds, Window
+import shapely
 
 from mgb_vec_hydro.exceptions import PreparedDataError
+from mgb_vec_hydro.execution.vector import geometry_column_name, read_vector_table
 
 CONTRACT = "mgb-prepared-dataset"
 CONTRACT_VERSION = 4
@@ -172,7 +175,9 @@ class PreparedDataset:
         for name, asset in rasters.items():
             path = self._validate_asset(asset)
             if asset.get("driver") != "COG":
-                raise PreparedDataError(f"Prepared raster {name} is not declared as COG")
+                raise PreparedDataError(
+                    f"Prepared raster {name} is not declared as COG"
+                )
             try:
                 with rasterio.open(path) as source:
                     if (
@@ -189,17 +194,27 @@ class PreparedDataset:
                             f"Prepared raster {name} does not match the canonical grid/COG contract"
                         )
             except rasterio.errors.RasterioError as exc:
-                raise PreparedDataError(f"Cannot inspect prepared raster: {name}") from exc
+                raise PreparedDataError(
+                    f"Cannot inspect prepared raster: {name}"
+                ) from exc
         for name in ("mini_ownership", "drainage"):
             asset = assets[name]
             path = self._validate_asset(asset)
             with rasterio.open(path) as source:
                 expected_dtype = "int32" if name == "mini_ownership" else "uint8"
-                if (source.count != 1 or source.crs is None or CRS.from_user_input(source.crs) != crs
-                    or source.transform != transform or source.shape != (int(grid["height"]), int(grid["width"]))
-                    or source.nodata is not None or source.dtypes[0] != expected_dtype
-                    or source.tags(ns="IMAGE_STRUCTURE").get("LAYOUT") != "COG"):
-                    raise PreparedDataError(f"Prepared raster {name} does not match the canonical grid")
+                if (
+                    source.count != 1
+                    or source.crs is None
+                    or CRS.from_user_input(source.crs) != crs
+                    or source.transform != transform
+                    or source.shape != (int(grid["height"]), int(grid["width"]))
+                    or source.nodata is not None
+                    or source.dtypes[0] != expected_dtype
+                    or source.tags(ns="IMAGE_STRUCTURE").get("LAYOUT") != "COG"
+                ):
+                    raise PreparedDataError(
+                        f"Prepared raster {name} does not match the canonical grid"
+                    )
         index = self._validate_asset(assets["mini_index"])
         if index.suffix != ".parquet":
             raise PreparedDataError("Prepared mini index must be Parquet")
@@ -216,11 +231,20 @@ class PreparedDataset:
 def _aggregation_inputs(root: Path) -> tuple[Path, Path, Path, CRS]:
     try:
         manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
+        if (
+            manifest.get("contract") != "mgb-aggregation-dataset"
+            or manifest.get("version") != 2
+        ):
+            raise PreparedDataError(
+                "Unsupported aggregation dataset contract or version"
+            )
         roi = Path(manifest["roi"])
         crs = CRS.from_wkt(manifest["crs_wkt"])
         assets = manifest["assets"]
         catchments = root / assets["catchments"]["path"]
         segments = root / assets["segments"]["path"]
+    except PreparedDataError:
+        raise
     except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
         raise PreparedDataError("Cannot read aggregation manifest") from exc
     if not roi.is_dir() or not catchments.is_file() or not segments.is_file():
@@ -240,24 +264,46 @@ def prepare_dataset(spec: PreparationSpec) -> PreparationReport:
     try:
         (staging / "rasters").mkdir()
         phase_started = time.perf_counter()
-        roi_root, mini_catchments, mini_segments, target_crs = _aggregation_inputs(Path(spec.minis))
-        roi_manifest = json.loads((roi_root / "manifest.json").read_text(encoding="utf-8"))
+        roi_root, mini_catchments, mini_segments, target_crs = _aggregation_inputs(
+            Path(spec.minis)
+        )
+        roi_manifest = json.loads(
+            (roi_root / "manifest.json").read_text(encoding="utf-8")
+        )
         if CRS.from_wkt(roi_manifest["crs_wkt"]) != target_crs:
             raise PreparedDataError("Aggregation and ROI CRS do not match")
         roi_catchments = roi_root / roi_manifest["assets"]["catchments"]["path"]
         with rasterio.open(spec.dem) as dem:
             _require_source_grid(dem, target_crs, "DEM")
-            domain = gpd.read_file(roi_catchments).geometry.union_all()
+            domain = _union_vector_geometries(roi_catchments)
             if domain.is_empty:
                 raise PreparedDataError("ROI domain is empty")
             buffered_domain = domain.buffer(spec.buffer_cells * abs(dem.transform.a))
-            window = from_bounds(*buffered_domain.bounds, transform=dem.transform).round_offsets().round_lengths()
-            if (window.col_off < 0 or window.row_off < 0
+            window = (
+                from_bounds(*buffered_domain.bounds, transform=dem.transform)
+                .round_offsets()
+                .round_lengths()
+            )
+            if (
+                window.col_off < 0
+                or window.row_off < 0
                 or window.col_off + window.width > dem.width
-                or window.row_off + window.height > dem.height):
+                or window.row_off + window.height > dem.height
+            ):
                 raise PreparedDataError("DEM does not cover the buffered ROI domain")
-            grid = GridSpec(target_crs, rasterio.windows.transform(window, dem.transform), int(window.width), int(window.height))
-            mask = rasterize([(buffered_domain, 1)], out_shape=(grid.height, grid.width), transform=grid.transform, fill=0, dtype="uint8").astype(bool)
+            grid = GridSpec(
+                target_crs,
+                rasterio.windows.transform(window, dem.transform),
+                int(window.width),
+                int(window.height),
+            )
+            mask = rasterize(
+                [(buffered_domain, 1)],
+                out_shape=(grid.height, grid.width),
+                transform=grid.transform,
+                fill=0,
+                dtype="uint8",
+            ).astype(bool)
         grid_domain_seconds = time.perf_counter() - phase_started
 
         phase_started = time.perf_counter()
@@ -271,14 +317,18 @@ def prepare_dataset(spec: PreparationSpec) -> PreparationReport:
             raster_assets[item.name] = _raster_asset(target, staging, item.kind)
         if spec.d8 is not None:
             target = staging / "rasters" / "d8.tif"
-            _prepare_clipped_d8(spec.d8, target, grid, window, mask, spec.d8_encoding or "canonical")
+            _prepare_clipped_d8(
+                spec.d8, target, grid, window, mask, spec.d8_encoding or "canonical"
+            )
             raster_assets["d8"] = _raster_asset(
                 target, staging, "d8", encoding="canonical-clockwise"
             )
         raster_preparation_seconds = time.perf_counter() - phase_started
 
         phase_started = time.perf_counter()
-        domain_assets, mini_index = _prepare_domain_rasters(staging, grid, mini_catchments, mini_segments)
+        domain_assets, mini_index = _prepare_domain_rasters(
+            staging, grid, mini_catchments, mini_segments
+        )
         domain_rasterization_seconds = time.perf_counter() - phase_started
         phase_started = time.perf_counter()
         manifest = {
@@ -286,9 +336,18 @@ def prepare_dataset(spec: PreparationSpec) -> PreparationReport:
             "version": CONTRACT_VERSION,
             "producer": _producer_version(),
             "grid": grid.to_manifest(),
-            "inputs": {"minis": str(Path(spec.minis).resolve()), "roi": str(roi_root.resolve())},
+            "inputs": {
+                "minis": str(Path(spec.minis).resolve()),
+                "roi": str(roi_root.resolve()),
+            },
             "sources": {"rasters": _raster_sources(spec)},
-            "assets": {"rasters": raster_assets, **domain_assets, "mini_index": _file_asset(mini_index, staging, role="dense mini-label index")},
+            "assets": {
+                "rasters": raster_assets,
+                **domain_assets,
+                "mini_index": _file_asset(
+                    mini_index, staging, role="dense mini-label index"
+                ),
+            },
         }
         manifest_path = staging / "manifest.json"
         manifest_path.write_text(
@@ -351,7 +410,9 @@ def _validate_spec(spec: PreparationSpec) -> None:
         raise PreparedDataError(f"D8 input is not a local file: {spec.d8}")
 
 
-def _require_source_grid(source, crs: CRS, name: str, grid: GridSpec | None = None) -> None:
+def _require_source_grid(
+    source, crs: CRS, name: str, grid: GridSpec | None = None
+) -> None:
     if source.count != 1 or source.crs is None:
         raise PreparedDataError(f"{name} must be single-band and declare a CRS")
     if CRS.from_user_input(source.crs) != crs:
@@ -360,25 +421,49 @@ def _require_source_grid(source, crs: CRS, name: str, grid: GridSpec | None = No
     if transform.b != 0 or transform.d != 0 or transform.a <= 0 or transform.e >= 0:
         raise PreparedDataError(f"{name} must use a north-up raster grid")
     if grid is not None:
-        if not (math.isclose(transform.a, grid.transform.a) and math.isclose(transform.e, grid.transform.e)):
+        if not (
+            math.isclose(transform.a, grid.transform.a)
+            and math.isclose(transform.e, grid.transform.e)
+        ):
             raise PreparedDataError(f"{name} resolution does not match the DEM grid")
         col = (grid.transform.c - transform.c) / transform.a
         row = (grid.transform.f - transform.f) / transform.e
-        if not (math.isclose(col, round(col), abs_tol=1e-7) and math.isclose(row, round(row), abs_tol=1e-7)):
+        if not (
+            math.isclose(col, round(col), abs_tol=1e-7)
+            and math.isclose(row, round(row), abs_tol=1e-7)
+        ):
             raise PreparedDataError(f"{name} origin is not aligned to the DEM grid")
-        if (grid.bounds[0] < source.bounds.left - 1e-7 or grid.bounds[1] < source.bounds.bottom - 1e-7
-            or grid.bounds[2] > source.bounds.right + 1e-7 or grid.bounds[3] > source.bounds.top + 1e-7):
+        if (
+            grid.bounds[0] < source.bounds.left - 1e-7
+            or grid.bounds[1] < source.bounds.bottom - 1e-7
+            or grid.bounds[2] > source.bounds.right + 1e-7
+            or grid.bounds[3] > source.bounds.top + 1e-7
+        ):
             raise PreparedDataError(f"{name} does not cover the buffered ROI domain")
 
 
-def _prepare_clipped_raster(source: Path, output: Path, grid: GridSpec, window: Window, domain_mask: np.ndarray, kind: Literal["continuous", "categorical"]) -> None:
+def _prepare_clipped_raster(
+    source: Path,
+    output: Path,
+    grid: GridSpec,
+    window: Window,
+    domain_mask: np.ndarray,
+    kind: Literal["continuous", "categorical"],
+) -> None:
     dtype = "float32" if kind == "continuous" else "int32"
     resampling = Resampling.bilinear if kind == "continuous" else Resampling.nearest
     intermediate = output.with_suffix(".working.tif")
     try:
-        with rasterio.open(source) as src, _working_raster(intermediate, grid, dtype) as dst:
+        with (
+            rasterio.open(source) as src,
+            _working_raster(intermediate, grid, dtype) as dst,
+        ):
             _require_source_grid(src, grid.crs, str(source), grid)
-            source_window = from_bounds(*grid.bounds, transform=src.transform).round_offsets().round_lengths()
+            source_window = (
+                from_bounds(*grid.bounds, transform=src.transform)
+                .round_offsets()
+                .round_lengths()
+            )
             values = src.read(1, window=source_window, masked=True)
             valid = ~np.ma.getmaskarray(values) & domain_mask
             raw = values.filled(0)
@@ -387,8 +472,13 @@ def _prepare_clipped_raster(source: Path, output: Path, grid: GridSpec, window: 
                 data = np.where(valid, raw, 0).astype(dtype)
             else:
                 source_values = raw[valid]
-                if source_values.size and (not np.all(np.isfinite(source_values)) or not np.all(source_values == np.floor(source_values))):
-                    raise PreparedDataError(f"Categorical raster {source} contains non-integral values")
+                if source_values.size and (
+                    not np.all(np.isfinite(source_values))
+                    or not np.all(source_values == np.floor(source_values))
+                ):
+                    raise PreparedDataError(
+                        f"Categorical raster {source} contains non-integral values"
+                    )
                 data = raw.astype(dtype)
             dst.write(data, 1)
             dst.write_mask(valid.astype("uint8") * 255)
@@ -397,21 +487,44 @@ def _prepare_clipped_raster(source: Path, output: Path, grid: GridSpec, window: 
         intermediate.unlink(missing_ok=True)
 
 
-def _prepare_clipped_d8(source: Path, output: Path, grid: GridSpec, window: Window, domain_mask: np.ndarray, encoding: str) -> None:
+def _prepare_clipped_d8(
+    source: Path,
+    output: Path,
+    grid: GridSpec,
+    window: Window,
+    domain_mask: np.ndarray,
+    encoding: str,
+) -> None:
     intermediate = output.with_suffix(".working.tif")
     esri = {0: 0, 1: 3, 2: 4, 4: 5, 8: 6, 16: 7, 32: 8, 64: 1, 128: 2}
     try:
-        with rasterio.open(source) as src, _working_raster(intermediate, grid, "uint8") as dst:
+        with (
+            rasterio.open(source) as src,
+            _working_raster(intermediate, grid, "uint8") as dst,
+        ):
             _require_source_grid(src, grid.crs, "D8", grid)
-            source_window = from_bounds(*grid.bounds, transform=src.transform).round_offsets().round_lengths()
+            source_window = (
+                from_bounds(*grid.bounds, transform=src.transform)
+                .round_offsets()
+                .round_lengths()
+            )
             values = src.read(1, window=source_window, masked=True)
             valid = ~np.ma.getmaskarray(values) & domain_mask
             raw = values.filled(0)
             allowed = set(range(9)) if encoding == "canonical" else set(esri)
             unknown = set(np.unique(raw[valid]).tolist()) - allowed
             if unknown:
-                raise PreparedDataError("D8 raster contains invalid code(s): " + ", ".join(map(str, sorted(unknown))))
-            data = raw.astype("uint8") if encoding == "canonical" else np.vectorize(lambda value: esri.get(value, 0), otypes=["uint8"])(raw)
+                raise PreparedDataError(
+                    "D8 raster contains invalid code(s): "
+                    + ", ".join(map(str, sorted(unknown)))
+                )
+            data = (
+                raw.astype("uint8")
+                if encoding == "canonical"
+                else np.vectorize(lambda value: esri.get(value, 0), otypes=["uint8"])(
+                    raw
+                )
+            )
             dst.write(data, 1)
             dst.write_mask(valid.astype("uint8") * 255)
         _to_cog(intermediate, output, Resampling.nearest)
@@ -419,39 +532,136 @@ def _prepare_clipped_d8(source: Path, output: Path, grid: GridSpec, window: Wind
         intermediate.unlink(missing_ok=True)
 
 
-def _prepare_domain_rasters(staging: Path, grid: GridSpec, catchment_path: Path, segment_path: Path) -> tuple[dict[str, dict[str, Any]], Path]:
+def _prepare_domain_rasters(
+    staging: Path, grid: GridSpec, catchment_path: Path, segment_path: Path
+) -> tuple[dict[str, dict[str, Any]], Path]:
     """Rasterize complete aggregated minis before terrain processing."""
-    from mgb_vec_hydro.execution.raster import RasterAssembler, RasterPatch, RasterProductSpec
-    catchments = gpd.read_file(catchment_path).set_index("id")
-    segments = gpd.read_file(segment_path).set_index("id")
-    if set(catchments.index) != set(segments.index):
+    from mgb_vec_hydro.execution.raster import (
+        RasterAssembler,
+        RasterPatch,
+        RasterProductSpec,
+    )
+
+    catchment_vector = read_vector_table(catchment_path)
+    segment_vector = read_vector_table(segment_path)
+    catchment_ids = catchment_vector.table["id"].to_pylist()
+    segment_ids = segment_vector.table["id"].to_pylist()
+    catchments = dict(zip(catchment_ids, catchment_vector.geometries(), strict=True))
+    segments = dict(zip(segment_ids, segment_vector.geometries(), strict=True))
+    if set(catchments) != set(segments):
         raise PreparedDataError("Mini catchments and segments do not have matching IDs")
-    ordered = sorted(catchments.index, key=lambda value: (type(value).__name__, str(value)))
+    ordered = sorted(catchments, key=lambda value: (type(value).__name__, str(value)))
     labels = {mini_id: label for label, mini_id in enumerate(ordered, start=1)}
     raster_root = staging / "rasters"
-    with RasterAssembler(raster_root, grid, (RasterProductSpec("mini_ownership", "int32"), RasterProductSpec("drainage", "uint8"))) as assembler:
+    with RasterAssembler(
+        raster_root,
+        grid,
+        (
+            RasterProductSpec("mini_ownership", "int32"),
+            RasterProductSpec("drainage", "uint8"),
+        ),
+    ) as assembler:
         for mini_id in ordered:
-            catchment, segment = catchments.loc[mini_id].geometry, segments.loc[mini_id].geometry
-            if catchment is None or segment is None or catchment.is_empty or segment.is_empty:
+            catchment, segment = catchments[mini_id], segments[mini_id]
+            if (
+                catchment is None
+                or segment is None
+                or catchment.is_empty
+                or segment.is_empty
+            ):
                 raise PreparedDataError(f"Mini {mini_id} has invalid geometry")
-            win = from_bounds(*catchment.bounds, transform=grid.transform).round_offsets().round_lengths().intersection(Window(0, 0, grid.width, grid.height))
+            win = (
+                from_bounds(*catchment.bounds, transform=grid.transform)
+                .round_offsets()
+                .round_lengths()
+                .intersection(Window(0, 0, grid.width, grid.height))
+            )
             shape = (int(win.height), int(win.width))
             transform = rasterio.windows.transform(win, grid.transform)
-            valid = rasterize([(catchment, 1)], out_shape=shape, transform=transform, dtype="uint8", all_touched=False).astype(bool)
-            drainage = rasterize([(segment, 1)], out_shape=shape, transform=transform, dtype="uint8", all_touched=True).astype(bool) & valid
+            valid = rasterize(
+                [(catchment, 1)],
+                out_shape=shape,
+                transform=transform,
+                dtype="uint8",
+                all_touched=False,
+            ).astype(bool)
+            drainage = (
+                rasterize(
+                    [(segment, 1)],
+                    out_shape=shape,
+                    transform=transform,
+                    dtype="uint8",
+                    all_touched=True,
+                ).astype(bool)
+                & valid
+            )
             if not valid.any() or not drainage.any():
-                raise PreparedDataError(f"Mini {mini_id} has no rasterized ownership or drainage cells")
-            assembler.write(RasterPatch("mini_ownership", win, np.full(shape, labels[mini_id], dtype="int32"), valid))
-            assembler.write(RasterPatch("drainage", win, drainage.astype("uint8"), valid))
+                raise PreparedDataError(
+                    f"Mini {mini_id} has no rasterized ownership or drainage cells"
+                )
+            assembler.write(
+                RasterPatch(
+                    "mini_ownership",
+                    win,
+                    np.full(shape, labels[mini_id], dtype="int32"),
+                    valid,
+                )
+            )
+            assembler.write(
+                RasterPatch("drainage", win, drainage.astype("uint8"), valid)
+            )
         paths = assembler.finish()
     index = staging / "mini_index.parquet"
-    bounds = [catchments.loc[mini_id].geometry.bounds for mini_id in ordered]
-    pd.DataFrame({
-        "mini_label": np.arange(1, len(ordered) + 1, dtype="int32"), "mini_id": ordered,
-        "minx": [value[0] for value in bounds], "miny": [value[1] for value in bounds],
-        "maxx": [value[2] for value in bounds], "maxy": [value[3] for value in bounds],
-    }).to_parquet(index, index=False)
-    return ({name: _raster_asset(path, staging, name) for name, path in paths.items()}, index)
+    bounds = [catchments[mini_id].bounds for mini_id in ordered]
+    pd.DataFrame(
+        {
+            "mini_label": np.arange(1, len(ordered) + 1, dtype="int32"),
+            "mini_id": ordered,
+            "minx": [value[0] for value in bounds],
+            "miny": [value[1] for value in bounds],
+            "maxx": [value[2] for value in bounds],
+            "maxy": [value[3] for value in bounds],
+        }
+    ).to_parquet(index, index=False)
+    return (
+        {name: _raster_asset(path, staging, name) for name, path in paths.items()},
+        index,
+    )
+
+
+def _union_vector_geometries(path: Path, batch_size: int = 10_000):
+    """Union a provider incrementally without constructing an eager vector frame."""
+    partial = None
+    try:
+        with pyogrio.open_arrow(
+            path,
+            columns=[],
+            read_geometry=True,
+            batch_size=batch_size,
+            use_pyarrow=True,
+        ) as (metadata, batches):
+            for batch in batches:
+                table = pa.Table.from_batches([batch])
+                geometry_column = geometry_column_name(
+                    table, metadata.get("geometry_name")
+                )
+                values = (
+                    table[geometry_column]
+                    .combine_chunks()
+                    .to_numpy(zero_copy_only=False)
+                )
+                geometries = shapely.from_wkb(values, on_invalid="raise")
+                batch_union = shapely.union_all(geometries)
+                partial = (
+                    batch_union
+                    if partial is None
+                    else shapely.union(partial, batch_union)
+                )
+    except Exception as exc:
+        raise PreparedDataError(f"Cannot read ROI domain geometry: {path}") from exc
+    if partial is None:
+        raise PreparedDataError("ROI domain is empty")
+    return partial
 
 
 def _working_raster(path: Path, grid: GridSpec, dtype: str):

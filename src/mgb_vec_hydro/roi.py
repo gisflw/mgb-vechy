@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 import time
 from collections import defaultdict
 from collections.abc import Hashable, Iterable
@@ -11,14 +12,13 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
-import geopandas as gpd
 import numpy as np
 import pandas as pd
 import pyarrow as pa
 import pyarrow.compute as pc
 import pyogrio
 from pyproj import CRS, Geod, Transformer
-from shapely.ops import transform as shapely_transform
+import shapely
 
 from mgb_vec_hydro.exceptions import (
     DuplicateSegmentIdError,
@@ -29,14 +29,16 @@ from mgb_vec_hydro.exceptions import (
 )
 from mgb_vec_hydro.execution.checkpoints import (
     CheckpointStore,
-    JsonCheckpointCodec,
     execution_fingerprint,
 )
+from mgb_vec_hydro.execution.executor import ExecutionConfig, LocalExecutor, WorkItem
 from mgb_vec_hydro.execution.publication import AtomicOutputDirectory
 from mgb_vec_hydro.execution.vector import (
-    conservative_geometry_packet_rows,
-    id_predicate,
+    VectorTable,
+    VectorTableCheckpointCodec,
     inspect_vector_provider,
+    vector_table_from_arrow,
+    write_vector_table,
 )
 from mgb_vec_hydro.crs_utils import parse_crs
 
@@ -44,8 +46,16 @@ DEFAULT_STRAHLER_ORDER_COL = "strahler_order"
 ROI_CONTRACT = "mgb-roi-dataset"
 ROI_CONTRACT_VERSION = 2
 ROI_COLUMNS = [
-    "id", "id_down", "sub", "strahler_order", "unit_length",
-    "upstream_length", "unit_area", "upstream_area", "water_course", "geometry",
+    "id",
+    "id_down",
+    "sub",
+    "strahler_order",
+    "unit_length",
+    "upstream_length",
+    "unit_area",
+    "upstream_area",
+    "water_course",
+    "geometry",
 ]
 
 
@@ -93,12 +103,17 @@ class RoiDataset:
         try:
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
-            raise PreparedDataError(f"Cannot read ROI manifest: {manifest_path}") from exc
+            raise PreparedDataError(
+                f"Cannot read ROI manifest: {manifest_path}"
+            ) from exc
         return cls(root, manifest)
 
     def validate(self) -> None:
         value = self.manifest
-        if value.get("contract") != ROI_CONTRACT or value.get("version") != ROI_CONTRACT_VERSION:
+        if (
+            value.get("contract") != ROI_CONTRACT
+            or value.get("version") != ROI_CONTRACT_VERSION
+        ):
             raise PreparedDataError("Unsupported ROI dataset contract or version")
         assets = value.get("assets")
         if not isinstance(assets, dict) or set(assets) != {"catchments", "segments"}:
@@ -118,17 +133,25 @@ class RoiDataset:
             try:
                 path.relative_to(self.root.resolve())
             except ValueError as exc:
-                raise PreparedDataError(f"ROI asset escapes dataset: {relative}") from exc
+                raise PreparedDataError(
+                    f"ROI asset escapes dataset: {relative}"
+                ) from exc
             if not path.is_file():
                 raise PreparedDataError(f"ROI asset is missing: {relative}")
             info = pyogrio.read_info(path)
-            if list(info["fields"]) != ROI_COLUMNS[:-1] or info["features"] != asset.get("feature_count"):
+            if list(info["fields"]) != ROI_COLUMNS[:-1] or info[
+                "features"
+            ] != asset.get("feature_count"):
                 raise PreparedDataError(f"ROI {name} asset does not match its manifest")
-            if info.get("crs") is None or CRS.from_user_input(info["crs"]) != expected_crs:
+            if (
+                info.get("crs") is None
+                or CRS.from_user_input(info["crs"]) != expected_crs
+            ):
                 raise PreparedDataError(f"ROI {name} asset has an incompatible CRS")
 
-    def path(self, name: str) -> Path:
-        self.validate()
+    def path(self, name: str, *, validate: bool = True) -> Path:
+        if validate:
+            self.validate()
         try:
             return self.root / self.manifest["assets"][name]["path"]
         except KeyError as exc:
@@ -144,21 +167,38 @@ class _Provider:
     fields: dict[str, str]
 
 
+@dataclass(frozen=True)
+class _GeometryPacket:
+    provider: _Provider
+    ids: tuple[Hashable, ...]
+    fids: tuple[int, ...]
+    kind: str
+    target_crs_wkt: str
+
+
 def define_roi_dataset(spec: RoiSpec) -> RoiReport:
     """Select from raw providers and atomically publish a normalized ROI."""
     overall_started = time.perf_counter()
     _validate_spec(spec)
     target_crs = parse_crs(spec.crs)
-    checkpoint = _roi_checkpoint(spec, target_crs)
     phase_started = time.perf_counter()
     segment_provider = _provider(
-        spec.segments, spec.segments_layer, spec.segments_source_crs,
-        {"id": spec.id_col, "id_down": spec.id_down_col,
-         "strahler_order": spec.strahler_order_col}, "segments",
+        spec.segments,
+        spec.segments_layer,
+        spec.segments_source_crs,
+        {
+            "id": spec.id_col,
+            "id_down": spec.id_down_col,
+            "strahler_order": spec.strahler_order_col,
+        },
+        "segments",
     )
     catchment_provider = _provider(
-        spec.catchments, spec.catchments_layer, spec.catchments_source_crs,
-        {"id": spec.id_col}, "catchments",
+        spec.catchments,
+        spec.catchments_layer,
+        spec.catchments_source_crs,
+        {"id": spec.id_col},
+        "catchments",
     )
     topology, segment_fids = _read_topology(segment_provider, spec.batch_size)
     outlet_ids = _coerce_outlets(spec.outlet_ids, topology["id"])
@@ -168,31 +208,88 @@ def define_roi_dataset(spec: RoiSpec) -> RoiReport:
     provider_topology_seconds = time.perf_counter() - phase_started
 
     memory_bytes = spec.memory_limit_mb * 1024 * 1024
-    phase_started = time.perf_counter()
-    metrics = _compute_selected_metrics(
-        selected_ids, segment_provider, catchment_provider, segment_fids,
-        batch_size=spec.batch_size, memory_bytes=memory_bytes,
-    )
-    upstream_length, upstream_area = _upstream_metrics(selected, metrics)
-    metric_attributes = _metric_attributes(
-        selected, sub_by_id, metrics, upstream_length, upstream_area,
-    )
-    water_course = _water_course_by_segment(metric_attributes)
-    metrics_seconds = time.perf_counter() - phase_started
     output = Path(spec.output_dir)
     publisher = AtomicOutputDirectory(output)
-    phase_started = time.perf_counter()
+    checkpoint = None
     with publisher as staging:
+        phase_started = time.perf_counter()
+        catchment_fids = _scan_fids(catchment_provider, spec.batch_size)
+        missing = selected_ids - set(catchment_fids)
+        if missing:
+            raise InvalidInputSchemaError(
+                "Selected catchment ID(s) are missing: "
+                + ", ".join(map(str, sorted(missing, key=str)))
+            )
+        items, kinds = _geometry_work_items(
+            selected_ids,
+            segment_provider,
+            catchment_provider,
+            segment_fids,
+            catchment_fids,
+            target_crs,
+            batch_size=spec.batch_size,
+            memory_bytes=memory_bytes,
+            workers=spec.workers,
+        )
+        checkpoint = _roi_checkpoint(spec, target_crs, items)
+        packet_dir = staging / ".packets"
+        packet_dir.mkdir()
+        codec = VectorTableCheckpointCodec()
+
+        def reduce_packet(result):
+            codec.dump(result.value, packet_dir / f"{result.ordinal:012d}.arrow")
+            return None
+
+        execution = LocalExecutor(
+            ExecutionConfig(
+                workers=spec.workers,
+                memory_limit_bytes=memory_bytes,
+                io_slots=spec.io_slots,
+            )
+        ).run(items, _process_geometry_packet, reduce_packet, checkpoint=checkpoint)
+        metrics: dict[Hashable, dict[str, float]] = {}
+        for ordinal in range(len(items)):
+            packet = codec.load(packet_dir / f"{ordinal:012d}.arrow")
+            key = "unit_length" if kinds[ordinal] == "segments" else "unit_area"
+            for segment_id, value in zip(
+                packet.table["id"].to_pylist(),
+                packet.table["unit_metric"].to_pylist(),
+                strict=True,
+            ):
+                metrics.setdefault(segment_id, {})[key] = float(value)
+        if set(metrics) != selected_ids or any(
+            "unit_length" not in value or "unit_area" not in value
+            for value in metrics.values()
+        ):
+            raise InvalidInputSchemaError(
+                "Selected segment and catchment IDs do not match"
+            )
+        upstream_length, upstream_area = _upstream_metrics(selected, metrics)
+        metric_attributes = _metric_attributes(
+            selected, sub_by_id, metrics, upstream_length, upstream_area
+        )
+        water_course = _water_course_by_segment(metric_attributes)
+        metrics_seconds = time.perf_counter() - phase_started
+
+        phase_started = time.perf_counter()
         vectors = staging / "vectors"
         vectors.mkdir()
         catchments_path = vectors / "roi_catchments.fgb"
         segments_path = vectors / "roi_segments.fgb"
-        _write_selected_outputs(
-            selected, sub_by_id, metrics, upstream_length, upstream_area,
-            water_course, segment_provider, catchment_provider, segment_fids,
-            target_crs, batch_size=spec.batch_size, memory_bytes=memory_bytes,
-            catchments_path=catchments_path, segments_path=segments_path,
+        _write_cached_outputs(
+            packet_dir,
+            kinds,
+            selected,
+            sub_by_id,
+            metrics,
+            upstream_length,
+            upstream_area,
+            water_course,
+            target_crs,
+            catchments_path=catchments_path,
+            segments_path=segments_path,
         )
+        shutil.rmtree(packet_dir)
         manifest = {
             "contract": ROI_CONTRACT,
             "version": ROI_CONTRACT_VERSION,
@@ -207,9 +304,9 @@ def define_roi_dataset(spec: RoiSpec) -> RoiReport:
             json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
         )
         RoiDataset(staging, manifest).validate()
-        publisher.publish((
-            "manifest.json", "vectors/roi_catchments.fgb", "vectors/roi_segments.fgb"
-        ))
+        publisher.publish(
+            ("manifest.json", "vectors/roi_catchments.fgb", "vectors/roi_segments.fgb")
+        )
     output_publication_seconds = time.perf_counter() - phase_started
 
     if checkpoint is not None:
@@ -222,6 +319,7 @@ def define_roi_dataset(spec: RoiSpec) -> RoiReport:
         {
             "provider_topology": provider_topology_seconds,
             "metrics": metrics_seconds,
+            "geometry_execution": execution.wall_seconds,
             "output_publication": output_publication_seconds,
             "total": time.perf_counter() - overall_started,
         },
@@ -229,7 +327,7 @@ def define_roi_dataset(spec: RoiSpec) -> RoiReport:
 
 
 def _roi_checkpoint(
-    spec: RoiSpec, target_crs: CRS
+    spec: RoiSpec, target_crs: CRS, work_items: Iterable[WorkItem[Any]]
 ) -> CheckpointStore[Any] | None:
     if spec.checkpoint_dir is None:
         return None
@@ -237,12 +335,18 @@ def _roi_checkpoint(
     for path in (spec.catchments, spec.segments):
         stat = Path(path).stat()
         sources.append(
-            {"path": str(Path(path).resolve()), "size": stat.st_size, "mtime_ns": stat.st_mtime_ns}
+            {
+                "path": str(Path(path).resolve()),
+                "size": stat.st_size,
+                "mtime_ns": stat.st_mtime_ns,
+            }
         )
     fingerprint = execution_fingerprint(
         algorithm="define-roi",
-        version="1",
-        prepared_manifest={"crs_wkt": target_crs.to_wkt(version="WKT2_2019", pretty=False)},
+        version="2",
+        prepared_manifest={
+            "crs_wkt": target_crs.to_wkt(version="WKT2_2019", pretty=False)
+        },
         parameters={
             "sources": sources,
             "outlets": list(spec.outlet_ids),
@@ -250,9 +354,144 @@ def _roi_checkpoint(
             "layers": [spec.catchments_layer, spec.segments_layer],
             "source_crs": [spec.catchments_source_crs, spec.segments_source_crs],
         },
-        work_items=(),
+        work_items=work_items,
     )
-    return CheckpointStore(spec.checkpoint_dir, fingerprint, JsonCheckpointCodec())
+    return CheckpointStore(
+        spec.checkpoint_dir, fingerprint, VectorTableCheckpointCodec()
+    )
+
+
+def _geometry_work_items(
+    ids: set[Hashable],
+    segment_provider: _Provider,
+    catchment_provider: _Provider,
+    segment_fids: dict[Hashable, int],
+    catchment_fids: dict[Hashable, int],
+    target_crs: CRS,
+    *,
+    batch_size: int,
+    memory_bytes: int,
+    workers: int,
+) -> tuple[list[WorkItem[_GeometryPacket]], dict[int, str]]:
+    ordered = sorted(ids, key=lambda value: (type(value).__name__, str(value)))
+    packet_rows = max(1, min(batch_size, memory_bytes // max(1, workers) // 4096))
+    items: list[WorkItem[_GeometryPacket]] = []
+    kinds: dict[int, str] = {}
+    for provider, fid_by_id, kind in (
+        (segment_provider, segment_fids, "segments"),
+        (catchment_provider, catchment_fids, "catchments"),
+    ):
+        for start in range(0, len(ordered), packet_rows):
+            ordinal = len(items)
+            packet_ids = tuple(ordered[start : start + packet_rows])
+            fids = tuple(fid_by_id[value] for value in packet_ids)
+            estimate = max(1, min(memory_bytes // max(1, workers), len(fids) * 4096))
+            items.append(
+                WorkItem(
+                    f"{kind}-{start:012d}",
+                    ordinal,
+                    estimate,
+                    _GeometryPacket(
+                        provider, packet_ids, fids, kind, target_crs.to_wkt()
+                    ),
+                )
+            )
+            kinds[ordinal] = kind
+    return items, kinds
+
+
+def _process_geometry_packet(payload: _GeometryPacket, context) -> VectorTable:
+    provider = payload.provider
+    try:
+        with context.io_bound():
+            metadata, table = pyogrio.read_arrow(
+                provider.path,
+                layer=provider.layer,
+                columns=list(dict.fromkeys(provider.fields.values())),
+                fids=list(payload.fids),
+            )
+    except Exception as exc:
+        raise InvalidInputSchemaError(
+            "Cannot read selected provider geometry packet"
+        ) from exc
+    frame = _normalize_vector_table(
+        _provider_vector(metadata, table, provider), provider
+    )
+    returned = frame.table["id"].to_pylist()
+    if len(returned) != len(set(returned)) or set(returned) != set(payload.ids):
+        raise InvalidInputSchemaError(
+            "Provider geometry packet did not return the exact requested IDs"
+        )
+    geometries = frame.geometries()
+    allowed = (
+        {"LineString", "MultiLineString"}
+        if payload.kind == "segments"
+        else {"Polygon", "MultiPolygon"}
+    )
+    _validate_geometries(geometries, payload.kind, allowed)
+    metrics = [_geometry_metric(value, provider, payload.kind) for value in geometries]
+    target_crs = CRS.from_wkt(payload.target_crs_wkt)
+    if provider.crs != target_crs:
+        transformer = Transformer.from_crs(provider.crs, target_crs, always_xy=True)
+        geometries = shapely.transform(
+            geometries, transformer.transform, interleaved=False
+        )
+    result = pa.table(
+        {
+            "id": frame.table["id"],
+            "unit_metric": pa.array(metrics, type=pa.float64()),
+            "geometry": pa.array(shapely.to_wkb(geometries), type=pa.binary()),
+        }
+    )
+    return VectorTable(result, target_crs, "geometry", frame.geometry_type)
+
+
+def _write_cached_outputs(
+    packet_dir: Path,
+    kinds: dict[int, str],
+    attrs: pd.DataFrame,
+    sub_by_id,
+    metrics,
+    upstream_length,
+    upstream_area,
+    water_course,
+    target_crs: CRS,
+    *,
+    catchments_path: Path,
+    segments_path: Path,
+) -> None:
+    lookup = attrs.set_index("id").to_dict("index")
+    id_type = pa.array(attrs["id"].tolist()).type
+    codec = VectorTableCheckpointCodec()
+    first = {"segments": True, "catchments": True}
+    paths = {"segments": segments_path, "catchments": catchments_path}
+    for ordinal in range(len(kinds)):
+        kind = kinds[ordinal]
+        packet = codec.load(packet_dir / f"{ordinal:012d}.arrow")
+        rows = []
+        for segment_id, geometry in zip(
+            packet.table["id"].to_pylist(),
+            packet.table["geometry"].to_pylist(),
+            strict=True,
+        ):
+            item = lookup[segment_id]
+            rows.append(
+                {
+                    "id": segment_id,
+                    "id_down": item["id_down"],
+                    "sub": sub_by_id[segment_id],
+                    "strahler_order": int(item["strahler_order"]),
+                    "unit_length": metrics[segment_id]["unit_length"],
+                    "upstream_length": upstream_length[segment_id],
+                    "unit_area": metrics[segment_id]["unit_area"],
+                    "upstream_area": upstream_area[segment_id],
+                    "water_course": water_course[segment_id],
+                    "geometry": geometry,
+                }
+            )
+        output = _rows_to_vector(rows, id_type, target_crs, packet.geometry_type)
+        _write_fgb(output, paths[kind], append=not first[kind])
+        first[kind] = False
 
 
 def define_roi(spec: RoiSpec) -> RoiReport:
@@ -266,7 +505,12 @@ def _validate_spec(spec: RoiSpec) -> None:
             raise PreparedDataError(f"{label} input does not exist: {path}")
     if not spec.outlet_ids:
         raise InvalidInputSchemaError("At least one outlet ID is required")
-    for name, value in (("workers", spec.workers), ("memory limit", spec.memory_limit_mb), ("I/O slots", spec.io_slots), ("batch size", spec.batch_size)):
+    for name, value in (
+        ("workers", spec.workers),
+        ("memory limit", spec.memory_limit_mb),
+        ("I/O slots", spec.io_slots),
+        ("batch size", spec.batch_size),
+    ):
         if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
             raise InvalidInputSchemaError(f"{name} must be a positive integer")
     if spec.workers > 4:
@@ -274,7 +518,13 @@ def _validate_spec(spec: RoiSpec) -> None:
     parse_crs(spec.crs)
 
 
-def _provider(path: Path, layer: str | None, override: str | None, requested: dict[str, str], label: str) -> _Provider:
+def _provider(
+    path: Path,
+    layer: str | None,
+    override: str | None,
+    requested: dict[str, str],
+    label: str,
+) -> _Provider:
     source = inspect_vector_provider(path, layer=layer, source_crs=override)
     info = {
         "fields": source.fields,
@@ -284,14 +534,18 @@ def _provider(path: Path, layer: str | None, override: str | None, requested: di
         "features": source.feature_count,
         "fid_column": source.fid_column,
     }
-    fields = {name: _resolve_field(info, value, label) for name, value in requested.items()}
+    fields = {
+        name: _resolve_field(info, value, label) for name, value in requested.items()
+    }
     return _Provider(Path(path), layer, info, source.crs, fields)
 
 
 def _resolve_field(info: dict[str, Any], requested: str, label: str) -> str:
     fields = list(info.get("fields", ()))
     exact = [field for field in fields if field == requested]
-    matches = exact or [field for field in fields if field.casefold() == requested.casefold()]
+    matches = exact or [
+        field for field in fields if field.casefold() == requested.casefold()
+    ]
     if len(matches) != 1:
         reason = "ambiguous" if matches else "missing"
         raise InvalidInputSchemaError(
@@ -300,18 +554,28 @@ def _resolve_field(info: dict[str, Any], requested: str, label: str) -> str:
     return matches[0]
 
 
-def _read_topology(provider: _Provider, batch_size: int) -> tuple[pd.DataFrame, dict[Hashable, int]]:
+def _read_topology(
+    provider: _Provider, batch_size: int
+) -> tuple[pd.DataFrame, dict[Hashable, int]]:
     columns = list(provider.fields.values())
     batches: list[pa.RecordBatch] = []
     try:
         with pyogrio.open_arrow(
-            provider.path, layer=provider.layer, columns=columns,
-            read_geometry=False, return_fids=True, batch_size=batch_size,
+            provider.path,
+            layer=provider.layer,
+            columns=columns,
+            read_geometry=False,
+            return_fids=True,
+            batch_size=batch_size,
             use_pyarrow=True,
         ) as (_, stream):
             for batch in stream:
                 order = batch[provider.fields["strahler_order"]]
-                if not (pa.types.is_integer(order.type) or pa.types.is_floating(order.type) or pa.types.is_decimal(order.type)):
+                if not (
+                    pa.types.is_integer(order.type)
+                    or pa.types.is_floating(order.type)
+                    or pa.types.is_decimal(order.type)
+                ):
                     raise InvalidInputSchemaError("Strahler order must be numeric")
                 numeric = pc.cast(order, pa.float64())
                 mask = pc.fill_null(
@@ -364,7 +628,9 @@ def _coerce_outlets(values: Iterable[str], ids: pd.Series) -> list[Hashable]:
     return result
 
 
-def _select_topology(frame: pd.DataFrame, outlets: list[Hashable]) -> tuple[set[Hashable], dict[Hashable, int]]:
+def _select_topology(
+    frame: pd.DataFrame, outlets: list[Hashable]
+) -> tuple[set[Hashable], dict[Hashable, int]]:
     ids = set(frame["id"].tolist())
     missing = [value for value in outlets if value not in ids]
     if missing:
@@ -402,14 +668,17 @@ def _select_topology(frame: pd.DataFrame, outlets: list[Hashable]) -> tuple[set[
     return selected, sub_by_id
 
 
-def _topological_order(ids: set[Hashable], downstream: dict[Hashable, Hashable]) -> list[Hashable]:
+def _topological_order(
+    ids: set[Hashable], downstream: dict[Hashable, Hashable]
+) -> list[Hashable]:
     upstream_count = dict.fromkeys(ids, 0)
     for downstream_id in downstream.values():
         if downstream_id in ids:
             upstream_count[downstream_id] += 1
     ready = sorted(
         (value for value, count in upstream_count.items() if count == 0),
-        key=str, reverse=True,
+        key=str,
+        reverse=True,
     )
     order: list[Hashable] = []
     while ready:
@@ -427,109 +696,26 @@ def _topological_order(ids: set[Hashable], downstream: dict[Hashable, Hashable])
 
 
 def _validate_selected_attributes(frame: pd.DataFrame) -> None:
-    order = pd.to_numeric(frame["strahler_order"], errors="coerce").to_numpy(dtype=float)
+    order = pd.to_numeric(frame["strahler_order"], errors="coerce").to_numpy(
+        dtype=float
+    )
     if not np.all(np.isfinite(order)) or not np.all(order == np.floor(order)):
         raise InvalidInputSchemaError(
             "Selected Strahler orders must be finite integral values"
         )
 
 
-def _iter_selected(
-    provider: _Provider,
-    ids: set[Hashable],
-    *,
-    batch_size: int,
-    memory_bytes: int,
-    known_fids: dict[Hashable, int] | None = None,
-) -> Iterable[gpd.GeoDataFrame]:
-    ordered = sorted(ids, key=lambda value: (type(value).__name__, str(value)))
-    source = inspect_vector_provider(
-        provider.path, layer=provider.layer, source_crs=provider.crs.to_string()
-    )
-    rows_per_packet = conservative_geometry_packet_rows(
-        source, memory_limit_bytes=memory_bytes, requested_rows=batch_size
-    )
-    frames: list[gpd.GeoDataFrame] = []
-    # Use provider-side predicates for ordinary selections. If unsupported,
-    # make exactly one ID/FID scan and issue bounded random-FID reads.
-    if len(ordered) <= 2_000:
-        try:
-            packet_size = min(rows_per_packet, 400)
-            for start in range(0, len(ordered), packet_size):
-                values = ordered[start : start + packet_size]
-                frames.append(pyogrio.read_dataframe(
-                    provider.path, layer=provider.layer,
-                    columns=list(dict.fromkeys(provider.fields.values())),
-                    where=id_predicate(provider.fields["id"], values),
-                    use_arrow=True,
-                ))
-        except (
-            pyogrio.errors.DataLayerError,
-            pyogrio.errors.DataSourceError,
-            pyogrio.errors.FeatureError,
-            pyogrio.errors.FieldError,
-            pyogrio.errors.GeometryError,
-            RuntimeError,
-            ValueError,
-        ):
-            frames.clear()
-    if not frames:
-        fid_by_id = known_fids or _scan_fids(provider, batch_size)
-        missing = ids - set(fid_by_id)
-        if missing:
-            raise InvalidInputSchemaError(
-                "Selected catchment ID(s) are missing: "
-                + ", ".join(map(str, sorted(missing, key=str)))
-            )
-        selected_fids = [fid_by_id[value] for value in ordered]
-        try:
-            for start in range(0, len(selected_fids), rows_per_packet):
-                frames.append(pyogrio.read_dataframe(
-                    provider.path, layer=provider.layer,
-                    columns=list(dict.fromkeys(provider.fields.values())),
-                    fids=selected_fids[start : start + rows_per_packet],
-                    use_arrow=True,
-                ))
-        except Exception as exc:
-            raise InvalidInputSchemaError(
-                "Cannot read selected provider geometries by FID"
-            ) from exc
-    if not frames:
-        raise InvalidInputSchemaError("Provider returned no selected geometries")
-    frame = pd.concat(frames, ignore_index=True)
-    frame = gpd.GeoDataFrame(frame, geometry=frames[0].geometry.name, crs=frames[0].crs)
-    frame = frame.rename(columns={actual: normalized for normalized, actual in provider.fields.items()})
-    if frame.geometry.name != "geometry":
-        frame = frame.rename_geometry("geometry")
-    returned = frame["id"]
-    duplicates = returned[returned.duplicated(keep=False)].tolist()
-    if duplicates:
-        raise InvalidInputSchemaError(
-            "Provider returned duplicate selected ID(s): "
-            + ", ".join(map(str, duplicates[:20]))
-        )
-    missing = ids - set(returned.tolist())
-    extra = set(returned.tolist()) - ids
-    if missing or extra:
-        raise InvalidInputSchemaError(
-            "Provider selection did not return the exact requested IDs"
-        )
-    estimate = int(frame.memory_usage(index=True, deep=True).sum())
-    estimate += sum(len(value) if value else 0 for value in frame.geometry.to_wkb())
-    if estimate > memory_bytes:
-        raise InvalidInputSchemaError(
-            "Selected geometry packet exceeds the configured memory budget"
-        )
-    yield frame[[*provider.fields.keys(), "geometry"]]
-
-
 def _scan_fids(provider: _Provider, batch_size: int) -> dict[Hashable, int]:
     result: dict[Hashable, int] = {}
     try:
         with pyogrio.open_arrow(
-            provider.path, layer=provider.layer,
-            columns=[provider.fields["id"]], read_geometry=False,
-            return_fids=True, batch_size=batch_size, use_pyarrow=True,
+            provider.path,
+            layer=provider.layer,
+            columns=[provider.fields["id"]],
+            read_geometry=False,
+            return_fids=True,
+            batch_size=batch_size,
+            use_pyarrow=True,
         ) as (metadata, batches):
             fid_name = metadata.get("fid_column") or "fid"
             for batch in batches:
@@ -537,9 +723,12 @@ def _scan_fids(provider: _Provider, batch_size: int) -> dict[Hashable, int]:
                 fid_index = max(fid_index, 0)
                 values = zip(
                     batch[provider.fields["id"]].to_pylist(),
-                    batch.column(fid_index).to_pylist(), strict=True,
+                    batch.column(fid_index).to_pylist(),
+                    strict=True,
                 )
                 for segment_id, fid in values:
+                    if pd.isna(segment_id):
+                        continue
                     if segment_id in result:
                         raise InvalidInputSchemaError(
                             f"Provider contains duplicate ID: {segment_id}"
@@ -550,63 +739,6 @@ def _scan_fids(provider: _Provider, batch_size: int) -> dict[Hashable, int]:
     except Exception as exc:
         raise InvalidInputSchemaError("Cannot scan provider IDs and FIDs") from exc
     return result
-
-
-def _iter_selected_bounded(
-    provider: _Provider, ids: set[Hashable], *, batch_size: int,
-    memory_bytes: int, known_fids: dict[Hashable, int] | None = None,
-) -> Iterable[gpd.GeoDataFrame]:
-    """Yield selected geometries without concatenating packets."""
-    source = inspect_vector_provider(
-        provider.path, layer=provider.layer, source_crs=provider.crs.to_string()
-    )
-    rows_per_packet = conservative_geometry_packet_rows(
-        source, memory_limit_bytes=memory_bytes, requested_rows=batch_size
-    )
-    ordered = sorted(ids, key=lambda value: (type(value).__name__, str(value)))
-    if known_fids is not None:
-        missing = ids - set(known_fids)
-        if missing:
-            raise InvalidInputSchemaError("Selected provider ID(s) are missing")
-        requests = [
-            ("fids", [known_fids[value] for value in ordered[start : start + rows_per_packet]])
-            for start in range(0, len(ordered), rows_per_packet)
-        ]
-    else:
-        packet_size = min(rows_per_packet, 400)
-        requests = [
-            ("where", ordered[start : start + packet_size])
-            for start in range(0, len(ordered), packet_size)
-        ]
-    seen: set[Hashable] = set()
-    for mode, request in requests:
-        try:
-            read_options = {mode: request}
-            if mode == "where":
-                read_options[mode] = id_predicate(provider.fields["id"], request)
-            frame = pyogrio.read_dataframe(
-                provider.path, layer=provider.layer,
-                columns=list(dict.fromkeys(provider.fields.values())),
-                use_arrow=True, **read_options,
-            )
-        except Exception as exc:
-            raise InvalidInputSchemaError("Cannot read selected provider geometries") from exc
-        frame = gpd.GeoDataFrame(frame, geometry=frame.geometry.name, crs=provider.crs)
-        frame = frame.rename(columns={actual: normalized for normalized, actual in provider.fields.items()})
-        if frame.geometry.name != "geometry":
-            frame = frame.rename_geometry("geometry")
-        frame = frame.sort_values("id", key=lambda values: values.map(lambda value: (type(value).__name__, str(value))))
-        returned = frame["id"].tolist()
-        if seen.intersection(returned):
-            raise InvalidInputSchemaError("Provider returned duplicate selected IDs")
-        seen.update(returned)
-        estimate = int(frame.memory_usage(index=True, deep=True).sum())
-        estimate += sum(len(value) if value else 0 for value in frame.geometry.to_wkb())
-        if estimate > memory_bytes:
-            raise InvalidInputSchemaError("Selected geometry packet exceeds the configured memory budget")
-        yield frame[[*provider.fields.keys(), "geometry"]]
-    if seen != ids:
-        raise InvalidInputSchemaError("Provider selection did not return the exact requested IDs")
 
 
 @lru_cache(maxsize=16)
@@ -624,12 +756,8 @@ def _geodetic_tools(crs_text: str) -> tuple[Transformer, Geod]:
 
 
 def _geometry_metric(geometry, provider: _Provider, kind: str) -> float:
-    _validate_geometry(
-        gpd.GeoDataFrame({"geometry": [geometry]}, geometry="geometry", crs=provider.crs),
-        kind, {"LineString", "MultiLineString"} if kind == "segments" else {"Polygon", "MultiPolygon"},
-    )
     transformer, geod = _geodetic_tools(provider.crs.to_wkt())
-    geographic = shapely_transform(transformer.transform, geometry)
+    geographic = shapely.transform(geometry, transformer.transform, interleaved=False)
     if kind == "segments":
         value = geod.geometry_length(geographic) / 1000.0
     else:
@@ -637,21 +765,6 @@ def _geometry_metric(geometry, provider: _Provider, kind: str) -> float:
     if not np.isfinite(value) or value < 0:
         raise InvalidInputSchemaError(f"Selected {kind} produced an invalid metric")
     return float(value)
-
-
-def _compute_selected_metrics(ids, segments, catchments, segment_fids, *, batch_size, memory_bytes):
-    metrics = {}
-    for frame in _iter_selected_bounded(segments, ids, batch_size=batch_size, memory_bytes=memory_bytes, known_fids=segment_fids):
-        for row in frame.itertuples(index=False):
-            metrics.setdefault(row.id, {})["unit_length"] = _geometry_metric(row.geometry, segments, "segments")
-    for frame in _iter_selected_bounded(catchments, ids, batch_size=batch_size, memory_bytes=memory_bytes):
-        for row in frame.itertuples(index=False):
-            if row.id not in metrics:
-                raise InvalidInputSchemaError(f"Catchment ID is not present in selected segments: {row.id}")
-            metrics[row.id]["unit_area"] = _geometry_metric(row.geometry, catchments, "catchments")
-    if set(metrics) != ids or any("unit_area" not in value for value in metrics.values()):
-        raise InvalidInputSchemaError("Selected segment and catchment IDs do not match")
-    return metrics
 
 
 def _upstream_metrics(attrs, metrics):
@@ -669,7 +782,9 @@ def _upstream_metrics(attrs, metrics):
 def _metric_attributes(attrs, sub_by_id, metrics, upstream_length, upstream_area):
     result = attrs.copy()
     result["sub"] = result["id"].map(sub_by_id)
-    result["unit_length"] = result["id"].map(lambda value: metrics[value]["unit_length"])
+    result["unit_length"] = result["id"].map(
+        lambda value: metrics[value]["unit_length"]
+    )
     result["upstream_length"] = result["id"].map(upstream_length)
     result["unit_area"] = result["id"].map(lambda value: metrics[value]["unit_area"])
     result["upstream_area"] = result["id"].map(upstream_area)
@@ -677,45 +792,29 @@ def _metric_attributes(attrs, sub_by_id, metrics, upstream_length, upstream_area
     return result
 
 
-def _write_selected_outputs(attrs, sub_by_id, metrics, upstream_length, upstream_area, water_course,
-                            segment_provider, catchment_provider, segment_fids, target_crs, *,
-                            batch_size, memory_bytes, catchments_path, segments_path):
-    lookup = attrs.set_index("id").to_dict("index")
-    for provider, fids, path, kind in ((segment_provider, segment_fids, segments_path, "segments"), (catchment_provider, None, catchments_path, "catchments")):
-        first = True
-        for frame in _iter_selected_bounded(provider, set(lookup), batch_size=batch_size, memory_bytes=memory_bytes, known_fids=fids):
-            rows = []
-            for row in frame.itertuples(index=False):
-                item = lookup[row.id]
-                values = {
-                    "id": row.id, "id_down": item["id_down"], "sub": sub_by_id[row.id],
-                    "strahler_order": int(item["strahler_order"]),
-                    "unit_length": metrics[row.id]["unit_length"], "upstream_length": upstream_length[row.id],
-                    "unit_area": metrics[row.id]["unit_area"], "upstream_area": upstream_area[row.id],
-                    "water_course": water_course[row.id], "geometry": row.geometry,
-                }
-                rows.append(values)
-            output = gpd.GeoDataFrame(rows, columns=ROI_COLUMNS, geometry="geometry", crs=provider.crs).to_crs(target_crs)
-            _validate_geometry(output, kind, {"LineString", "MultiLineString"} if kind == "segments" else {"Polygon", "MultiPolygon"})
-            _write_fgb(output, path, append=not first)
-            first = False
-
-
-def _validate_geometry(frame: gpd.GeoDataFrame, name: str, allowed: set[str]) -> None:
-    if frame.geometry.isna().any() or frame.geometry.is_empty.any():
-        raise InvalidInputSchemaError(
-            f"Selected {name} contain null or empty geometry"
-        )
-    bad_types = sorted(set(frame.geom_type) - allowed)
+def _validate_geometries(geometries: np.ndarray, name: str, allowed: set[str]) -> None:
+    if np.any(shapely.is_missing(geometries)) or np.any(shapely.is_empty(geometries)):
+        raise InvalidInputSchemaError(f"Selected {name} contain null or empty geometry")
+    type_codes = {
+        "LineString": shapely.GeometryType.LINESTRING.value,
+        "MultiLineString": shapely.GeometryType.MULTILINESTRING.value,
+        "Polygon": shapely.GeometryType.POLYGON.value,
+        "MultiPolygon": shapely.GeometryType.MULTIPOLYGON.value,
+    }
+    bad_types = sorted(
+        set(shapely.get_type_id(geometries).tolist())
+        - {type_codes[value] for value in allowed}
+    )
     if bad_types:
         raise InvalidInputSchemaError(
-            f"Selected {name} have invalid geometry type(s): " + ", ".join(bad_types)
+            f"Selected {name} have invalid geometry type code(s): "
+            + ", ".join(map(str, bad_types))
         )
-    if not frame.geometry.is_valid.all():
+    if not np.all(shapely.is_valid(geometries)):
         raise InvalidInputSchemaError(f"Selected {name} contain invalid geometry")
 
 
-def _water_course_by_segment(segments: gpd.GeoDataFrame) -> dict[Hashable, Hashable]:
+def _water_course_by_segment(segments: pd.DataFrame) -> dict[Hashable, Hashable]:
     result: dict[Hashable, Hashable] = {}
     for _, group in segments.groupby("sub", sort=False):
         ids = set(group["id"].tolist())
@@ -733,7 +832,8 @@ def _water_course_by_segment(segments: gpd.GeoDataFrame) -> dict[Hashable, Hasha
                     children,
                     key=lambda child: (
                         attrs.at[child, "upstream_area"],
-                        attrs.at[child, "unit_length"], str(child),
+                        attrs.at[child, "unit_length"],
+                        str(child),
                     ),
                 )
                 for child in children:
@@ -741,16 +841,66 @@ def _water_course_by_segment(segments: gpd.GeoDataFrame) -> dict[Hashable, Hasha
     return result
 
 
-def _write_fgb(frame: gpd.GeoDataFrame, path: Path, *, append: bool = False) -> None:
-    pyogrio.write_dataframe(
-        frame, path, driver="FlatGeobuf", append=append, use_arrow=True,
-        SPATIAL_INDEX="YES",
+def _write_fgb(frame: VectorTable, path: Path, *, append: bool = False) -> None:
+    write_vector_table(frame, path, driver="FlatGeobuf", append=append)
+
+
+def _normalize_vector_table(frame: VectorTable, provider: _Provider) -> VectorTable:
+    rename = {actual: normalized for normalized, actual in provider.fields.items()}
+    names = [
+        rename.get(name, "geometry" if name == frame.geometry_column else name)
+        for name in frame.table.column_names
+    ]
+    table = frame.table.rename_columns(names)
+    columns = [*provider.fields.keys(), "geometry"]
+    return VectorTable(
+        table.select(columns), provider.crs, "geometry", frame.geometry_type
     )
+
+
+def _provider_vector(
+    metadata: dict[str, Any], table: pa.Table, provider: _Provider
+) -> VectorTable:
+    if metadata.get("crs") is None:
+        metadata = {**metadata, "crs": provider.crs.to_wkt()}
+    return vector_table_from_arrow(metadata, table)
+
+
+def _rows_to_vector(
+    rows: list[dict[str, Any]], id_type: pa.DataType, crs: CRS, geometry_type: str
+) -> VectorTable:
+    def nullable_id(value):
+        return None if pd.isna(value) else value
+
+    arrays = {
+        "id": pa.array([row["id"] for row in rows], type=id_type),
+        "id_down": pa.array(
+            [nullable_id(row["id_down"]) for row in rows], type=id_type
+        ),
+        "sub": pa.array([row["sub"] for row in rows], type=pa.int64()),
+        "strahler_order": pa.array(
+            [row["strahler_order"] for row in rows], type=pa.int64()
+        ),
+        "unit_length": pa.array(
+            [row["unit_length"] for row in rows], type=pa.float64()
+        ),
+        "upstream_length": pa.array(
+            [row["upstream_length"] for row in rows], type=pa.float64()
+        ),
+        "unit_area": pa.array([row["unit_area"] for row in rows], type=pa.float64()),
+        "upstream_area": pa.array(
+            [row["upstream_area"] for row in rows], type=pa.float64()
+        ),
+        "water_course": pa.array([row["water_course"] for row in rows], type=id_type),
+        "geometry": pa.array([row["geometry"] for row in rows], type=pa.binary()),
+    }
+    return VectorTable(pa.table(arrays), crs, "geometry", geometry_type)
 
 
 def _asset(path: Path, root: Path, count: int) -> dict[str, Any]:
     return {
         "path": path.relative_to(root).as_posix(),
-        "driver": "FlatGeobuf", "feature_count": count,
+        "driver": "FlatGeobuf",
+        "feature_count": count,
         "fields": ROI_COLUMNS[:-1],
     }

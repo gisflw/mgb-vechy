@@ -1,9 +1,14 @@
-import geopandas as gpd
 import pytest
 from shapely.geometry import Point
 
 from mgb_vec_hydro.exceptions import UnsupportedOutputFormatError
-from mgb_vec_hydro.io import aggregation_output_paths, output_paths, read_vector, write_vector
+from mgb_vec_hydro.io import (
+    aggregation_output_paths,
+    output_paths,
+    read_vector,
+    write_vector,
+)
+from mgb_vec_hydro.execution.vector import VectorTable
 
 
 def test_output_paths_use_roi_dataset_names(tmp_path):
@@ -27,14 +32,13 @@ def test_aggregation_output_paths_use_mini_dataset_names(tmp_path):
 
 
 def test_write_and_read_vector_round_trip_gpkg(tmp_path):
-    gdf = gpd.GeoDataFrame(
-        {"value": [1], "geometry": [Point(0, 0)]},
-        crs="EPSG:4326",
+    vector = VectorTable.from_pydict(
+        {"value": [1]}, [Point(0, 0)], crs="EPSG:4326", geometry_type="Point"
     )
     path = tmp_path / "points.gpkg"
 
-    write_vector(gdf, path, output_format="gpkg")
+    write_vector(vector, path, output_format="gpkg")
     result = read_vector(path)
 
-    assert list(result["value"]) == [1]
-    assert result.crs == gdf.crs
+    assert result.table["value"].to_pylist() == [1]
+    assert result.crs == vector.crs

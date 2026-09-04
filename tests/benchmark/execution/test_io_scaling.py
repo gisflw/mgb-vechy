@@ -10,8 +10,8 @@ import os
 import time
 from pathlib import Path
 
-import geopandas as gpd
 import numpy as np
+import pandas as pd
 import pytest
 import rasterio
 from pyproj import CRS
@@ -23,8 +23,10 @@ from shapely.geometry import LineString
 from mgb_vec_hydro.execution.executor import WorkerContext
 from mgb_vec_hydro.execution.raster import PreparedRasterReader
 from mgb_vec_hydro.execution.vector import (
+    VectorTable,
     inspect_vector_provider,
     iter_provider_batches,
+    write_vector_table,
 )
 
 pytestmark = pytest.mark.skipif(
@@ -37,13 +39,16 @@ def _write_prepared(root, feature_count, raster_size):
     (root / "vectors").mkdir(parents=True)
     (root / "rasters").mkdir()
     ids = np.arange(feature_count, dtype="int64")
-    vectors = gpd.GeoDataFrame(
+    vectors = VectorTable.from_pydict(
         {"id": ids, "group": ids % 8},
-        geometry=[LineString([(value, 0), (value + 1, 1)]) for value in ids],
+        [LineString([(value, 0), (value + 1, 1)]) for value in ids],
         crs="EPSG:3857",
+        geometry_type="LineString",
     )
     for name in ("catchments", "segments"):
-        vectors.to_file(root / "vectors" / f"{name}.fgb", driver="FlatGeobuf")
+        write_vector_table(
+            vectors, root / "vectors" / f"{name}.fgb", driver="FlatGeobuf"
+        )
 
     working = root / "rasters" / "dem.working.tif"
     transform = from_origin(0, raster_size, 1, 1)
@@ -68,6 +73,38 @@ def _write_prepared(root, feature_count, raster_size):
             target.write_mask(np.full(shape, 255, dtype="uint8"), window=window)
     copy_raster(working, root / "rasters" / "dem.tif", driver="COG", BLOCKSIZE=512)
     working.unlink()
+    for name, dtype in (("mini_ownership", "int32"), ("drainage", "uint8")):
+        working = root / "rasters" / f"{name}.working.tif"
+        with rasterio.open(
+            working,
+            "w",
+            driver="GTiff",
+            width=raster_size,
+            height=raster_size,
+            count=1,
+            dtype=dtype,
+            crs="EPSG:3857",
+            transform=transform,
+            tiled=True,
+            blockxsize=512,
+            blockysize=512,
+        ) as target:
+            target.write(np.zeros((raster_size, raster_size), dtype=dtype), 1)
+            target.write_mask(np.full((raster_size, raster_size), 255, dtype="uint8"))
+        copy_raster(
+            working, root / "rasters" / f"{name}.tif", driver="COG", BLOCKSIZE=512
+        )
+        working.unlink()
+    pd.DataFrame(
+        {
+            "mini_label": [1],
+            "mini_id": [1],
+            "minx": [0.0],
+            "miny": [0.0],
+            "maxx": [1.0],
+            "maxy": [1.0],
+        }
+    ).to_parquet(root / "mini_index.parquet", index=False)
 
     raster_asset = {
         "path": "rasters/dem.tif",
@@ -76,7 +113,7 @@ def _write_prepared(root, feature_count, raster_size):
     }
     manifest = {
         "contract": "mgb-prepared-dataset",
-        "version": 3,
+        "version": 4,
         "grid": {
             "crs_wkt": CRS.from_epsg(3857).to_wkt(),
             "transform": list(transform)[:6],
@@ -87,7 +124,12 @@ def _write_prepared(root, feature_count, raster_size):
             "nodata": "internal-mask",
         },
         "sources": {"rasters": {}},
-        "assets": {"rasters": {"dem": raster_asset}},
+        "assets": {
+            "rasters": {"dem": raster_asset},
+            "mini_ownership": {"path": "rasters/mini_ownership.tif", "driver": "COG"},
+            "drainage": {"path": "rasters/drainage.tif", "driver": "COG"},
+            "mini_index": {"path": "mini_index.parquet"},
+        },
     }
     (root / "manifest.json").write_text(json.dumps(manifest))
 
@@ -97,9 +139,7 @@ def _measure_vector(root, result_queue):
     provider = inspect_vector_provider(root / "vectors/segments.fgb")
     count = sum(
         batch.num_rows
-        for batch in iter_provider_batches(
-            provider, columns=("group",), batch_size=128
-        )
+        for batch in iter_provider_batches(provider, columns=("group",), batch_size=128)
     )
     result_queue.put((count, time.perf_counter() - started))
 

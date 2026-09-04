@@ -3,10 +3,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
-import geopandas as gpd
-
 from mgb_vec_hydro.exceptions import UnsupportedOutputFormatError
-
+from mgb_vec_hydro.execution.vector import (
+    VectorTable,
+    read_vector_table,
+    write_vector_table,
+)
 
 SUPPORTED_OUTPUT_FORMATS = {
     "fgb": ("FlatGeobuf", ".fgb"),
@@ -32,10 +34,10 @@ class AggregationOutputPaths:
     mapping: Path
 
 
-def read_vector(path: str | Path) -> gpd.GeoDataFrame:
-    """Read a vector layer into a GeoDataFrame."""
+def read_vector(path: str | Path) -> VectorTable:
+    """Read a vector layer into an Arrow-native vector table."""
 
-    return gpd.read_file(Path(path))
+    return read_vector_table(Path(path))
 
 
 def output_paths(output_dir: str | Path, output_format: str) -> RoiOutputPaths:
@@ -79,12 +81,12 @@ def aggregation_output_paths(
 
 
 def write_vector(
-    gdf: gpd.GeoDataFrame,
+    vector: VectorTable,
     path: str | Path,
     *,
     output_format: str,
 ) -> Path:
-    """Write a GeoDataFrame using a supported vector driver."""
+    """Write an Arrow-native vector table using a supported vector driver."""
 
     output_format = output_format.lower()
     if output_format not in SUPPORTED_OUTPUT_FORMATS:
@@ -96,5 +98,5 @@ def write_vector(
     driver = SUPPORTED_OUTPUT_FORMATS[output_format][0]
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    gdf.to_file(path, driver=driver)
+    write_vector_table(vector, path, driver=driver)
     return path

@@ -1,9 +1,9 @@
-import geopandas as gpd
 import pytest
 from shapely.geometry import LineString, Polygon
 
 from mgb_vec_hydro.aggregation import INPUT_COLUMNS, aggregate_minibasins
 from mgb_vec_hydro.exceptions import InvalidInputSchemaError
+from mgb_vec_hydro.execution.vector import VectorTable
 
 
 def _input_fixture(
@@ -20,43 +20,42 @@ def _input_fixture(
     strahler_order = list(reversed(range(1, len(ids) + 1)))
     if water_course is None:
         water_course = ids
-    catchments = gpd.GeoDataFrame(
-        {
-            "id": list(ids),
-            "id_down": list(id_down),
-            "sub": list(sub),
-            "strahler_order": strahler_order,
-            "unit_length": list(unit_length),
-            "upstream_length": upstream_length,
-            "unit_area": unit_area,
-            "upstream_area": list(upstream_area),
-            "water_course": list(water_course),
-            "geometry": [
-                Polygon([(index, 0), (index + 1, 0), (index + 1, 1), (index, 1)])
-                for index, _ in enumerate(ids)
-            ],
-        },
+    common = {
+        "id": list(ids),
+        "id_down": list(id_down),
+        "sub": list(sub),
+        "strahler_order": strahler_order,
+        "unit_length": list(unit_length),
+        "upstream_length": upstream_length,
+        "unit_area": unit_area,
+        "upstream_area": list(upstream_area),
+        "water_course": list(water_course),
+    }
+    catchments = VectorTable.from_pydict(
+        common,
+        [
+            Polygon([(index, 0), (index + 1, 0), (index + 1, 1), (index, 1)])
+            for index, _ in enumerate(ids)
+        ],
         crs="EPSG:3857",
+        geometry_type="Polygon",
     )
-    segments = gpd.GeoDataFrame(
-        {
-            "id": list(ids),
-            "id_down": list(id_down),
-            "sub": list(sub),
-            "strahler_order": strahler_order,
-            "unit_length": list(unit_length),
-            "upstream_length": upstream_length,
-            "unit_area": unit_area,
-            "upstream_area": list(upstream_area),
-            "water_course": list(water_course),
-            "geometry": [
-                LineString([(index, 0), (index + 1, 0)])
-                for index, _ in enumerate(ids)
-            ],
-        },
+    segments = VectorTable.from_pydict(
+        common,
+        [LineString([(index, 0), (index + 1, 0)]) for index, _ in enumerate(ids)],
         crs="EPSG:3857",
+        geometry_type="LineString",
     )
     return catchments, segments
+
+
+def _with_attribute_table(vector, frame):
+    import pyarrow as pa
+
+    table = pa.Table.from_pandas(frame, preserve_index=False).append_column(
+        vector.geometry_column, vector.table[vector.geometry_column]
+    )
+    return VectorTable(table, vector.crs, vector.geometry_column, vector.geometry_type)
 
 
 def test_exact_input_schema_is_accepted():
@@ -69,30 +68,47 @@ def test_exact_input_schema_is_accepted():
         lmin=0,
     )
 
-    assert list(result.catchments.columns) == INPUT_COLUMNS
-    assert list(result.segments.columns) == INPUT_COLUMNS
+    assert list(result.catchments.to_pandas().columns) == INPUT_COLUMNS
+    assert list(result.segments.to_pandas().columns) == INPUT_COLUMNS
 
 
 @pytest.mark.parametrize(
     "mutate",
     [
-        lambda gdf: gdf.drop(columns=["upstream_area"]),
-        lambda gdf: gdf.drop(columns=["water_course"]),
-        lambda gdf: gdf.assign(extra=1),
-        lambda gdf: gdf[
-            [
-                "id_down",
-                "id",
-                "sub",
-                "strahler_order",
-                "unit_length",
-                "upstream_length",
-                "unit_area",
-                "water_course",
-                "upstream_area",
-                "geometry",
-            ]
-        ],
+        lambda vector: _with_attribute_table(
+            vector,
+            vector.to_pandas(decode_geometry=False).drop(
+                columns=["geometry", "upstream_area"]
+            ),
+        ),
+        lambda vector: _with_attribute_table(
+            vector,
+            vector.to_pandas(decode_geometry=False).drop(
+                columns=["geometry", "water_course"]
+            ),
+        ),
+        lambda vector: _with_attribute_table(
+            vector,
+            vector.to_pandas(decode_geometry=False)
+            .drop(columns="geometry")
+            .assign(extra=1),
+        ),
+        lambda vector: _with_attribute_table(
+            vector,
+            vector.to_pandas(decode_geometry=False).drop(columns="geometry")[
+                [
+                    "id_down",
+                    "id",
+                    "sub",
+                    "strahler_order",
+                    "unit_length",
+                    "upstream_length",
+                    "unit_area",
+                    "water_course",
+                    "upstream_area",
+                ]
+            ],
+        ),
     ],
 )
 def test_input_schema_rejects_missing_extra_or_reordered_columns(mutate):
@@ -114,9 +130,14 @@ def test_confluence_continuing_domain_uses_greatest_upstream_area():
 
     mapping = dict(zip(result.mapping["id"], result.mapping["mini_id"]))
     assert mapping[2] == 2
-    assert mapping[4] == 4
+    assert mapping[4] == 2
     assert mapping[3] == 3
-    water_course = dict(zip(result.segments["id"], result.segments["water_course"]))
+    water_course = dict(
+        zip(
+            result.segments.to_pandas()["id"],
+            result.segments.to_pandas()["water_course"],
+        )
+    )
     assert water_course[1] == 1
     assert water_course[3] == 3
 
@@ -129,7 +150,7 @@ def test_cocursodag_column_is_not_required():
     assert "cocursodag" not in segments.columns
 
 
-def test_short_chain_merges_into_smallest_unit_length_adjacent_group():
+def test_linear_chain_is_collapsed_before_lmin():
     catchments, segments = _input_fixture(
         ids=(1, 2, 3),
         id_down=(None, 1, 2),
@@ -147,8 +168,8 @@ def test_short_chain_merges_into_smallest_unit_length_adjacent_group():
     )
 
     mapping = dict(zip(result.mapping["id"], result.mapping["mini_id"]))
-    assert mapping[2] == 3
-    assert mapping[3] == 3
+    assert mapping == {1: 1, 2: 1, 3: 1}
+    assert result.segments.to_pandas()["unit_length"].iloc[0] == pytest.approx(5.5)
 
 
 def test_short_segments_do_not_merge_across_sub_or_water_course():
@@ -170,7 +191,7 @@ def test_short_segments_do_not_merge_across_sub_or_water_course():
 
     mapping = dict(zip(result.mapping["id"], result.mapping["mini_id"]))
     assert mapping[2] == 1
-    assert 2 not in set(result.segments["id"])
+    assert 2 not in set(result.segments.to_pandas()["id"])
     assert mapping[3] == 3
     assert mapping[4] == 4
 
@@ -193,13 +214,13 @@ def test_segments_below_uparea_min_are_merged_but_not_output_minis():
     )
 
     mapping = dict(zip(result.mapping["id"], result.mapping["mini_id"]))
-    assert 2 not in set(result.segments["id"])
-    assert mapping[2] == 3
-    assert result.segments.loc[result.segments["id"] == 3, "unit_length"].iloc[
-        0
-    ] == pytest.approx(4.0)
-    assert result.catchments["unit_area"].sum() == pytest.approx(
-        catchments["unit_area"].sum()
+    assert 2 not in set(result.segments.to_pandas()["id"])
+    assert mapping[2] == 1
+    assert result.segments.to_pandas().loc[
+        result.segments.to_pandas()["id"] == 1, "unit_length"
+    ].iloc[0] == pytest.approx(9.0)
+    assert result.catchments.to_pandas()["unit_area"].sum() == pytest.approx(
+        catchments.to_pandas()["unit_area"].sum()
     )
 
 
@@ -223,12 +244,12 @@ def test_segments_below_uparea_min_do_not_satisfy_lmin():
     mapping = dict(zip(result.mapping["id"], result.mapping["mini_id"]))
     assert mapping[2] == 1
     assert mapping[3] == 1
-    assert result.segments.loc[result.segments["id"] == 1, "unit_length"].iloc[
-        0
-    ] == pytest.approx(5.6)
+    assert result.segments.to_pandas().loc[
+        result.segments.to_pandas()["id"] == 1, "unit_length"
+    ].iloc[0] == pytest.approx(5.6)
 
 
-def test_excluded_segment_between_eligible_minis_maps_to_smallest_length_target():
+def test_filter_created_linear_link_is_collapsed_before_lmin():
     catchments, segments = _input_fixture(
         ids=(1, 2, 3),
         id_down=(None, 1, 2),
@@ -246,10 +267,27 @@ def test_excluded_segment_between_eligible_minis_maps_to_smallest_length_target(
     )
 
     mapping = dict(zip(result.mapping["id"], result.mapping["mini_id"]))
-    assert mapping[2] == 3
-    assert result.segments.loc[result.segments["id"] == 3, "unit_length"].iloc[
-        0
-    ] == pytest.approx(2.0)
+    assert mapping == {1: 1, 2: 1, 3: 1}
+    assert result.segments.to_pandas().loc[
+        result.segments.to_pandas()["id"] == 1, "unit_length"
+    ].iloc[0] == pytest.approx(7.0)
+
+
+def test_surviving_confluence_remains_a_chain_boundary():
+    catchments, segments = _input_fixture(
+        ids=(1, 2, 3, 4),
+        id_down=(None, 1, 1, 2),
+        unit_length=(2.0, 1.0, 3.0, 1.0),
+        upstream_area=(10.0, 7.0, 3.0, 2.0),
+        water_course=(1, 1, 1, 1),
+    )
+
+    result = aggregate_minibasins(catchments, segments, uparea_min=0, lmin=0)
+    mapping = dict(zip(result.mapping["id"], result.mapping["mini_id"]))
+
+    assert mapping[1] == 1
+    assert mapping[2] == mapping[4] == 2
+    assert mapping[3] == 3
 
 
 def test_excluded_segment_without_water_course_target_falls_back_to_same_sub():
@@ -271,7 +309,7 @@ def test_excluded_segment_without_water_course_target_falls_back_to_same_sub():
 
     mapping = dict(zip(result.mapping["id"], result.mapping["mini_id"]))
     assert mapping[2] == 1
-    assert set(result.segments["id"]) == {1}
+    assert set(result.segments.to_pandas()["id"]) == {1}
 
 
 def test_lmin_uses_evolving_aggregated_length_until_threshold_is_met():
@@ -294,9 +332,9 @@ def test_lmin_uses_evolving_aggregated_length_until_threshold_is_met():
     mapping = dict(zip(result.mapping["id"], result.mapping["mini_id"]))
     assert mapping[2] == 1
     assert mapping[3] == 1
-    assert result.segments.loc[result.segments["id"] == 1, "unit_length"].iloc[
-        0
-    ] == pytest.approx(5.8)
+    assert result.segments.to_pandas().loc[
+        result.segments.to_pandas()["id"] == 1, "unit_length"
+    ].iloc[0] == pytest.approx(5.8)
 
 
 def test_unmergeable_short_mini_is_filtered_and_catchment_is_preserved():
@@ -317,10 +355,10 @@ def test_unmergeable_short_mini_is_filtered_and_catchment_is_preserved():
     )
 
     mapping = dict(zip(result.mapping["id"], result.mapping["mini_id"]))
-    assert set(result.segments["id"]) == {1}
+    assert set(result.segments.to_pandas()["id"]) == {1}
     assert mapping[2] == 1
-    assert result.catchments["unit_area"].sum() == pytest.approx(
-        catchments["unit_area"].sum()
+    assert result.catchments.to_pandas()["unit_area"].sum() == pytest.approx(
+        catchments.to_pandas()["unit_area"].sum()
     )
 
 
@@ -341,9 +379,9 @@ def test_filtered_short_mini_length_does_not_contribute_to_surviving_reach():
         lmin=1.0,
     )
 
-    assert result.segments.loc[result.segments["id"] == 1, "unit_length"].iloc[
-        0
-    ] == pytest.approx(5.0)
+    assert result.segments.to_pandas().loc[
+        result.segments.to_pandas()["id"] == 1, "unit_length"
+    ].iloc[0] == pytest.approx(5.0)
 
 
 def test_all_unmergeable_short_minis_raise_missing_target_error():
@@ -380,6 +418,37 @@ def test_catchments_are_assigned_once():
 
     assert len(result.mapping) == len(catchments)
     assert result.mapping["id"].is_unique
-    assert result.catchments["unit_area"].sum() == pytest.approx(
-        catchments["unit_area"].sum()
+    assert result.catchments.to_pandas()["unit_area"].sum() == pytest.approx(
+        catchments.to_pandas()["unit_area"].sum()
     )
+
+
+def test_mapping_ids_match_output_ids_and_downstream_references():
+    catchments, segments = _input_fixture(
+        ids=(1, 2, 3, 4),
+        id_down=(None, 1, 1, 2),
+        water_course=(1, 1, 3, 1),
+        upstream_area=(10.0, 8.0, 6.0, 2.0),
+    )
+
+    result = aggregate_minibasins(catchments, segments, uparea_min=0, lmin=0)
+    output = result.segments.to_pandas()
+    output_ids = set(output["id"])
+
+    assert set(result.mapping["mini_id"]) == output_ids
+    assert set(output["id_down"].dropna()).issubset(output_ids)
+
+
+def test_null_geometry_is_rejected():
+    catchments, segments = _input_fixture(
+        ids=(1,), id_down=(None,), sub=(1,), unit_length=(1.0,), upstream_area=(1.0,)
+    )
+    invalid = VectorTable.from_pydict(
+        segments.table.drop([segments.geometry_column]).to_pydict(),
+        [None],
+        crs=segments.crs,
+        geometry_type="LineString",
+    )
+
+    with pytest.raises(InvalidInputSchemaError, match="missing or empty geometry"):
+        aggregate_minibasins(catchments, invalid, uparea_min=0, lmin=0)

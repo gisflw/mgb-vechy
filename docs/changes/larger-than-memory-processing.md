@@ -43,7 +43,7 @@ outputs.
   is no ownership buffer.
 - Vector and raster workflows use domain-specific work units rather than a
   universal rectangular chunk abstraction.
-- Vector aggregation is partitioned by water course.
+- Vector aggregation uses compact topology state and GDAL grouped geometry operations.
 - Terrain processing is partitioned by complete unit catchment.
 - Parallel execution is bounded by memory and I/O capacity.
 - Workers do not concurrently modify final output datasets.
@@ -121,8 +121,8 @@ Aggregation will be reorganized around water-course work units:
 
 - Group assignment and topology calculations will avoid repeated whole-table
   reconstruction and scanning.
-- Geometry aggregation will run on bounded partitions and may execute in
-  parallel.
+- Geometry aggregation will use Arrow-native staging and GDAL SQLite grouped
+  unions rather than eager GeoDataFrame dissolves.
 - Cross-water-course output relationships will be resolved deterministically
   after partition-local work.
 - Large intermediate GeoDataFrames will not be required.
@@ -221,7 +221,7 @@ scaling. Any intentional difference introduced by the new processing contract
 must be identified and accepted explicitly; it must not be hidden behind a
 fallback to the previous implementation.
 
-The BHAE gates are 791 source pairs, 267 minis, ROI at or below 26.2 seconds,
+The BHAE gates are 791 source pairs, 207 chain-first minis, ROI at or below 26.2 seconds,
 aggregation at or below 15.8 seconds and 374 MB peak RSS, and a warm-cache
 terrain target at or below 60 seconds. Defaults are 512 MB, 10,000-row scans,
 no more than four workers, and two I/O slots.
@@ -232,3 +232,20 @@ The change is complete when all downstream stages consume only the new prepared
 data and shared execution contracts, continental jobs remain within configured
 memory limits, and the obsolete eager and buffered processing paths have been
 removed from the codebase, tests, and documentation.
+
+## Arrow vector refactor validation
+
+The September 2026 local validation of the Arrow/GDAL refactor recorded:
+
+- Carinhanha in-memory aggregation: approximately 0.9 seconds for 791 sources,
+  compared with the pre-refactor 16.8-second baseline.
+- Complete Carinhanha aggregation read/dissolve/publication: approximately 1.1
+  seconds, producing 207 chain-first minis.
+- Synthetic 512-feature ROI: approximately 0.88 seconds total.
+- Synthetic aggregation: 0.026 seconds for 256 sources and 0.086 seconds for
+  1,024 sources.
+- ROI peak RSS: about 268 MB for 2,000 sources and 283 MB for 10,000 sources.
+
+These measurements are machine-specific. The opt-in benchmark suites retain the
+scaling and regression gates; the documented BHAE production gates remain the
+release criteria when those external inputs are available.

@@ -24,14 +24,17 @@ The independent `--catchments-source-crs` and `--segments-source-crs` options
 replace missing or incorrect provider metadata. There is no target-CRS option.
 Column matching is case-insensitive.
 
-Topology attributes are streamed without geometry in batches of 10,000.
+Topology attributes are streamed without geometry in Arrow batches of 10,000.
 Null, non-finite, and below-one Strahler rows are removed before traversal;
 selected values must then be integral. Null downstream IDs are sinks. An outlet may
 drain outside the ROI, while every other selected segment must connect toward
 a selected outlet. Duplicate IDs, cycles, missing source pairs, and invalid
 polygon/line geometries are rejected.
 
-Only selected geometry is decoded and reprojected. The output columns are:
+Only selected geometry is decoded. Selected FIDs are processed in bounded worker
+packets, validated and reprojected with Shapely/PyProj, checkpointed as Arrow IPC,
+and written directly through Pyogrio. Each source geometry is read and transformed
+once. The output columns are:
 
 `id`, `id_down`, `sub`, `strahler_order`, `unit_length`, `upstream_length`,
 `unit_area`, `upstream_area`, `water_course`, `geometry`.

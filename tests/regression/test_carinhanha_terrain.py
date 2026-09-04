@@ -2,7 +2,6 @@ import math
 from pathlib import Path
 
 from affine import Affine
-import geopandas as gpd
 import numpy as np
 import rasterio
 from rasterio.features import rasterize
@@ -13,7 +12,7 @@ from mgb_vec_hydro.terrain import (
     compute_hand,
     compute_ltnd,
 )
-
+from mgb_vec_hydro.execution.vector import read_vector_table
 
 FIXTURE = Path(__file__).parents[1] / "carinhanha"
 
@@ -21,8 +20,12 @@ FIXTURE = Path(__file__).parents[1] / "carinhanha"
 def test_terrain_routing_matches_reference_statistics_on_representative_catchment():
     """Protect broad terrain behavior without requiring pixel-identical routing."""
 
-    catchments = gpd.read_file(FIXTURE / "expected" / "mareas.shp")
-    segments = gpd.read_file(FIXTURE / "expected" / "mtrecs.shp").set_index("cotrecho")
+    catchments = read_vector_table(FIXTURE / "expected" / "mareas.shp").to_pandas()
+    segments = (
+        read_vector_table(FIXTURE / "expected" / "mtrecs.shp")
+        .to_pandas()
+        .set_index("cotrecho")
+    )
     catchment = catchments.loc[catchments["cotrecho"] == 921256].iloc[0]
 
     with (
@@ -81,5 +84,10 @@ def test_terrain_routing_matches_reference_statistics_on_representative_catchmen
     assert np.mean(np.abs(hand[compared] - reference_hand[compared])) < 5
     assert np.corrcoef(ltnd_km[compared], reference_ltnd[compared])[0, 1] > 0.9
     assert np.mean(np.abs(ltnd_km[compared] - reference_ltnd[compared])) < 0.5
-    assert abs(np.count_nonzero(hand[compared] < 0)
-               - np.count_nonzero(reference_hand[compared] < 0)) < 15
+    assert (
+        abs(
+            np.count_nonzero(hand[compared] < 0)
+            - np.count_nonzero(reference_hand[compared] < 0)
+        )
+        < 15
+    )

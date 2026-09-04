@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import math
 
-import geopandas as gpd
+import pyarrow as pa
 from pyproj import CRS
 import rasterio
 from rasterio.enums import Resampling
@@ -13,7 +13,9 @@ from rasterio.vrt import WarpedVRT
 from rasterio.warp import calculate_default_transform
 
 from mgb_vec_hydro.exceptions import MgbVecHydroError
-
+from mgb_vec_hydro.execution.vector import VectorTable
+import shapely
+from pyproj import Transformer
 
 DEFAULT_CRS = "EPSG:6933"
 
@@ -49,19 +51,33 @@ def parse_crs(value: str | CRS) -> CRS:
 
 
 def transform_vector(
-    frame: gpd.GeoDataFrame,
+    frame: VectorTable,
     target_crs: str | CRS = DEFAULT_CRS,
     *,
     name: str = "vector",
     source_crs: str | CRS | None = None,
-) -> gpd.GeoDataFrame:
-    """Validate CRS metadata and return a frame expressed in target CRS."""
+) -> VectorTable:
+    """Validate CRS metadata and return an Arrow vector in the target CRS."""
     target = parse_metric_crs(target_crs)
     if source_crs is not None:
-        frame = frame.set_crs(source_crs, allow_override=True)
-    elif frame.crs is None:
-        raise CrsError(f"{name} has no CRS")
-    return frame.to_crs(target)
+        source = parse_crs(source_crs)
+    else:
+        source = frame.crs
+    if source == target:
+        return VectorTable(
+            frame.table, target, frame.geometry_column, frame.geometry_type
+        )
+    try:
+        transformer = Transformer.from_crs(source, target, always_xy=True)
+        geometries = shapely.transform(
+            frame.geometries(), transformer.transform, interleaved=False
+        )
+        wkb = pa.array(shapely.to_wkb(geometries), type=pa.binary())
+        index = frame.table.schema.get_field_index(frame.geometry_column)
+        table = frame.table.set_column(index, frame.geometry_column, wkb)
+        return VectorTable(table, target, frame.geometry_column, frame.geometry_type)
+    except Exception as exc:
+        raise CrsError(f"Cannot transform {name} to the target CRS") from exc
 
 
 @dataclass(frozen=True)
@@ -107,7 +123,9 @@ def warped_vrt(
     )
 
 
-def require_aligned_sources(first, second, first_name="HAND", second_name="LTND") -> None:
+def require_aligned_sources(
+    first, second, first_name="HAND", second_name="LTND"
+) -> None:
     """Require two source rasters to share one grid before virtual transformation."""
     if first.crs is None or second.crs is None:
         missing = first_name if first.crs is None else second_name

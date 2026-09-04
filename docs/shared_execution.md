@@ -62,10 +62,11 @@ safely quoted provider predicates when practical; otherwise one geometry-free
 ID/FID scan is followed by bounded random-FID reads. Exact IDs, duplicates,
 geometry types, and packet estimates are checked before results are admitted.
 
-Versioned ROI assets are indexed FlatGeobuf. Aggregation partitions them by
-`water_course`; multiple complete courses may share a task when their combined
-estimate remains within the configured budget. Ordered reduction and central
-topology resolution keep serial and parallel output deterministic.
+Versioned ROI assets are indexed FlatGeobuf. Vector packets use Arrow-native WKB
+with explicit CRS metadata; checkpoint artifacts use Arrow IPC. Ordered
+reduction and central topology resolution keep output deterministic, and GDAL's
+SQLite engine performs the final grouped geometry union without GeoDataFrame
+materialization.
 
 ## Prepared raster access
 
