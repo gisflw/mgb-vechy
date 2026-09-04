@@ -37,3 +37,6 @@ the private staging directory is atomically renamed into place.
 
 Defaults are 512 MB of execution memory. Existing output directories are
 rejected and private staging data is removed after errors or cancellation.
+On successful completion, the command also prints runtime timings for grid/domain
+setup, raster preparation, domain rasterization, validation/publication, and total
+time.

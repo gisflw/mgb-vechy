@@ -9,6 +9,7 @@ import os
 import re
 import shutil
 import tempfile
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
@@ -63,6 +64,7 @@ class PreparationReport:
     output_dir: Path
     manifest: Path
     raster_count: int
+    timings: dict[str, float]
 
 
 @dataclass(frozen=True)
@@ -228,6 +230,7 @@ def _aggregation_inputs(root: Path) -> tuple[Path, Path, Path, CRS]:
 
 def prepare_dataset(spec: PreparationSpec) -> PreparationReport:
     """Create and atomically publish one prepared dataset."""
+    overall_started = time.perf_counter()
     _validate_spec(spec)
     output = Path(spec.output_dir)
     if output.exists():
@@ -236,6 +239,7 @@ def prepare_dataset(spec: PreparationSpec) -> PreparationReport:
     staging = Path(tempfile.mkdtemp(prefix=f".{output.name}.tmp-", dir=output.parent))
     try:
         (staging / "rasters").mkdir()
+        phase_started = time.perf_counter()
         roi_root, mini_catchments, mini_segments, target_crs = _aggregation_inputs(Path(spec.minis))
         roi_manifest = json.loads((roi_root / "manifest.json").read_text(encoding="utf-8"))
         if CRS.from_wkt(roi_manifest["crs_wkt"]) != target_crs:
@@ -254,7 +258,9 @@ def prepare_dataset(spec: PreparationSpec) -> PreparationReport:
                 raise PreparedDataError("DEM does not cover the buffered ROI domain")
             grid = GridSpec(target_crs, rasterio.windows.transform(window, dem.transform), int(window.width), int(window.height))
             mask = rasterize([(buffered_domain, 1)], out_shape=(grid.height, grid.width), transform=grid.transform, fill=0, dtype="uint8").astype(bool)
+        grid_domain_seconds = time.perf_counter() - phase_started
 
+        phase_started = time.perf_counter()
         raster_assets: dict[str, dict[str, Any]] = {}
         dem_path = staging / "rasters" / "dem.tif"
         _prepare_clipped_raster(spec.dem, dem_path, grid, window, mask, "continuous")
@@ -269,8 +275,12 @@ def prepare_dataset(spec: PreparationSpec) -> PreparationReport:
             raster_assets["d8"] = _raster_asset(
                 target, staging, "d8", encoding="canonical-clockwise"
             )
+        raster_preparation_seconds = time.perf_counter() - phase_started
 
+        phase_started = time.perf_counter()
         domain_assets, mini_index = _prepare_domain_rasters(staging, grid, mini_catchments, mini_segments)
+        domain_rasterization_seconds = time.perf_counter() - phase_started
+        phase_started = time.perf_counter()
         manifest = {
             "contract": CONTRACT,
             "version": CONTRACT_VERSION,
@@ -294,6 +304,7 @@ def prepare_dataset(spec: PreparationSpec) -> PreparationReport:
         )
         PreparedDataset(staging, manifest).validate()
         os.replace(staging, output)
+        validation_publication_seconds = time.perf_counter() - phase_started
     except BaseException:
         shutil.rmtree(staging, ignore_errors=True)
         raise
@@ -302,6 +313,13 @@ def prepare_dataset(spec: PreparationSpec) -> PreparationReport:
         output_dir=output,
         manifest=output / "manifest.json",
         raster_count=len(raster_assets),
+        timings={
+            "grid_domain_setup": grid_domain_seconds,
+            "raster_preparation": raster_preparation_seconds,
+            "domain_rasterization": domain_rasterization_seconds,
+            "validation_publication": validation_publication_seconds,
+            "total": time.perf_counter() - overall_started,
+        },
     )
 
 

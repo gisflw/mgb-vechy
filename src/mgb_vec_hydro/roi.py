@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import time
 from collections import defaultdict
 from collections.abc import Hashable, Iterable
 from dataclasses import dataclass
@@ -75,6 +76,7 @@ class RoiReport:
     manifest: Path
     catchment_count: int
     segment_count: int
+    timings: dict[str, float]
 
 
 class RoiDataset:
@@ -144,9 +146,11 @@ class _Provider:
 
 def define_roi_dataset(spec: RoiSpec) -> RoiReport:
     """Select from raw providers and atomically publish a normalized ROI."""
+    overall_started = time.perf_counter()
     _validate_spec(spec)
     target_crs = parse_crs(spec.crs)
     checkpoint = _roi_checkpoint(spec, target_crs)
+    phase_started = time.perf_counter()
     segment_provider = _provider(
         spec.segments, spec.segments_layer, spec.segments_source_crs,
         {"id": spec.id_col, "id_down": spec.id_down_col,
@@ -161,8 +165,10 @@ def define_roi_dataset(spec: RoiSpec) -> RoiReport:
     selected_ids, sub_by_id = _select_topology(topology, outlet_ids)
     selected = topology.loc[topology["id"].isin(selected_ids)].copy()
     _validate_selected_attributes(selected)
+    provider_topology_seconds = time.perf_counter() - phase_started
 
     memory_bytes = spec.memory_limit_mb * 1024 * 1024
+    phase_started = time.perf_counter()
     metrics = _compute_selected_metrics(
         selected_ids, segment_provider, catchment_provider, segment_fids,
         batch_size=spec.batch_size, memory_bytes=memory_bytes,
@@ -172,9 +178,10 @@ def define_roi_dataset(spec: RoiSpec) -> RoiReport:
         selected, sub_by_id, metrics, upstream_length, upstream_area,
     )
     water_course = _water_course_by_segment(metric_attributes)
-
+    metrics_seconds = time.perf_counter() - phase_started
     output = Path(spec.output_dir)
     publisher = AtomicOutputDirectory(output)
+    phase_started = time.perf_counter()
     with publisher as staging:
         vectors = staging / "vectors"
         vectors.mkdir()
@@ -203,11 +210,21 @@ def define_roi_dataset(spec: RoiSpec) -> RoiReport:
         publisher.publish((
             "manifest.json", "vectors/roi_catchments.fgb", "vectors/roi_segments.fgb"
         ))
+    output_publication_seconds = time.perf_counter() - phase_started
 
     if checkpoint is not None:
         checkpoint.cleanup()
     return RoiReport(
-        output, output / "manifest.json", len(selected_ids), len(selected_ids)
+        output,
+        output / "manifest.json",
+        len(selected_ids),
+        len(selected_ids),
+        {
+            "provider_topology": provider_topology_seconds,
+            "metrics": metrics_seconds,
+            "output_publication": output_publication_seconds,
+            "total": time.perf_counter() - overall_started,
+        },
     )
 
 

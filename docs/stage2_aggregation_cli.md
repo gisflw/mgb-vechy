@@ -35,3 +35,5 @@ to EPSG:4326.
 Execution defaults are 512 MB, four workers, two I/O operations, and 10,000-row
 batches. Optional checkpoints survive failures/cancellation and are removed
 only after successful validation and publication.
+On successful completion, the command also prints runtime timings for ROI input
+loading, mini-basin aggregation, output publication, and total time.

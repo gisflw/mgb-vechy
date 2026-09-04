@@ -5,6 +5,7 @@ from collections.abc import Hashable
 from dataclasses import dataclass
 from pathlib import Path
 import json
+import time
 
 import geopandas as gpd
 import pandas as pd
@@ -69,6 +70,7 @@ class AggregationReport:
     catchment_count: int
     segment_count: int
     mapping_count: int
+    timings: dict[str, float]
 
 
 def aggregate_minibasins(
@@ -211,12 +213,14 @@ def aggregate_minibasins(
 
 def aggregate_roi_dataset(spec: AggregationSpec) -> AggregationReport:
     """Aggregate one versioned ROI and atomically publish fixed Stage 2 assets."""
+    overall_started = time.perf_counter()
     if spec.workers <= 0 or spec.workers > 4:
         raise InvalidInputSchemaError("workers must be between one and four")
     if spec.memory_limit_mb <= 0 or spec.io_slots <= 0 or spec.batch_size <= 0:
         raise InvalidInputSchemaError("execution limits must be positive")
     if spec.uparea_min < 0 or spec.lmin < 0:
         raise InvalidInputSchemaError("uparea-min and lmin must be non-negative")
+    phase_started = time.perf_counter()
     dataset = RoiDataset.open(spec.roi)
     dataset.validate()
     checkpoint = None
@@ -241,11 +245,15 @@ def aggregate_roi_dataset(spec: AggregationSpec) -> AggregationReport:
         or CRS.from_user_input(segments.crs) != expected_crs
     ):
         raise InvalidInputSchemaError("ROI assets do not use the manifest CRS")
+    roi_input_seconds = time.perf_counter() - phase_started
+    phase_started = time.perf_counter()
     result = aggregate_minibasins(
         catchments, segments, uparea_min=spec.uparea_min, lmin=spec.lmin
     )
     output = Path(spec.output_dir)
     publisher = AtomicOutputDirectory(output)
+    aggregation_seconds = time.perf_counter() - phase_started
+    phase_started = time.perf_counter()
     with publisher as staging:
         catchment_path = staging / "mini_catchments.fgb"
         segment_path = staging / "mini_segments.fgb"
@@ -281,10 +289,21 @@ def aggregate_roi_dataset(spec: AggregationSpec) -> AggregationReport:
         publisher.publish(
             ("manifest.json", "mini_catchments.fgb", "mini_segments.fgb", "source_to_mini.csv")
         )
+    output_publication_seconds = time.perf_counter() - phase_started
     if checkpoint is not None:
         checkpoint.cleanup()
     return AggregationReport(
-        output, output / "manifest.json", len(result.catchments), len(result.segments), len(result.mapping)
+        output,
+        output / "manifest.json",
+        len(result.catchments),
+        len(result.segments),
+        len(result.mapping),
+        {
+            "roi_input": roi_input_seconds,
+            "aggregation": aggregation_seconds,
+            "output_publication": output_publication_seconds,
+            "total": time.perf_counter() - overall_started,
+        },
     )
 
 

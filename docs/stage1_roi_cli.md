@@ -53,3 +53,6 @@ roi/
 
 Published vectors are spatially indexed FlatGeobuf. Execution defaults are
 512 MB, four workers, two concurrent I/O operations, and 10,000-row scans.
+On successful completion, the command also prints runtime timings for
+provider/topology loading, metric calculation, output publication, and total
+time.

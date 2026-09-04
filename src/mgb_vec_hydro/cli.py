@@ -24,6 +24,15 @@ _NAMED_RASTER = click.Tuple(
 )
 
 
+def _echo_timings(timings: dict[str, float]) -> None:
+    click.echo(
+        "Timing: "
+        + ", ".join(
+            f"{name} {seconds:.3f}s" for name, seconds in timings.items()
+        )
+    )
+
+
 @main.command("prepare")
 @click.option(
     "--dem",
@@ -94,6 +103,7 @@ def prepare_command(
         raise click.ClickException(str(exc)) from exc
     click.echo(f"Wrote {report.manifest}")
     click.echo(f"Prepared {report.raster_count} raster(s)")
+    _echo_timings(report.timings)
 
 
 @main.command("define-roi")
@@ -182,6 +192,7 @@ def define_roi_command(
 
     click.echo(f"Wrote {report.manifest}")
     click.echo(f"Selected {report.segment_count} source pairs")
+    _echo_timings(report.timings)
 
 
 @main.command("aggregate")
@@ -241,6 +252,7 @@ def aggregate_command(
     click.echo(f"Wrote {report.output_dir / 'mini_catchments.fgb'}")
     click.echo(f"Wrote {report.output_dir / 'mini_segments.fgb'}")
     click.echo(f"Wrote {report.output_dir / 'source_to_mini.csv'}")
+    _echo_timings(report.timings)
 
 
 @main.command("terrain-products")
