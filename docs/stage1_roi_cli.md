@@ -1,8 +1,9 @@
 # Stage 1: define ROI
 
 `mgb-vec-hydro define-roi` reads raw GeoPackage or FlatGeobuf providers and
-selects topology upstream of one or more outlets. It defines the working CRS;
-the DEM is validated against that CRS later by `prepare`.
+selects topology upstream of one or more outlets. It defines the output CRS;
+the CRS may be geographic or projected. The DEM is validated against that CRS
+later by `prepare`.
 
 ```bash
 mgb-vec-hydro define-roi \
@@ -13,9 +14,6 @@ mgb-vec-hydro define-roi \
   --id-col cotrecho \
   --id-down-col nutrjus \
   --strahler-order-col nustrahler \
-  --upstream-area-col nuareamont \
-  --unit-length-col nucomptrec \
-  --unit-area-col nuareacont \
   --output-dir roi
 ```
 
@@ -26,8 +24,7 @@ Column matching is case-insensitive.
 
 Topology attributes are streamed without geometry in batches of 10,000.
 Null, non-finite, and below-one Strahler rows are removed before traversal;
-selected values must then be integral. Selected provider upstream-area values
-must be finite and non-negative. Null downstream IDs are sinks. An outlet may
+selected values must then be integral. Null downstream IDs are sinks. An outlet may
 drain outside the ROI, while every other selected segment must connect toward
 a selected outlet. Duplicate IDs, cycles, missing source pairs, and invalid
 polygon/line geometries are rejected.
@@ -37,10 +34,10 @@ Only selected geometry is decoded and reprojected. The output columns are:
 `id`, `id_down`, `sub`, `strahler_order`, `unit_length`, `upstream_length`,
 `unit_area`, `upstream_area`, `water_course`, `geometry`.
 
-`unit_length` is required from the segments provider in km and `unit_area` is
-required from the catchments provider in km². Both must be finite and
-non-negative. `upstream_length` is derived from topology by summing supplied
-unit lengths; `upstream_area` is copied from the required provider column.
+`unit_length` is computed from segment geometry using the source CRS ellipsoid
+and geodesic calculations, in km. `unit_area` is computed similarly from
+catchment geometry, in km². `upstream_length` and `upstream_area` are derived
+from topology by summing the selected unit metrics.
 Repeated outlets are ordered downstream to upstream; later overlapping outlet
 domains overwrite `sub` assignments.
 

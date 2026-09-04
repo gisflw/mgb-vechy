@@ -55,7 +55,7 @@ outputs.
 
 ### 1. ROI and post-aggregation prepared data
 
-ROI selects vectors and defines the working projected CRS. After aggregation,
+ROI selects vectors and defines the working CRS. After aggregation,
 preparation converts the already-aligned source rasters and aggregated mini
 domain into the canonical inputs consumed by terrain.
 
@@ -69,8 +69,8 @@ The prepared dataset establishes:
 
 Vector inspection, schema mapping, Strahler filtering, topology selection, and
 selected-geometry reprojection belong to Stage 1. Unit lengths and areas are
-provider fields in km and km²; only upstream length is derived. COG is the
-prepared raster interface.
+derived geodesically from selected source geometries in km and km²; both
+upstream metrics are topology reductions. COG is the prepared raster interface.
 
 ### 2. Shared vector and raster execution layers
 

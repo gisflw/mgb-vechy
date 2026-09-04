@@ -97,7 +97,7 @@ def prepare_command(
 
 
 @main.command("define-roi")
-@click.option("--crs", required=True, help="Working projected CRS with metre units.")
+@click.option("--crs", required=True, help="Output CRS; geographic and projected CRSs are supported.")
 @click.option(
     "--catchments",
     "catchments_path",
@@ -118,9 +118,6 @@ def prepare_command(
 @click.option("--id-col", required=True)
 @click.option("--id-down-col", required=True)
 @click.option("--strahler-order-col", required=True)
-@click.option("--upstream-area-col", required=True)
-@click.option("--unit-length-col", required=True, help="Segment length column in km.")
-@click.option("--unit-area-col", required=True, help="Catchment area column in km².")
 @click.option(
     "--output-dir",
     type=click.Path(file_okay=False, path_type=Path),
@@ -149,9 +146,6 @@ def define_roi_command(
     id_col: str,
     id_down_col: str,
     strahler_order_col: str,
-    upstream_area_col: str,
-    unit_length_col: str,
-    unit_area_col: str,
     output_dir: Path,
     workers: int,
     memory_limit_mb: int,
@@ -175,9 +169,6 @@ def define_roi_command(
                 id_col=id_col,
                 id_down_col=id_down_col,
                 strahler_order_col=strahler_order_col,
-                upstream_area_col=upstream_area_col,
-                unit_length_col=unit_length_col,
-                unit_area_col=unit_area_col,
                 output_dir=output_dir,
                 workers=workers,
                 memory_limit_mb=memory_limit_mb,

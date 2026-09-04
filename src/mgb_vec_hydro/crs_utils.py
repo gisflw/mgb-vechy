@@ -40,6 +40,14 @@ def parse_metric_crs(value: str | CRS = DEFAULT_CRS) -> CRS:
     return crs
 
 
+def parse_crs(value: str | CRS) -> CRS:
+    """Parse any valid CRS without imposing projected metric units."""
+    try:
+        return CRS.from_user_input(value)
+    except Exception as exc:
+        raise CrsError(f"Invalid target CRS: {value!r}") from exc
+
+
 def transform_vector(
     frame: gpd.GeoDataFrame,
     target_crs: str | CRS = DEFAULT_CRS,

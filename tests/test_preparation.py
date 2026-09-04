@@ -39,7 +39,7 @@ def _spec(tmp_path):
     segments = gpd.GeoDataFrame({"id": [1], "down": [None], "order": [1], "up": [1.0], "length": [1.0]}, geometry=[LineString([(0, 10), (20, 10)])], crs="EPSG:3857")
     catchments.to_file(tmp_path / "catchments.fgb", driver="FlatGeobuf")
     segments.to_file(tmp_path / "segments.fgb", driver="FlatGeobuf")
-    define_roi_dataset(RoiSpec(crs="EPSG:3857", catchments=tmp_path / "catchments.fgb", segments=tmp_path / "segments.fgb", outlet_ids=("1",), id_col="id", id_down_col="down", strahler_order_col="order", upstream_area_col="up", unit_length_col="length", unit_area_col="area", output_dir=tmp_path / "roi", workers=1))
+    define_roi_dataset(RoiSpec(crs="EPSG:3857", catchments=tmp_path / "catchments.fgb", segments=tmp_path / "segments.fgb", outlet_ids=("1",), id_col="id", id_down_col="down", strahler_order_col="order", output_dir=tmp_path / "roi", workers=1))
     aggregate_roi_dataset(AggregationSpec(roi=tmp_path / "roi", uparea_min=0, lmin=0, output_dir=tmp_path / "minis", workers=1))
     return PreparationSpec(
         dem=dem, minis=tmp_path / "minis",

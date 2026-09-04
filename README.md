@@ -52,9 +52,6 @@ mgb-vec-hydro define-roi \
   --id-col id \
   --id-down-col id_down \
   --strahler-order-col strahler_order \
-  --upstream-area-col upstream_area \
-  --unit-length-col unit_length_km \
-  --unit-area-col unit_area_km2 \
   --output-dir output/roi
 ```
 

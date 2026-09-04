@@ -16,11 +16,10 @@ def test_stage_command_contracts():
         "--segments-layer",
         "--catchments-source-crs",
         "--segments-source-crs",
-        "--upstream-area-col",
-        "--unit-length-col",
-        "--unit-area-col",
     ):
         assert option in roi.output
+    for option in ("--upstream-area-col", "--unit-length-col", "--unit-area-col"):
+        assert option not in roi.output
     assert "--prepared" not in roi.output and "--output-format" not in roi.output
     assert "--roi" in aggregate.output
     assert "--roi-catchments" not in aggregate.output

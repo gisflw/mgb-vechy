@@ -6,6 +6,7 @@ import json
 from collections import defaultdict
 from collections.abc import Hashable, Iterable
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -15,7 +16,8 @@ import pandas as pd
 import pyarrow as pa
 import pyarrow.compute as pc
 import pyogrio
-from pyproj import CRS
+from pyproj import CRS, Geod, Transformer
+from shapely.ops import transform as shapely_transform
 
 from mgb_vec_hydro.exceptions import (
     DuplicateSegmentIdError,
@@ -35,11 +37,11 @@ from mgb_vec_hydro.execution.vector import (
     id_predicate,
     inspect_vector_provider,
 )
-from mgb_vec_hydro.crs_utils import parse_metric_crs
+from mgb_vec_hydro.crs_utils import parse_crs
 
 DEFAULT_STRAHLER_ORDER_COL = "strahler_order"
 ROI_CONTRACT = "mgb-roi-dataset"
-ROI_CONTRACT_VERSION = 1
+ROI_CONTRACT_VERSION = 2
 ROI_COLUMNS = [
     "id", "id_down", "sub", "strahler_order", "unit_length",
     "upstream_length", "unit_area", "upstream_area", "water_course", "geometry",
@@ -55,9 +57,6 @@ class RoiSpec:
     id_col: str
     id_down_col: str
     strahler_order_col: str
-    upstream_area_col: str
-    unit_length_col: str
-    unit_area_col: str
     output_dir: Path
     catchments_layer: str | None = None
     segments_layer: str | None = None
@@ -76,12 +75,6 @@ class RoiReport:
     manifest: Path
     catchment_count: int
     segment_count: int
-
-
-@dataclass(frozen=True)
-class RoiResult:
-    catchments: gpd.GeoDataFrame
-    segments: gpd.GeoDataFrame
 
 
 class RoiDataset:
@@ -152,18 +145,16 @@ class _Provider:
 def define_roi_dataset(spec: RoiSpec) -> RoiReport:
     """Select from raw providers and atomically publish a normalized ROI."""
     _validate_spec(spec)
-    target_crs = parse_metric_crs(spec.crs)
+    target_crs = parse_crs(spec.crs)
     checkpoint = _roi_checkpoint(spec, target_crs)
     segment_provider = _provider(
         spec.segments, spec.segments_layer, spec.segments_source_crs,
         {"id": spec.id_col, "id_down": spec.id_down_col,
-         "strahler_order": spec.strahler_order_col,
-         "upstream_area": spec.upstream_area_col,
-         "unit_length": spec.unit_length_col}, "segments",
+         "strahler_order": spec.strahler_order_col}, "segments",
     )
     catchment_provider = _provider(
         spec.catchments, spec.catchments_layer, spec.catchments_source_crs,
-        {"id": spec.id_col, "unit_area": spec.unit_area_col}, "catchments",
+        {"id": spec.id_col}, "catchments",
     )
     topology, segment_fids = _read_topology(segment_provider, spec.batch_size)
     outlet_ids = _coerce_outlets(spec.outlet_ids, topology["id"])
@@ -172,19 +163,15 @@ def define_roi_dataset(spec: RoiSpec) -> RoiReport:
     _validate_selected_attributes(selected)
 
     memory_bytes = spec.memory_limit_mb * 1024 * 1024
-    segment_geometry = _read_selected(
-        segment_provider, selected_ids, batch_size=spec.batch_size,
-        memory_bytes=memory_bytes, known_fids=segment_fids,
+    metrics = _compute_selected_metrics(
+        selected_ids, segment_provider, catchment_provider, segment_fids,
+        batch_size=spec.batch_size, memory_bytes=memory_bytes,
     )
-    catchment_geometry = _read_selected(
-        catchment_provider, selected_ids, batch_size=spec.batch_size,
-        memory_bytes=memory_bytes,
+    upstream_length, upstream_area = _upstream_metrics(selected, metrics)
+    metric_attributes = _metric_attributes(
+        selected, sub_by_id, metrics, upstream_length, upstream_area,
     )
-    segment_geometry = segment_geometry.set_crs(segment_provider.crs, allow_override=True)
-    catchment_geometry = catchment_geometry.set_crs(catchment_provider.crs, allow_override=True)
-    result = _normalize_selected(
-        selected, segment_geometry, catchment_geometry, sub_by_id, target_crs,
-    )
+    water_course = _water_course_by_segment(metric_attributes)
 
     output = Path(spec.output_dir)
     publisher = AtomicOutputDirectory(output)
@@ -193,15 +180,19 @@ def define_roi_dataset(spec: RoiSpec) -> RoiReport:
         vectors.mkdir()
         catchments_path = vectors / "roi_catchments.fgb"
         segments_path = vectors / "roi_segments.fgb"
-        _write_fgb(result.catchments, catchments_path)
-        _write_fgb(result.segments, segments_path)
+        _write_selected_outputs(
+            selected, sub_by_id, metrics, upstream_length, upstream_area,
+            water_course, segment_provider, catchment_provider, segment_fids,
+            target_crs, batch_size=spec.batch_size, memory_bytes=memory_bytes,
+            catchments_path=catchments_path, segments_path=segments_path,
+        )
         manifest = {
             "contract": ROI_CONTRACT,
             "version": ROI_CONTRACT_VERSION,
             "crs_wkt": target_crs.to_wkt(version="WKT2_2019", pretty=False),
             "assets": {
-                "catchments": _asset(catchments_path, staging, len(result.catchments)),
-                "segments": _asset(segments_path, staging, len(result.segments)),
+                "catchments": _asset(catchments_path, staging, len(selected_ids)),
+                "segments": _asset(segments_path, staging, len(selected_ids)),
             },
         }
         manifest_path = staging / "manifest.json"
@@ -216,7 +207,7 @@ def define_roi_dataset(spec: RoiSpec) -> RoiReport:
     if checkpoint is not None:
         checkpoint.cleanup()
     return RoiReport(
-        output, output / "manifest.json", len(result.catchments), len(result.segments)
+        output, output / "manifest.json", len(selected_ids), len(selected_ids)
     )
 
 
@@ -238,7 +229,7 @@ def _roi_checkpoint(
         parameters={
             "sources": sources,
             "outlets": list(spec.outlet_ids),
-            "columns": [spec.id_col, spec.id_down_col, spec.strahler_order_col, spec.upstream_area_col, spec.unit_length_col, spec.unit_area_col],
+            "columns": [spec.id_col, spec.id_down_col, spec.strahler_order_col],
             "layers": [spec.catchments_layer, spec.segments_layer],
             "source_crs": [spec.catchments_source_crs, spec.segments_source_crs],
         },
@@ -263,7 +254,7 @@ def _validate_spec(spec: RoiSpec) -> None:
             raise InvalidInputSchemaError(f"{name} must be a positive integer")
     if spec.workers > 4:
         raise InvalidInputSchemaError("workers cannot exceed four")
-    parse_metric_crs(spec.crs)
+    parse_crs(spec.crs)
 
 
 def _provider(path: Path, layer: str | None, override: str | None, requested: dict[str, str], label: str) -> _Provider:
@@ -333,7 +324,7 @@ def _read_topology(provider: _Provider, batch_size: int) -> tuple[pd.DataFrame, 
         )
     fids = dict(zip(frame["id"], frame[fid_column], strict=True))
     return (
-        frame[["id", "id_down", "strahler_order", "upstream_area", "unit_length"]].reset_index(drop=True),
+        frame[["id", "id_down", "strahler_order"]].reset_index(drop=True),
         fids,
     )
 
@@ -424,26 +415,16 @@ def _validate_selected_attributes(frame: pd.DataFrame) -> None:
         raise InvalidInputSchemaError(
             "Selected Strahler orders must be finite integral values"
         )
-    area = pd.to_numeric(frame["upstream_area"], errors="coerce").to_numpy(dtype=float)
-    if not np.all(np.isfinite(area)) or np.any(area < 0):
-        raise InvalidInputSchemaError(
-            "Selected upstream areas must be finite non-negative numeric values"
-        )
-    length = pd.to_numeric(frame["unit_length"], errors="coerce").to_numpy(dtype=float)
-    if not np.all(np.isfinite(length)) or np.any(length < 0):
-        raise InvalidInputSchemaError(
-            "Selected unit lengths must be finite non-negative numeric values"
-        )
 
 
-def _read_selected(
+def _iter_selected(
     provider: _Provider,
     ids: set[Hashable],
     *,
     batch_size: int,
     memory_bytes: int,
     known_fids: dict[Hashable, int] | None = None,
-) -> gpd.GeoDataFrame:
+) -> Iterable[gpd.GeoDataFrame]:
     ordered = sorted(ids, key=lambda value: (type(value).__name__, str(value)))
     source = inspect_vector_provider(
         provider.path, layer=provider.layer, source_crs=provider.crs.to_string()
@@ -522,7 +503,7 @@ def _read_selected(
         raise InvalidInputSchemaError(
             "Selected geometry packet exceeds the configured memory budget"
         )
-    return frame[[*provider.fields.keys(), "geometry"]]
+    yield frame[[*provider.fields.keys(), "geometry"]]
 
 
 def _scan_fids(provider: _Provider, batch_size: int) -> dict[Hashable, int]:
@@ -554,62 +535,153 @@ def _scan_fids(provider: _Provider, batch_size: int) -> dict[Hashable, int]:
     return result
 
 
-def _normalize_selected(
-    attrs: pd.DataFrame,
-    segments: gpd.GeoDataFrame,
-    catchments: gpd.GeoDataFrame,
-    sub_by_id: dict[Hashable, int],
-    target_crs: CRS,
-) -> RoiResult:
-    # Geometry is decoded and transformed only after topology selection.
-    segments = segments.to_crs(target_crs)
-    catchments = catchments.to_crs(target_crs)
-    _validate_geometry(segments, "segments", {"LineString", "MultiLineString"})
-    _validate_geometry(catchments, "catchments", {"Polygon", "MultiPolygon"})
-    attrs = attrs.set_index("id", drop=False)
-    segments = segments.set_index("id").loc[attrs.index]
-    catchments = catchments.set_index("id").loc[attrs.index]
-    unit_length = attrs["unit_length"].astype("float64")
-    unit_area = pd.to_numeric(catchments["unit_area"], errors="coerce").astype("float64")
-    if not np.isfinite(unit_area.to_numpy()).all() or (unit_area < 0).any():
-        raise InvalidInputSchemaError(
-            "Selected unit areas must be finite non-negative numeric values"
-        )
-    downstream = attrs["id_down"].to_dict()
-    selected_ids = set(attrs.index.tolist())
-    order = _topological_order(selected_ids, downstream)
-    upstream_length = unit_length.to_dict()
-    for segment_id in order:
+def _iter_selected_bounded(
+    provider: _Provider, ids: set[Hashable], *, batch_size: int,
+    memory_bytes: int, known_fids: dict[Hashable, int] | None = None,
+) -> Iterable[gpd.GeoDataFrame]:
+    """Yield selected geometries without concatenating packets."""
+    source = inspect_vector_provider(
+        provider.path, layer=provider.layer, source_crs=provider.crs.to_string()
+    )
+    rows_per_packet = conservative_geometry_packet_rows(
+        source, memory_limit_bytes=memory_bytes, requested_rows=batch_size
+    )
+    ordered = sorted(ids, key=lambda value: (type(value).__name__, str(value)))
+    if known_fids is not None:
+        missing = ids - set(known_fids)
+        if missing:
+            raise InvalidInputSchemaError("Selected provider ID(s) are missing")
+        requests = [
+            ("fids", [known_fids[value] for value in ordered[start : start + rows_per_packet]])
+            for start in range(0, len(ordered), rows_per_packet)
+        ]
+    else:
+        packet_size = min(rows_per_packet, 400)
+        requests = [
+            ("where", ordered[start : start + packet_size])
+            for start in range(0, len(ordered), packet_size)
+        ]
+    seen: set[Hashable] = set()
+    for mode, request in requests:
+        try:
+            read_options = {mode: request}
+            if mode == "where":
+                read_options[mode] = id_predicate(provider.fields["id"], request)
+            frame = pyogrio.read_dataframe(
+                provider.path, layer=provider.layer,
+                columns=list(dict.fromkeys(provider.fields.values())),
+                use_arrow=True, **read_options,
+            )
+        except Exception as exc:
+            raise InvalidInputSchemaError("Cannot read selected provider geometries") from exc
+        frame = gpd.GeoDataFrame(frame, geometry=frame.geometry.name, crs=provider.crs)
+        frame = frame.rename(columns={actual: normalized for normalized, actual in provider.fields.items()})
+        if frame.geometry.name != "geometry":
+            frame = frame.rename_geometry("geometry")
+        frame = frame.sort_values("id", key=lambda values: values.map(lambda value: (type(value).__name__, str(value))))
+        returned = frame["id"].tolist()
+        if seen.intersection(returned):
+            raise InvalidInputSchemaError("Provider returned duplicate selected IDs")
+        seen.update(returned)
+        estimate = int(frame.memory_usage(index=True, deep=True).sum())
+        estimate += sum(len(value) if value else 0 for value in frame.geometry.to_wkb())
+        if estimate > memory_bytes:
+            raise InvalidInputSchemaError("Selected geometry packet exceeds the configured memory budget")
+        yield frame[[*provider.fields.keys(), "geometry"]]
+    if seen != ids:
+        raise InvalidInputSchemaError("Provider selection did not return the exact requested IDs")
+
+
+@lru_cache(maxsize=16)
+def _geodetic_tools(crs_text: str) -> tuple[Transformer, Geod]:
+    crs = CRS.from_wkt(crs_text)
+    geodetic = crs.geodetic_crs
+    if geodetic is None or crs.ellipsoid.semi_major_metre is None:
+        raise InvalidInputSchemaError("Source CRS has no usable geodetic ellipsoid")
+    ellipsoid = crs.ellipsoid
+    if ellipsoid.inverse_flattening == 0:
+        geod = Geod(a=ellipsoid.semi_major_metre, b=ellipsoid.semi_minor_metre)
+    else:
+        geod = Geod(a=ellipsoid.semi_major_metre, rf=ellipsoid.inverse_flattening)
+    return Transformer.from_crs(crs, geodetic, always_xy=True), geod
+
+
+def _geometry_metric(geometry, provider: _Provider, kind: str) -> float:
+    _validate_geometry(
+        gpd.GeoDataFrame({"geometry": [geometry]}, geometry="geometry", crs=provider.crs),
+        kind, {"LineString", "MultiLineString"} if kind == "segments" else {"Polygon", "MultiPolygon"},
+    )
+    transformer, geod = _geodetic_tools(provider.crs.to_wkt())
+    geographic = shapely_transform(transformer.transform, geometry)
+    if kind == "segments":
+        value = geod.geometry_length(geographic) / 1000.0
+    else:
+        value = abs(geod.geometry_area_perimeter(geographic)[0]) / 1_000_000.0
+    if not np.isfinite(value) or value < 0:
+        raise InvalidInputSchemaError(f"Selected {kind} produced an invalid metric")
+    return float(value)
+
+
+def _compute_selected_metrics(ids, segments, catchments, segment_fids, *, batch_size, memory_bytes):
+    metrics = {}
+    for frame in _iter_selected_bounded(segments, ids, batch_size=batch_size, memory_bytes=memory_bytes, known_fids=segment_fids):
+        for row in frame.itertuples(index=False):
+            metrics.setdefault(row.id, {})["unit_length"] = _geometry_metric(row.geometry, segments, "segments")
+    for frame in _iter_selected_bounded(catchments, ids, batch_size=batch_size, memory_bytes=memory_bytes):
+        for row in frame.itertuples(index=False):
+            if row.id not in metrics:
+                raise InvalidInputSchemaError(f"Catchment ID is not present in selected segments: {row.id}")
+            metrics[row.id]["unit_area"] = _geometry_metric(row.geometry, catchments, "catchments")
+    if set(metrics) != ids or any("unit_area" not in value for value in metrics.values()):
+        raise InvalidInputSchemaError("Selected segment and catchment IDs do not match")
+    return metrics
+
+
+def _upstream_metrics(attrs, metrics):
+    downstream = dict(attrs[["id", "id_down"]].itertuples(index=False, name=None))
+    length = {key: value["unit_length"] for key, value in metrics.items()}
+    area = {key: value["unit_area"] for key, value in metrics.items()}
+    for segment_id in _topological_order(set(metrics), downstream):
         target = downstream.get(segment_id)
-        if target in upstream_length:
-            upstream_length[target] += upstream_length[segment_id]
-    normalized_segments = gpd.GeoDataFrame(
-        {
-            "id": attrs.index.to_numpy(),
-            "id_down": attrs["id_down"].to_numpy(),
-            "sub": [sub_by_id[value] for value in attrs.index],
-            "strahler_order": attrs["strahler_order"].astype("int64").to_numpy(),
-            "unit_length": unit_length.to_numpy(),
-            "upstream_length": [upstream_length[value] for value in attrs.index],
-            "unit_area": unit_area.to_numpy(),
-            # Provider values are copied, never reconstructed from polygons.
-            "upstream_area": attrs["upstream_area"].astype("float64").to_numpy(),
-        },
-        geometry=segments.geometry.to_numpy(), crs=target_crs,
-    )
-    water_course = _water_course_by_segment(normalized_segments)
-    normalized_segments.insert(
-        8, "water_course", normalized_segments["id"].map(water_course)
-    )
-    normalized_catchments = normalized_segments.drop(columns="geometry").copy()
-    normalized_catchments["geometry"] = catchments.geometry.to_numpy()
-    normalized_catchments = gpd.GeoDataFrame(
-        normalized_catchments, geometry="geometry", crs=target_crs
-    )
-    return RoiResult(
-        normalized_catchments[ROI_COLUMNS].reset_index(drop=True),
-        normalized_segments[ROI_COLUMNS].reset_index(drop=True),
-    )
+        if target in length:
+            length[target] += length[segment_id]
+            area[target] += area[segment_id]
+    return length, area
+
+
+def _metric_attributes(attrs, sub_by_id, metrics, upstream_length, upstream_area):
+    result = attrs.copy()
+    result["sub"] = result["id"].map(sub_by_id)
+    result["unit_length"] = result["id"].map(lambda value: metrics[value]["unit_length"])
+    result["upstream_length"] = result["id"].map(upstream_length)
+    result["unit_area"] = result["id"].map(lambda value: metrics[value]["unit_area"])
+    result["upstream_area"] = result["id"].map(upstream_area)
+    result["strahler_order"] = result["strahler_order"].astype("int64")
+    return result
+
+
+def _write_selected_outputs(attrs, sub_by_id, metrics, upstream_length, upstream_area, water_course,
+                            segment_provider, catchment_provider, segment_fids, target_crs, *,
+                            batch_size, memory_bytes, catchments_path, segments_path):
+    lookup = attrs.set_index("id").to_dict("index")
+    for provider, fids, path, kind in ((segment_provider, segment_fids, segments_path, "segments"), (catchment_provider, None, catchments_path, "catchments")):
+        first = True
+        for frame in _iter_selected_bounded(provider, set(lookup), batch_size=batch_size, memory_bytes=memory_bytes, known_fids=fids):
+            rows = []
+            for row in frame.itertuples(index=False):
+                item = lookup[row.id]
+                values = {
+                    "id": row.id, "id_down": item["id_down"], "sub": sub_by_id[row.id],
+                    "strahler_order": int(item["strahler_order"]),
+                    "unit_length": metrics[row.id]["unit_length"], "upstream_length": upstream_length[row.id],
+                    "unit_area": metrics[row.id]["unit_area"], "upstream_area": upstream_area[row.id],
+                    "water_course": water_course[row.id], "geometry": row.geometry,
+                }
+                rows.append(values)
+            output = gpd.GeoDataFrame(rows, columns=ROI_COLUMNS, geometry="geometry", crs=provider.crs).to_crs(target_crs)
+            _validate_geometry(output, kind, {"LineString", "MultiLineString"} if kind == "segments" else {"Polygon", "MultiPolygon"})
+            _write_fgb(output, path, append=not first)
+            first = False
 
 
 def _validate_geometry(frame: gpd.GeoDataFrame, name: str, allowed: set[str]) -> None:
@@ -652,8 +724,11 @@ def _water_course_by_segment(segments: gpd.GeoDataFrame) -> dict[Hashable, Hasha
     return result
 
 
-def _write_fgb(frame: gpd.GeoDataFrame, path: Path) -> None:
-    frame.to_file(path, driver="FlatGeobuf", index=False, SPATIAL_INDEX="YES")
+def _write_fgb(frame: gpd.GeoDataFrame, path: Path, *, append: bool = False) -> None:
+    pyogrio.write_dataframe(
+        frame, path, driver="FlatGeobuf", append=append, use_arrow=True,
+        SPATIAL_INDEX="YES",
+    )
 
 
 def _asset(path: Path, root: Path, count: int) -> dict[str, Any]:

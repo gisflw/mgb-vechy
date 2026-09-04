@@ -53,7 +53,7 @@ def prepared_execution_dataset(tmp_path):
         transform=from_origin(0, 20, 10, 10),
     ) as target:
         target.write(np.arange(6, dtype="float32").reshape(2, 3), 1)
-    define_roi_dataset(RoiSpec(crs="EPSG:3857", catchments=catchments_path, segments=segments_path, outlet_ids=("3",), id_col="id", id_down_col="id_down", strahler_order_col="strahler_order", upstream_area_col="up", unit_length_col="length", unit_area_col="area", output_dir=tmp_path / "roi", workers=1))
+    define_roi_dataset(RoiSpec(crs="EPSG:3857", catchments=catchments_path, segments=segments_path, outlet_ids=("3",), id_col="id", id_down_col="id_down", strahler_order_col="strahler_order", output_dir=tmp_path / "roi", workers=1))
     aggregate_roi_dataset(AggregationSpec(roi=tmp_path / "roi", uparea_min=0, lmin=0, output_dir=tmp_path / "minis", workers=1))
     report = prepare_dataset(PreparationSpec(dem=dem_path, minis=tmp_path / "minis", output_dir=tmp_path / "prepared", memory_limit_mb=16, buffer_cells=0))
     return report.output_dir
