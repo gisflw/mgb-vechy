@@ -29,6 +29,41 @@ def test_provider_inspection_and_case_insensitive_fields(provider):
     assert resolve_provider_field(provider, "source_id") == "Source_ID"
 
 
+def test_provider_layer_selects_named_geopackage_layer(tmp_path):
+    path = tmp_path / "layers.gpkg"
+    frame = gpd.GeoDataFrame(
+        {"selected_id": [1]}, geometry=[Point(0, 0)], crs="EPSG:3857"
+    )
+    frame.to_file(path, driver="GPKG", layer="ignored")
+    frame.to_file(path, driver="GPKG", layer="selected")
+
+    selected = inspect_vector_provider(path, layer="selected")
+
+    assert selected.driver == "GPKG"
+    assert selected.fields == ("selected_id",)
+
+
+def test_filegdb_provider_requires_layer(monkeypatch, tmp_path):
+    path = tmp_path / "source.gdb"
+    path.mkdir()
+    info = {
+        "driver": "OpenFileGDB",
+        "fields": ["source_id"],
+        "geometry_type": "Point",
+        "features": 1,
+        "crs": "EPSG:3857",
+        "fid_column": "OBJECTID",
+    }
+    monkeypatch.setattr("pyogrio.read_info", lambda *_args, **_kwargs: info)
+
+    with pytest.raises(InvalidInputSchemaError, match="requires an explicit layer"):
+        inspect_vector_provider(path)
+
+    provider = inspect_vector_provider(path, layer="selected")
+    assert provider.driver == "OpenFileGDB"
+    assert provider.layer == "selected"
+
+
 def test_attribute_stream_is_geometry_free_and_bounded(provider):
     batches = list(iter_provider_batches(provider, columns=("Source_ID",), batch_size=1))
     assert len(batches) == 3

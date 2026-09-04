@@ -43,6 +43,10 @@ mgb-vec-hydro prepare \
 
 Select all catchments and segments upstream of one or more outlets:
 
+Inputs may be GeoPackage, FlatGeobuf, or ESRI FileGDB. FileGDB inputs require
+the corresponding `--catchments-layer` or `--segments-layer` option; those
+options can also select named GeoPackage layers.
+
 ```bash
 mgb-vec-hydro define-roi \
   --crs EPSG:6933 \

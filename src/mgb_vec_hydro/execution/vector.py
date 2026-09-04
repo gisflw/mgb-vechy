@@ -1,4 +1,4 @@
-"""Bounded Arrow access to raw GeoPackage and FlatGeobuf providers."""
+"""Bounded Arrow access to raw vector providers."""
 
 from __future__ import annotations
 
@@ -16,7 +16,7 @@ from pyproj import CRS
 from mgb_vec_hydro.exceptions import InvalidInputSchemaError
 from mgb_vec_hydro.execution.executor import WorkerContext
 
-SUPPORTED_PROVIDER_DRIVERS = {"GPKG", "FlatGeobuf"}
+SUPPORTED_PROVIDER_DRIVERS = {"GPKG", "FlatGeobuf", "OpenFileGDB"}
 
 
 @dataclass(frozen=True)
@@ -46,7 +46,11 @@ def inspect_vector_provider(
     driver = info.get("driver")
     if driver not in SUPPORTED_PROVIDER_DRIVERS:
         raise InvalidInputSchemaError(
-            "Raw vector provider must be GeoPackage or FlatGeobuf"
+            "Raw vector provider must be GeoPackage, FlatGeobuf, or FileGDB"
+        )
+    if driver == "OpenFileGDB" and layer is None:
+        raise InvalidInputSchemaError(
+            "FileGDB provider requires an explicit layer"
         )
     value = source_crs or info.get("crs")
     if value is None:

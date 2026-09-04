@@ -1,7 +1,7 @@
 # Stage 1: define ROI
 
-`mgb-vec-hydro define-roi` reads raw GeoPackage or FlatGeobuf providers and
-selects topology upstream of one or more outlets. It defines the output CRS;
+`mgb-vec-hydro define-roi` reads raw GeoPackage, FlatGeobuf, or ESRI FileGDB
+providers and selects topology upstream of one or more outlets. It defines the output CRS;
 the CRS may be geographic or projected. The DEM is validated against that CRS
 later by `prepare`.
 
@@ -18,6 +18,8 @@ mgb-vec-hydro define-roi \
 ```
 
 Use `--catchments-layer` and `--segments-layer` for multi-layer containers.
+FileGDB inputs require the corresponding layer option; the layer options also
+select layers in GeoPackage inputs.
 The independent `--catchments-source-crs` and `--segments-source-crs` options
 replace missing or incorrect provider metadata. There is no target-CRS option.
 Column matching is case-insensitive.

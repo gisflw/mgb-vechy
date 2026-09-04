@@ -111,7 +111,7 @@ def prepare_command(
 @click.option(
     "--catchments",
     "catchments_path",
-    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    type=click.Path(exists=True, path_type=Path),
     required=True,
 )
 @click.option("--catchments-layer")
@@ -119,7 +119,7 @@ def prepare_command(
 @click.option(
     "--segments",
     "segments_path",
-    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    type=click.Path(exists=True, path_type=Path),
     required=True,
 )
 @click.option("--segments-layer")
