@@ -6,6 +6,7 @@ import pandas as pd
 import pytest
 import rasterio
 from affine import Affine
+from pyproj import CRS
 from shapely.geometry import LineString, Polygon
 
 from mgb_vec_hydro.exceptions import (
@@ -156,17 +157,6 @@ def _terrain_inputs(tmp_path, *, with_d8=False):
         ) as target:
             target.write(d8, 1)
             target.write_mask(np.full((4, 8), 255, dtype="uint8"))
-    prepared = tmp_path / "prepared"
-    prepare_dataset(
-        PreparationSpec(
-            dem=dem_path,
-            crs="EPSG:3857",
-            resolution=10,
-            output_dir=prepared,
-            d8=d8_path,
-            d8_encoding="canonical" if with_d8 else None,
-        )
-    )
     values = {
         "id": ["a", "b"],
         "id_down": ["b", None],
@@ -200,6 +190,13 @@ def _terrain_inputs(tmp_path, *, with_d8=False):
     segments.to_file(minis / "mini_segments.fgb", driver="FlatGeobuf", index=False)
     # Stage 4 must not inspect this user-facing provenance file.
     (minis / "source_to_mini.csv").write_text("deliberately,invalid\n")
+    roi = tmp_path / "roi"
+    (roi / "vectors").mkdir(parents=True)
+    catchments.to_file(roi / "vectors" / "roi_catchments.fgb", driver="FlatGeobuf", index=False)
+    (roi / "manifest.json").write_text(json.dumps({"crs_wkt": CRS.from_epsg(3857).to_wkt(), "assets": {"catchments": {"path": "vectors/roi_catchments.fgb"}}}))
+    (minis / "manifest.json").write_text(json.dumps({"roi": str(roi.resolve()), "crs_wkt": CRS.from_epsg(3857).to_wkt(), "assets": {"catchments": {"path": "mini_catchments.fgb"}, "segments": {"path": "mini_segments.fgb"}}}))
+    prepared = tmp_path / "prepared"
+    prepare_dataset(PreparationSpec(dem=dem_path, minis=minis, output_dir=prepared, d8=d8_path, d8_encoding="canonical" if with_d8 else None, buffer_cells=0))
     return prepared, minis
 
 
@@ -211,7 +208,6 @@ def test_terrain_dataset_records_custom_agree_profile_and_strict_domain(tmp_path
     report = create_terrain_dataset(
         TerrainSpec(
             prepared=prepared,
-            minis=minis,
             output_dir=output_dir,
             agree_sharp=12,
             agree_smooth=3,
@@ -231,7 +227,6 @@ def test_terrain_dataset_records_custom_agree_profile_and_strict_domain(tmp_path
     assert tags["agree_smooth"] == "3"
     assert tags["agree_buffer_pixels"] == "2"
     assert np.all(mask[:, 3] == 0)
-    assert np.all(mask[:, 7] == 0)
     with (
         rasterio.open(output_dir / "rasters" / "mini_ownership.tif") as ownership,
         rasterio.open(output_dir / "rasters" / "drainage.tif") as drainage,
@@ -297,7 +292,6 @@ def test_terrain_rejects_missing_d8_and_oversized_complete_mini(tmp_path):
         create_terrain_dataset(
             TerrainSpec(
                 prepared=prepared,
-                minis=minis,
                 output_dir=missing_output,
                 direction_source="d8",
             )
@@ -309,7 +303,6 @@ def test_terrain_rejects_missing_d8_and_oversized_complete_mini(tmp_path):
         create_terrain_dataset(
             TerrainSpec(
                 prepared=prepared,
-                minis=minis,
                 output_dir=oversized_output,
                 memory_limit_mb=1,
             )
@@ -325,7 +318,6 @@ def test_prepared_d8_uses_same_dataset_interface_and_is_deterministic(tmp_path):
     create_terrain_dataset(
         TerrainSpec(
             prepared=prepared,
-            minis=minis,
             output_dir=serial,
             direction_source="d8",
             write_flow_direction=True,
@@ -335,7 +327,6 @@ def test_prepared_d8_uses_same_dataset_interface_and_is_deterministic(tmp_path):
     create_terrain_dataset(
         TerrainSpec(
             prepared=prepared,
-            minis=minis,
             output_dir=parallel,
             direction_source="d8",
             write_flow_direction=True,
@@ -374,7 +365,7 @@ def test_domain_and_terrain_checkpoints_resume_after_failed_publication(
     def fail_second_finish(assembler):
         nonlocal finish_calls
         finish_calls += 1
-        if finish_calls == 2:
+        if finish_calls == 1:
             raise RuntimeError("injected failure")
         return finish(assembler)
 
@@ -384,7 +375,6 @@ def test_domain_and_terrain_checkpoints_resume_after_failed_publication(
             create_terrain_dataset(
                 TerrainSpec(
                     prepared=prepared,
-                    minis=minis,
                     output_dir=output,
                     checkpoint_dir=checkpoint,
                     workers=1,
@@ -392,26 +382,24 @@ def test_domain_and_terrain_checkpoints_resume_after_failed_publication(
             )
 
     assert not output.exists()
-    assert (checkpoint / "domain" / "checkpoint.json").is_file()
     assert (checkpoint / "terrain" / "checkpoint.json").is_file()
     assert RasterAssembler.finish is finish
 
     report = create_terrain_dataset(
         TerrainSpec(
             prepared=prepared,
-            minis=minis,
             output_dir=output,
             checkpoint_dir=checkpoint,
             workers=1,
         )
     )
 
-    assert report.domain_execution.resumed > 0
+    assert report.domain_execution.resumed == 0
     assert report.terrain_execution.resumed > 0
     assert not checkpoint.exists()
 
 
-def test_domain_worker_failure_publishes_nothing(tmp_path):
+def test_prepared_domain_is_not_rebuilt_from_mutated_minis(tmp_path):
     prepared, minis = _terrain_inputs(tmp_path)
     segment_path = minis / "mini_segments.fgb"
     segments = gpd.read_file(segment_path)
@@ -420,18 +408,8 @@ def test_domain_worker_failure_publishes_nothing(tmp_path):
     segments.to_file(segment_path, driver="FlatGeobuf", index=False)
     output = tmp_path / "terrain"
 
-    with pytest.raises(WorkerExecutionError, match="no matching drainage cells"):
-        create_terrain_dataset(
-            TerrainSpec(
-                prepared=prepared,
-                minis=minis,
-                output_dir=output,
-                workers=1,
-            )
-        )
-
-    assert not output.exists()
-
+    create_terrain_dataset(TerrainSpec(prepared=prepared, output_dir=output, workers=1))
+    assert output.exists()
 
 def test_longer_valley_route_wins_over_short_ridge_breach():
     elevation = np.array(

@@ -2,9 +2,10 @@
 
 ## Status
 
-Implementation in progress. Work areas 1 through 4 are implemented with the
-raster-only Stage 0, raw-provider Stage 1 boundary, and bounded mini-based
-terrain processing.
+Implementation in progress. Work areas 1 through 4 are implemented. Raster
+preparation now follows aggregation: ROI defines the working CRS, and prepare
+validates and clips already aligned source rasters while producing the bounded
+mini ownership/drainage inputs used by terrain. Only work area 5 remains.
 
 ## Compatibility policy
 
@@ -34,8 +35,10 @@ outputs.
 
 ## Architectural principles
 
-- Prepared inputs define one authoritative CRS and raster grid.
-- Stage 0 is raster-only; Stage 1 is the sole raw-vector ingestion boundary.
+- ROI defines the authoritative working CRS; the DEM establishes the prepared
+  raster grid after aggregation.
+- Stage 1 is the sole raw-vector ingestion boundary; preparation reads only
+  published ROI/aggregation products and source rasters.
 - Catchment ownership is not expanded beyond the domain rasterization. There
   is no ownership buffer.
 - Vector and raster workflows use domain-specific work units rather than a
@@ -50,21 +53,24 @@ outputs.
 
 ## Work areas
 
-### 1. Pre-conditioned input data
+### 1. ROI and post-aggregation prepared data
 
-Introduce a required preparation stage that converts source data into the
-canonical inputs consumed by all later processing.
+ROI selects vectors and defines the working projected CRS. After aggregation,
+preparation converts the already-aligned source rasters and aggregated mini
+domain into the canonical inputs consumed by terrain.
 
-The prepared dataset will establish:
+The prepared dataset establishes:
 
-- A single projected CRS, resolution, transform, extent, and nodata convention.
+- A DEM-derived resolution, transform, clipped extent, and nodata convention in
+  the ROI CRS; it never reprojects or resamples source rasters.
 - Tiled COG raster inputs using a block layout suitable for window access.
 - Optional D8 data on exactly the same grid, with an explicit direction encoding.
-- A minimal version-3 manifest recording only the grid and raster assets.
+- Rasterized strict mini ownership, matching drainage, and a dense mini index.
 
-Vector inspection, schema mapping, Strahler filtering, topology selection,
-selected-geometry reprojection, and metric normalization all belong to Stage 1.
-COG is the prepared raster interface.
+Vector inspection, schema mapping, Strahler filtering, topology selection, and
+selected-geometry reprojection belong to Stage 1. Unit lengths and areas are
+provider fields in km and km²; only upstream length is derived. COG is the
+prepared raster interface.
 
 ### 2. Shared vector and raster execution layers
 
@@ -127,14 +133,14 @@ coordinates transformed to EPSG:4326.
 
 ### 4. Refactor terrain processing
 
-Terrain processing depends on the shared raster execution layer, prepared
-rasters, and the aggregated mini products. Aggregated minis are the complete
-terrain and ownership units; `source_to_mini.csv` is not a Stage 4 input.
+Terrain processing depends on the shared raster execution layer and prepared
+rasters. Aggregated minis are rasterized during preparation; `source_to_mini.csv`
+and mini vectors are not Stage 4 inputs.
 
-Before terrain calculations begin, mini catchments and matching mini segments
-are rasterized on the canonical grid. This post-aggregation pass produces
-strict ownership and drainage COGs through the shared execution layer. It is
-not part of input preparation and does not expand ownership.
+Before terrain calculations, preparation rasterizes mini catchments and matching
+mini segments on the DEM grid. This post-aggregation pass produces strict
+ownership and drainage COGs through the shared execution layer and does not
+expand ownership.
 
 Each terrain task processes one complete mini catchment, or a bounded packet of
 complete minis, from local COG windows. Catchment and drainage geometry is not

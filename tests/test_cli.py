@@ -11,15 +11,17 @@ def test_stage_command_contracts():
     assert prepare.exit_code == roi.exit_code == aggregate.exit_code == 0
     assert "--catchments" not in prepare.output and "--segments" not in prepare.output
     for option in (
-        "--prepared",
+        "--crs",
         "--catchments-layer",
         "--segments-layer",
         "--catchments-source-crs",
         "--segments-source-crs",
         "--upstream-area-col",
+        "--unit-length-col",
+        "--unit-area-col",
     ):
         assert option in roi.output
-    assert "--crs" not in roi.output and "--output-format" not in roi.output
+    assert "--prepared" not in roi.output and "--output-format" not in roi.output
     assert "--roi" in aggregate.output
     assert "--roi-catchments" not in aggregate.output
     assert "--crs" not in aggregate.output and "--output-format" not in aggregate.output
@@ -35,7 +37,6 @@ def test_terrain_products_cli_exposes_agree_controls():
     assert result.exit_code == 0
     for option in (
         "--prepared",
-        "--minis",
         "--direction-source",
         "--agree-sharp",
         "--agree-smooth",
@@ -53,6 +54,6 @@ def test_terrain_products_cli_exposes_agree_controls():
         "--roi-segments",
         "--id-col",
         "--crs",
-        "--buffer-cells",
+        "--minis",
     ):
         assert obsolete not in result.output

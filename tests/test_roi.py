@@ -6,22 +6,12 @@ from rasterio.transform import from_origin
 from shapely.geometry import LineString, Polygon
 
 from mgb_vec_hydro.exceptions import InvalidInputSchemaError, TopologyCycleError
-from mgb_vec_hydro.preparation import PreparationSpec, prepare_dataset
 from mgb_vec_hydro.roi import ROI_COLUMNS, RoiDataset, RoiSpec, define_roi_dataset
 
 
 def _inputs(tmp_path, *, orders=(3, 2, 1), areas=(6.0, 5.0, 3.0), downstream=(None, 1, 2)):
-    dem = tmp_path / "dem.tif"
-    with rasterio.open(
-        dem, "w", driver="GTiff", width=3, height=1, count=1, dtype="float32",
-        crs="EPSG:3857", transform=from_origin(0, 1000, 1000, 1000),
-    ) as target:
-        target.write(np.ones((1, 3), dtype="float32"), 1)
-    prepare_dataset(PreparationSpec(
-        dem=dem, crs="EPSG:3857", resolution=1000, output_dir=tmp_path / "prepared"
-    ))
     catchments = gpd.GeoDataFrame(
-        {"SOURCE_ID": [1, 2, 3]},
+        {"SOURCE_ID": [1, 2, 3], "UNITAREA": [1.0, 1.0, 1.0]},
         geometry=[
             Polygon([(0, 0), (1000, 0), (1000, 1000), (0, 1000)]),
             Polygon([(1000, 0), (2000, 0), (2000, 1000), (1000, 1000)]),
@@ -29,7 +19,7 @@ def _inputs(tmp_path, *, orders=(3, 2, 1), areas=(6.0, 5.0, 3.0), downstream=(No
         ], crs="EPSG:3857",
     )
     segments = gpd.GeoDataFrame(
-        {"SOURCE_ID": [1, 2, 3], "DOWN": list(downstream), "ORDER": list(orders), "UPAREA": list(areas)},
+        {"SOURCE_ID": [1, 2, 3], "DOWN": list(downstream), "ORDER": list(orders), "UPAREA": list(areas), "UNITLEN": [1.0, 1.0, 1.0]},
         geometry=[
             LineString([(0, 500), (1000, 500)]),
             LineString([(1000, 500), (2000, 500)]),
@@ -39,9 +29,10 @@ def _inputs(tmp_path, *, orders=(3, 2, 1), areas=(6.0, 5.0, 3.0), downstream=(No
     catchments.to_file(tmp_path / "catchments.gpkg", driver="GPKG")
     segments.to_file(tmp_path / "segments.gpkg", driver="GPKG")
     return RoiSpec(
-        prepared=tmp_path / "prepared", catchments=tmp_path / "catchments.gpkg",
+        crs="EPSG:3857", catchments=tmp_path / "catchments.gpkg",
         segments=tmp_path / "segments.gpkg", outlet_ids=("1",), id_col="source_id",
         id_down_col="down", strahler_order_col="order", upstream_area_col="uparea",
+        unit_length_col="unitlen", unit_area_col="unitarea",
         output_dir=tmp_path / "roi", workers=1, batch_size=1,
     )
 

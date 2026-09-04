@@ -1,7 +1,7 @@
 # Stage 5 Mini-Basin Sampling CLI
 
 Stage 4 HRU construction is currently deferred. Stage 5 consumes an existing
-HRU raster together with the Stage 2 mini-basin vectors and Stage 3 terrain
+HRU raster together with the Stage 2 mini-basin vectors and Stage 4 terrain
 products.
 
 `mgb-vec-hydro sample-minis` samples terrain and HRU attributes onto each

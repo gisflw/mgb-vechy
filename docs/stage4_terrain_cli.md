@@ -1,7 +1,8 @@
-# Stage 3 Terrain Products CLI
+# Stage 4 Terrain Products CLI
 
 `mgb-vec-hydro terrain-products` creates a versioned, canonical-grid terrain
-dataset from the prepared rasters and the aggregated mini-basin directory. It
+dataset from prepared rasters, including the mini domain prepared after
+aggregation. It
 uses bounded complete-mini work units, deterministic local multiprocessing, and
 coordinator-only COG assembly.
 
@@ -10,7 +11,6 @@ coordinator-only COG assembly.
 ```bash
 mgb-vec-hydro terrain-products \
   --prepared prepared \
-  --minis output/minis \
   --output-dir output/terrain \
   --direction-source dem \
   --agree-sharp 80 \
@@ -18,7 +18,7 @@ mgb-vec-hydro terrain-products \
   --agree-buffer 4
 ```
 
-`--prepared`, `--minis`, and `--output-dir` are required.
+`--prepared` and `--output-dir` are required.
 `--direction-source` is either `dem` (the default) or `d8`. Use
 `--write-flow-direction` to publish the selected direction raster. Execution
 defaults are four workers, 512 MB of admitted task memory, two concurrent I/O
@@ -31,21 +31,14 @@ of pixels.
 
 ## Inputs and ownership
 
-The prepared version-3 dataset supplies the authoritative projected CRS,
-transform, dimensions, DEM, and optional canonical-clockwise D8 COG. The minis
-directory supplies only `mini_catchments.fgb` and `mini_segments.fgb`.
-They must have the normalized Stage 2 schema, matching unique IDs, the canonical
-CRS, and polygon/line geometry respectively.
+The prepared version-4 dataset supplies the authoritative projected CRS,
+transform, dimensions, DEM, optional canonical-clockwise D8 COG, rasterized
+ownership, drainage, and the dense mini index. Terrain does not open mini
+vectors or rasterize geometry.
 
-`source_to_mini.csv` is user-facing provenance. Stage 4 does not open,
-fingerprint, or validate it.
-
-Each aggregated mini is an indivisible processing unit. Before terrain work,
-its polygon is rasterized with pixel-center semantics and its matching segment
-with all-touched semantics. Drainage is clipped to that mini. Gaps remain
-masked, ownership conflicts are rejected, and ownership is never buffered.
-Terrain workers subsequently read only COG windows; they do not rasterize
-geometry.
+Each aggregated mini is an indivisible processing unit. Gaps remain masked,
+ownership conflicts are rejected, and ownership is never buffered. Terrain
+workers read only prepared COG windows.
 
 ## Direction behavior
 

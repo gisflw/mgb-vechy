@@ -15,18 +15,19 @@ from typing import Any, Literal
 
 import numpy as np
 import rasterio
+import geopandas as gpd
+import pandas as pd
 from pyproj import CRS
 from rasterio.enums import Resampling
 from rasterio.shutil import copy as copy_raster
 from rasterio.transform import Affine
-from rasterio.vrt import WarpedVRT
-from rasterio.warp import transform_bounds
+from rasterio.features import rasterize
+from rasterio.windows import from_bounds, Window
 
-from mgb_vec_hydro.crs_utils import parse_metric_crs
 from mgb_vec_hydro.exceptions import PreparedDataError
 
 CONTRACT = "mgb-prepared-dataset"
-CONTRACT_VERSION = 3
+CONTRACT_VERSION = 4
 BLOCK_SIZE = 512
 NAME_RE = re.compile(r"^[a-z][a-z0-9_-]*$")
 RESERVED_RASTER_NAMES = {"dem", "d8"}
@@ -46,13 +47,13 @@ class PreparationSpec:
     """Raster inputs and normalization choices for a prepared dataset."""
 
     dem: Path
-    crs: str
-    resolution: float
     output_dir: Path
+    minis: Path
     rasters: tuple[NamedRaster, ...] = field(default_factory=tuple)
     d8: Path | None = None
     d8_encoding: Literal["canonical", "esri"] | None = None
     memory_limit_mb: int = 512
+    buffer_cells: int = 1
 
 
 @dataclass(frozen=True)
@@ -153,8 +154,8 @@ class PreparedDataset:
                 "Prepared manifest has an unsupported nodata convention"
             )
         rasters = assets.get("rasters")
-        if set(assets) != {"rasters"}:
-            raise PreparedDataError("Prepared manifest must be raster-only")
+        if set(assets) != {"rasters", "mini_ownership", "drainage", "mini_index"}:
+            raise PreparedDataError("Prepared manifest has an invalid asset layout")
         if not isinstance(rasters, dict) or "dem" not in rasters:
             raise PreparedDataError("Prepared manifest must define a DEM")
         try:
@@ -187,6 +188,19 @@ class PreparedDataset:
                         )
             except rasterio.errors.RasterioError as exc:
                 raise PreparedDataError(f"Cannot inspect prepared raster: {name}") from exc
+        for name in ("mini_ownership", "drainage"):
+            asset = assets[name]
+            path = self._validate_asset(asset)
+            with rasterio.open(path) as source:
+                expected_dtype = "int32" if name == "mini_ownership" else "uint8"
+                if (source.count != 1 or source.crs is None or CRS.from_user_input(source.crs) != crs
+                    or source.transform != transform or source.shape != (int(grid["height"]), int(grid["width"]))
+                    or source.nodata is not None or source.dtypes[0] != expected_dtype
+                    or source.tags(ns="IMAGE_STRUCTURE").get("LAYOUT") != "COG"):
+                    raise PreparedDataError(f"Prepared raster {name} does not match the canonical grid")
+        index = self._validate_asset(assets["mini_index"])
+        if index.suffix != ".parquet":
+            raise PreparedDataError("Prepared mini index must be Parquet")
 
     def _validate_asset(self, asset: dict[str, Any]) -> Path:
         if not isinstance(asset, dict) or "path" not in asset:
@@ -197,29 +211,19 @@ class PreparedDataset:
         return path
 
 
-def canonical_grid(dem_path: str | Path, crs: str | CRS, resolution: float) -> GridSpec:
-    """Derive an origin-anchored target grid from transformed DEM bounds."""
-    if not math.isfinite(resolution) or resolution <= 0:
-        raise PreparedDataError("Resolution must be a finite positive number")
-    target = parse_metric_crs(crs)
+def _aggregation_inputs(root: Path) -> tuple[Path, Path, Path, CRS]:
     try:
-        with rasterio.open(dem_path) as src:
-            if src.count != 1:
-                raise PreparedDataError("DEM must contain exactly one band")
-            if src.crs is None:
-                raise PreparedDataError("DEM has no CRS")
-            bounds = transform_bounds(src.crs, target, *src.bounds, densify_pts=21)
-    except rasterio.errors.RasterioError as exc:
-        raise PreparedDataError(f"Cannot open DEM: {dem_path}") from exc
-    left = math.floor(bounds[0] / resolution) * resolution
-    bottom = math.floor(bounds[1] / resolution) * resolution
-    right = math.ceil(bounds[2] / resolution) * resolution
-    top = math.ceil(bounds[3] / resolution) * resolution
-    width = round((right - left) / resolution)
-    height = round((top - bottom) / resolution)
-    return GridSpec(
-        target, Affine(resolution, 0, left, 0, -resolution, top), width, height
-    )
+        manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
+        roi = Path(manifest["roi"])
+        crs = CRS.from_wkt(manifest["crs_wkt"])
+        assets = manifest["assets"]
+        catchments = root / assets["catchments"]["path"]
+        segments = root / assets["segments"]["path"]
+    except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise PreparedDataError("Cannot read aggregation manifest") from exc
+    if not roi.is_dir() or not catchments.is_file() or not segments.is_file():
+        raise PreparedDataError("Aggregation manifest has missing ROI or mini assets")
+    return roi, catchments, segments, crs
 
 
 def prepare_dataset(spec: PreparationSpec) -> PreparationReport:
@@ -232,34 +236,49 @@ def prepare_dataset(spec: PreparationSpec) -> PreparationReport:
     staging = Path(tempfile.mkdtemp(prefix=f".{output.name}.tmp-", dir=output.parent))
     try:
         (staging / "rasters").mkdir()
-        grid = canonical_grid(spec.dem, spec.crs, spec.resolution)
+        roi_root, mini_catchments, mini_segments, target_crs = _aggregation_inputs(Path(spec.minis))
+        roi_manifest = json.loads((roi_root / "manifest.json").read_text(encoding="utf-8"))
+        if CRS.from_wkt(roi_manifest["crs_wkt"]) != target_crs:
+            raise PreparedDataError("Aggregation and ROI CRS do not match")
+        roi_catchments = roi_root / roi_manifest["assets"]["catchments"]["path"]
+        with rasterio.open(spec.dem) as dem:
+            _require_source_grid(dem, target_crs, "DEM")
+            domain = gpd.read_file(roi_catchments).geometry.union_all()
+            if domain.is_empty:
+                raise PreparedDataError("ROI domain is empty")
+            buffered_domain = domain.buffer(spec.buffer_cells * abs(dem.transform.a))
+            window = from_bounds(*buffered_domain.bounds, transform=dem.transform).round_offsets().round_lengths()
+            if (window.col_off < 0 or window.row_off < 0
+                or window.col_off + window.width > dem.width
+                or window.row_off + window.height > dem.height):
+                raise PreparedDataError("DEM does not cover the buffered ROI domain")
+            grid = GridSpec(target_crs, rasterio.windows.transform(window, dem.transform), int(window.width), int(window.height))
+            mask = rasterize([(buffered_domain, 1)], out_shape=(grid.height, grid.width), transform=grid.transform, fill=0, dtype="uint8").astype(bool)
 
         raster_assets: dict[str, dict[str, Any]] = {}
         dem_path = staging / "rasters" / "dem.tif"
-        _prepare_warped_raster(
-            spec.dem, dem_path, grid, "continuous", spec.memory_limit_mb
-        )
+        _prepare_clipped_raster(spec.dem, dem_path, grid, window, mask, "continuous")
         raster_assets["dem"] = _raster_asset(dem_path, staging, "continuous")
         for item in sorted(spec.rasters, key=lambda value: value.name):
             target = staging / "rasters" / f"{item.name}.tif"
-            _prepare_warped_raster(
-                item.path, target, grid, item.kind, spec.memory_limit_mb
-            )
+            _prepare_clipped_raster(item.path, target, grid, window, mask, item.kind)
             raster_assets[item.name] = _raster_asset(target, staging, item.kind)
         if spec.d8 is not None:
             target = staging / "rasters" / "d8.tif"
-            _prepare_d8(spec.d8, target, grid, spec.d8_encoding or "canonical")
+            _prepare_clipped_d8(spec.d8, target, grid, window, mask, spec.d8_encoding or "canonical")
             raster_assets["d8"] = _raster_asset(
                 target, staging, "d8", encoding="canonical-clockwise"
             )
 
+        domain_assets, mini_index = _prepare_domain_rasters(staging, grid, mini_catchments, mini_segments)
         manifest = {
             "contract": CONTRACT,
             "version": CONTRACT_VERSION,
             "producer": _producer_version(),
             "grid": grid.to_manifest(),
+            "inputs": {"minis": str(Path(spec.minis).resolve()), "roi": str(roi_root.resolve())},
             "sources": {"rasters": _raster_sources(spec)},
-            "assets": {"rasters": raster_assets},
+            "assets": {"rasters": raster_assets, **domain_assets, "mini_index": _file_asset(mini_index, staging, role="dense mini-label index")},
         }
         manifest_path = staging / "manifest.json"
         manifest_path.write_text(
@@ -291,6 +310,10 @@ def _validate_spec(spec: PreparationSpec) -> None:
         raise PreparedDataError(f"DEM input is not a local file: {spec.dem}")
     if spec.memory_limit_mb <= 0:
         raise PreparedDataError("Memory limit must be positive")
+    if spec.buffer_cells < 0:
+        raise PreparedDataError("buffer-cells must be non-negative")
+    if not Path(spec.minis).is_dir():
+        raise PreparedDataError(f"minis input is not a directory: {spec.minis}")
     names: set[str] = set()
     for item in spec.rasters:
         if not NAME_RE.fullmatch(item.name) or item.name in RESERVED_RASTER_NAMES:
@@ -310,104 +333,107 @@ def _validate_spec(spec: PreparationSpec) -> None:
         raise PreparedDataError(f"D8 input is not a local file: {spec.d8}")
 
 
-def _prepare_warped_raster(
-    source: Path,
-    output: Path,
-    grid: GridSpec,
-    kind: Literal["continuous", "categorical"],
-    memory_limit_mb: int,
-) -> None:
+def _require_source_grid(source, crs: CRS, name: str, grid: GridSpec | None = None) -> None:
+    if source.count != 1 or source.crs is None:
+        raise PreparedDataError(f"{name} must be single-band and declare a CRS")
+    if CRS.from_user_input(source.crs) != crs:
+        raise PreparedDataError(f"{name} CRS does not match the ROI CRS")
+    transform = source.transform
+    if transform.b != 0 or transform.d != 0 or transform.a <= 0 or transform.e >= 0:
+        raise PreparedDataError(f"{name} must use a north-up raster grid")
+    if grid is not None:
+        if not (math.isclose(transform.a, grid.transform.a) and math.isclose(transform.e, grid.transform.e)):
+            raise PreparedDataError(f"{name} resolution does not match the DEM grid")
+        col = (grid.transform.c - transform.c) / transform.a
+        row = (grid.transform.f - transform.f) / transform.e
+        if not (math.isclose(col, round(col), abs_tol=1e-7) and math.isclose(row, round(row), abs_tol=1e-7)):
+            raise PreparedDataError(f"{name} origin is not aligned to the DEM grid")
+        if (grid.bounds[0] < source.bounds.left - 1e-7 or grid.bounds[1] < source.bounds.bottom - 1e-7
+            or grid.bounds[2] > source.bounds.right + 1e-7 or grid.bounds[3] > source.bounds.top + 1e-7):
+            raise PreparedDataError(f"{name} does not cover the buffered ROI domain")
+
+
+def _prepare_clipped_raster(source: Path, output: Path, grid: GridSpec, window: Window, domain_mask: np.ndarray, kind: Literal["continuous", "categorical"]) -> None:
     dtype = "float32" if kind == "continuous" else "int32"
     resampling = Resampling.bilinear if kind == "continuous" else Resampling.nearest
     intermediate = output.with_suffix(".working.tif")
     try:
-        with rasterio.open(source) as src:
-            if src.count != 1:
-                raise PreparedDataError(
-                    f"Raster {source} must contain exactly one band"
-                )
-            if src.crs is None:
-                raise PreparedDataError(f"Raster {source} has no CRS")
-            with (
-                WarpedVRT(
-                    src,
-                    crs=grid.crs,
-                    transform=grid.transform,
-                    width=grid.width,
-                    height=grid.height,
-                    resampling=resampling,
-                    warp_mem_limit=memory_limit_mb,
-                ) as vrt,
-                _working_raster(intermediate, grid, dtype) as dst,
-            ):
-                for _, window in dst.block_windows(1):
-                    values = vrt.read(1, window=window, masked=True)
-                    mask = ~np.ma.getmaskarray(values)
-                    if kind == "continuous":
-                        raw = values.filled(0)
-                        mask &= np.isfinite(raw)
-                        data = np.where(mask, raw, 0).astype("float32")
-                    else:
-                        raw = values.filled(0)
-                        valid = raw[mask]
-                        if valid.size and (
-                            not np.all(np.isfinite(valid))
-                            or not np.all(valid == np.floor(valid))
-                            or valid.min() < np.iinfo(np.int32).min
-                            or valid.max() > np.iinfo(np.int32).max
-                        ):
-                            raise PreparedDataError(
-                                f"Categorical raster {source} contains non-int32 values"
-                            )
-                        data = raw.astype("int32")
-                    dst.write(data, 1, window=window)
-                    dst.write_mask(mask.astype("uint8") * 255, window=window)
+        with rasterio.open(source) as src, _working_raster(intermediate, grid, dtype) as dst:
+            _require_source_grid(src, grid.crs, str(source), grid)
+            source_window = from_bounds(*grid.bounds, transform=src.transform).round_offsets().round_lengths()
+            values = src.read(1, window=source_window, masked=True)
+            valid = ~np.ma.getmaskarray(values) & domain_mask
+            raw = values.filled(0)
+            if kind == "continuous":
+                valid &= np.isfinite(raw)
+                data = np.where(valid, raw, 0).astype(dtype)
+            else:
+                source_values = raw[valid]
+                if source_values.size and (not np.all(np.isfinite(source_values)) or not np.all(source_values == np.floor(source_values))):
+                    raise PreparedDataError(f"Categorical raster {source} contains non-integral values")
+                data = raw.astype(dtype)
+            dst.write(data, 1)
+            dst.write_mask(valid.astype("uint8") * 255)
         _to_cog(intermediate, output, resampling)
     finally:
         intermediate.unlink(missing_ok=True)
 
 
-def _prepare_d8(source: Path, output: Path, grid: GridSpec, encoding: str) -> None:
+def _prepare_clipped_d8(source: Path, output: Path, grid: GridSpec, window: Window, domain_mask: np.ndarray, encoding: str) -> None:
     intermediate = output.with_suffix(".working.tif")
     esri = {0: 0, 1: 3, 2: 4, 4: 5, 8: 6, 16: 7, 32: 8, 64: 1, 128: 2}
     try:
-        with rasterio.open(source) as src:
-            if src.count != 1 or src.crs is None:
-                raise PreparedDataError(
-                    "D8 raster must be single-band and declare a CRS"
-                )
-            if (
-                CRS.from_user_input(src.crs) != grid.crs
-                or src.transform != grid.transform
-                or src.shape != (grid.height, grid.width)
-            ):
-                raise PreparedDataError(
-                    "D8 raster must exactly match the canonical grid"
-                )
-            with _working_raster(intermediate, grid, "uint8") as dst:
-                for _, window in src.block_windows(1):
-                    values = src.read(1, window=window, masked=True)
-                    mask = ~np.ma.getmaskarray(values)
-                    raw = values.filled(0)
-                    valid_values = set(np.unique(raw[mask]).tolist())
-                    allowed = set(range(9)) if encoding == "canonical" else set(esri)
-                    unknown = valid_values - allowed
-                    if unknown:
-                        raise PreparedDataError(
-                            "D8 raster contains invalid code(s): "
-                            + ", ".join(str(value) for value in sorted(unknown))
-                        )
-                    if encoding == "canonical":
-                        data = raw.astype("uint8")
-                    else:
-                        data = np.zeros(raw.shape, dtype="uint8")
-                        for source_code, target_code in esri.items():
-                            data[raw == source_code] = target_code
-                    dst.write(data, 1, window=window)
-                    dst.write_mask(mask.astype("uint8") * 255, window=window)
+        with rasterio.open(source) as src, _working_raster(intermediate, grid, "uint8") as dst:
+            _require_source_grid(src, grid.crs, "D8", grid)
+            source_window = from_bounds(*grid.bounds, transform=src.transform).round_offsets().round_lengths()
+            values = src.read(1, window=source_window, masked=True)
+            valid = ~np.ma.getmaskarray(values) & domain_mask
+            raw = values.filled(0)
+            allowed = set(range(9)) if encoding == "canonical" else set(esri)
+            unknown = set(np.unique(raw[valid]).tolist()) - allowed
+            if unknown:
+                raise PreparedDataError("D8 raster contains invalid code(s): " + ", ".join(map(str, sorted(unknown))))
+            data = raw.astype("uint8") if encoding == "canonical" else np.vectorize(lambda value: esri.get(value, 0), otypes=["uint8"])(raw)
+            dst.write(data, 1)
+            dst.write_mask(valid.astype("uint8") * 255)
         _to_cog(intermediate, output, Resampling.nearest)
     finally:
         intermediate.unlink(missing_ok=True)
+
+
+def _prepare_domain_rasters(staging: Path, grid: GridSpec, catchment_path: Path, segment_path: Path) -> tuple[dict[str, dict[str, Any]], Path]:
+    """Rasterize complete aggregated minis before terrain processing."""
+    from mgb_vec_hydro.execution.raster import RasterAssembler, RasterPatch, RasterProductSpec
+    catchments = gpd.read_file(catchment_path).set_index("id")
+    segments = gpd.read_file(segment_path).set_index("id")
+    if set(catchments.index) != set(segments.index):
+        raise PreparedDataError("Mini catchments and segments do not have matching IDs")
+    ordered = sorted(catchments.index, key=lambda value: (type(value).__name__, str(value)))
+    labels = {mini_id: label for label, mini_id in enumerate(ordered, start=1)}
+    raster_root = staging / "rasters"
+    with RasterAssembler(raster_root, grid, (RasterProductSpec("mini_ownership", "int32"), RasterProductSpec("drainage", "uint8"))) as assembler:
+        for mini_id in ordered:
+            catchment, segment = catchments.loc[mini_id].geometry, segments.loc[mini_id].geometry
+            if catchment is None or segment is None or catchment.is_empty or segment.is_empty:
+                raise PreparedDataError(f"Mini {mini_id} has invalid geometry")
+            win = from_bounds(*catchment.bounds, transform=grid.transform).round_offsets().round_lengths().intersection(Window(0, 0, grid.width, grid.height))
+            shape = (int(win.height), int(win.width))
+            transform = rasterio.windows.transform(win, grid.transform)
+            valid = rasterize([(catchment, 1)], out_shape=shape, transform=transform, dtype="uint8", all_touched=False).astype(bool)
+            drainage = rasterize([(segment, 1)], out_shape=shape, transform=transform, dtype="uint8", all_touched=True).astype(bool) & valid
+            if not valid.any() or not drainage.any():
+                raise PreparedDataError(f"Mini {mini_id} has no rasterized ownership or drainage cells")
+            assembler.write(RasterPatch("mini_ownership", win, np.full(shape, labels[mini_id], dtype="int32"), valid))
+            assembler.write(RasterPatch("drainage", win, drainage.astype("uint8"), valid))
+        paths = assembler.finish()
+    index = staging / "mini_index.parquet"
+    bounds = [catchments.loc[mini_id].geometry.bounds for mini_id in ordered]
+    pd.DataFrame({
+        "mini_label": np.arange(1, len(ordered) + 1, dtype="int32"), "mini_id": ordered,
+        "minx": [value[0] for value in bounds], "miny": [value[1] for value in bounds],
+        "maxx": [value[2] for value in bounds], "maxy": [value[3] for value in bounds],
+    }).to_parquet(index, index=False)
+    return ({name: _raster_asset(path, staging, name) for name, path in paths.items()}, index)
 
 
 def _working_raster(path: Path, grid: GridSpec, dtype: str):

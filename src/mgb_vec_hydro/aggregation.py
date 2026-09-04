@@ -4,6 +4,7 @@ from collections import defaultdict
 from collections.abc import Hashable
 from dataclasses import dataclass
 from pathlib import Path
+import json
 
 import geopandas as gpd
 import pandas as pd
@@ -35,6 +36,8 @@ INPUT_COLUMNS = [
     "water_course",
     "geometry",
 ]
+AGGREGATION_CONTRACT = "mgb-aggregation-dataset"
+AGGREGATION_CONTRACT_VERSION = 1
 
 
 @dataclass(frozen=True)
@@ -62,6 +65,7 @@ class AggregationSpec:
 @dataclass(frozen=True)
 class AggregationReport:
     output_dir: Path
+    manifest: Path
     catchment_count: int
     segment_count: int
     mapping_count: int
@@ -246,6 +250,7 @@ def aggregate_roi_dataset(spec: AggregationSpec) -> AggregationReport:
         catchment_path = staging / "mini_catchments.fgb"
         segment_path = staging / "mini_segments.fgb"
         mapping_path = staging / "source_to_mini.csv"
+        manifest_path = staging / "manifest.json"
         result.catchments.to_file(
             catchment_path, driver="FlatGeobuf", index=False, SPATIAL_INDEX="YES"
         )
@@ -260,13 +265,26 @@ def aggregate_roi_dataset(spec: AggregationSpec) -> AggregationReport:
             catchment_path, segment_path, mapping_path,
             expected_crs=expected_crs, source_ids=set(catchments["id"]),
         )
+        manifest_path.write_text(
+            json.dumps({
+                "contract": AGGREGATION_CONTRACT,
+                "version": AGGREGATION_CONTRACT_VERSION,
+                "roi": str(Path(spec.roi).resolve()),
+                "crs_wkt": expected_crs.to_wkt(version="WKT2_2019", pretty=False),
+                "assets": {
+                    "catchments": {"path": "mini_catchments.fgb", "driver": "FlatGeobuf", "feature_count": len(result.catchments)},
+                    "segments": {"path": "mini_segments.fgb", "driver": "FlatGeobuf", "feature_count": len(result.segments)},
+                    "mapping": {"path": "source_to_mini.csv", "driver": "CSV", "feature_count": len(result.mapping)},
+                },
+            }, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
         publisher.publish(
-            ("mini_catchments.fgb", "mini_segments.fgb", "source_to_mini.csv")
+            ("manifest.json", "mini_catchments.fgb", "mini_segments.fgb", "source_to_mini.csv")
         )
     if checkpoint is not None:
         checkpoint.cleanup()
     return AggregationReport(
-        output, len(result.catchments), len(result.segments), len(result.mapping)
+        output, output / "manifest.json", len(result.catchments), len(result.segments), len(result.mapping)
     )
 
 

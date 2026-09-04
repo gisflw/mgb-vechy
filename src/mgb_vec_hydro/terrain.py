@@ -21,6 +21,7 @@ import numpy as np
 import pandas as pd
 import pyogrio
 import rasterio
+from rasterio.shutil import copy as copy_raster
 from affine import Affine
 from numba import njit
 from pyproj import CRS
@@ -85,7 +86,6 @@ TASK_FIXED_BYTES = 8 * 1024 * 1024
 @dataclass(frozen=True)
 class TerrainSpec:
     prepared: Path
-    minis: Path
     output_dir: Path
     direction_source: Literal["dem", "d8"] = "dem"
     write_flow_direction: bool = False
@@ -1029,8 +1029,8 @@ class _MiniUnit:
     raster: RasterUnit
     mini_label: int
     mini_id: Any
-    catchment_fid: int
-    segment_fid: int
+    catchment_fid: int = -1
+    segment_fid: int = -1
 
 
 @dataclass(frozen=True)
@@ -1112,9 +1112,8 @@ def _create_terrain_dataset(spec: TerrainSpec) -> TerrainReport:
     prepared.validate()
     grid = prepared_grid(spec.prepared)
     planning_started = time.perf_counter()
-    mini_units, mini_index, mini_identity = _plan_minis(spec, grid)
+    mini_units, mini_index, mini_identity = _plan_minis(spec.prepared, grid)
     memory_bytes = spec.memory_limit_mb * 1024 * 1024
-    domain_items = _domain_work_items(mini_units, spec, grid, memory_bytes)
     planning_seconds = time.perf_counter() - planning_started
     config = ExecutionConfig(
         workers=spec.workers,
@@ -1123,13 +1122,7 @@ def _create_terrain_dataset(spec: TerrainSpec) -> TerrainReport:
         io_slots=spec.io_slots,
     )
     checkpoint_root = Path(spec.checkpoint_dir) if spec.checkpoint_dir else None
-    domain_checkpoint = _checkpoint(
-        checkpoint_root / "domain" if checkpoint_root else None,
-        "terrain-domain",
-        prepared.manifest,
-        {"minis": mini_identity},
-        domain_items,
-    )
+    domain_checkpoint = None
 
     publisher = AtomicOutputDirectory(spec.output_dir)
     compression_seconds = 0.0
@@ -1139,58 +1132,13 @@ def _create_terrain_dataset(spec: TerrainSpec) -> TerrainReport:
         mini_index_path = staging / "mini_index.parquet"
         mini_index.to_parquet(mini_index_path, index=False)
 
-        domain_specs = (
-            RasterProductSpec(
-                "mini_ownership",
-                "int32",
-                tags={
-                    "role": "mini-catchment ownership",
-                    "labels": "mini_index.parquet",
-                },
-            ),
-            RasterProductSpec(
-                "drainage",
-                "uint8",
-                tags={
-                    "role": "matching mini drainage",
-                    "values": "0 non-drainage, 1 drainage",
-                },
-            ),
-        )
-        with RasterAssembler(
-            raster_root,
-            grid,
-            domain_specs,
-            compression_threads=min(spec.workers, 4),
-        ) as domain_assembler:
-
-            def reduce_domain(result):
-                started = time.perf_counter()
-                for patch in result.value.patches:
-                    domain_assembler.write(
-                        RasterPatch(
-                            "mini_ownership",
-                            patch.window,
-                            patch.ownership,
-                            patch.valid,
-                        )
-                    )
-                    domain_assembler.write(
-                        RasterPatch(
-                            "drainage", patch.window, patch.drainage, patch.valid
-                        )
-                    )
-                return {"output_write": time.perf_counter() - started}
-
-            domain_report = LocalExecutor(config).run(
-                domain_items,
-                _domain_worker,
-                reduce_domain,
-                checkpoint=domain_checkpoint,
-            )
-            started = time.perf_counter()
-            domain_paths = domain_assembler.finish()
-            compression_seconds += time.perf_counter() - started
+        domain_paths = {}
+        for name in ("mini_ownership", "drainage"):
+            source = prepared.asset_path(prepared.manifest["assets"][name]["path"])
+            target = raster_root / f"{name}.tif"
+            copy_raster(source, target, driver="COG", BLOCKSIZE=BLOCK_SIZE, COMPRESS="DEFLATE")
+            domain_paths[name] = target
+        domain_report = ExecutionReport(0, 0, 0, 0, 0, 0, 0.0, {}, ())
 
         terrain_items = _terrain_work_items(
             mini_units,
@@ -1338,9 +1286,8 @@ def _create_terrain_dataset(spec: TerrainSpec) -> TerrainReport:
 
 
 def _validate_terrain_spec(spec: TerrainSpec) -> None:
-    for name, path in (("prepared", spec.prepared), ("minis", spec.minis)):
-        if not Path(path).is_dir():
-            raise TerrainProductsError(f"{name} input is not a directory: {path}")
+    if not Path(spec.prepared).is_dir():
+        raise TerrainProductsError(f"prepared input is not a directory: {spec.prepared}")
     if spec.direction_source not in {"dem", "d8"}:
         raise TerrainProductsError("direction source must be 'dem' or 'd8'")
     for name, value in (
@@ -1378,64 +1325,25 @@ def _validate_terrain_spec(spec: TerrainSpec) -> None:
 
 
 def _plan_minis(
-    spec: TerrainSpec, grid: GridSpec
+    prepared_root: Path, grid: GridSpec
 ) -> tuple[tuple[_MiniUnit, ...], pd.DataFrame, dict[str, Any]]:
-    root = Path(spec.minis)
-    catchment_path = root / "mini_catchments.fgb"
-    segment_path = root / "mini_segments.fgb"
-    providers = {
-        "catchments": inspect_vector_provider(catchment_path),
-        "segments": inspect_vector_provider(segment_path),
-    }
-    for name, provider in providers.items():
-        if provider.driver != "FlatGeobuf":
-            raise TerrainProductsError(f"Mini {name} must be FlatGeobuf")
-        if list(provider.fields) != INPUT_COLUMNS[:-1]:
-            raise TerrainProductsError(f"Mini {name} schema is invalid")
-        if provider.crs != grid.crs:
-            raise TerrainProductsError(f"Mini {name} does not use the canonical CRS")
-    if providers["catchments"].geometry_type not in {"Polygon", "MultiPolygon"}:
-        raise TerrainProductsError("Mini catchments must contain polygon geometry")
-    if providers["segments"].geometry_type not in {
-        "LineString",
-        "MultiLineString",
-    }:
-        raise TerrainProductsError("Mini segments must contain line geometry")
-    catchment_fids = scan_id_fids(
-        providers["catchments"], "id", batch_size=spec.batch_size
-    )
-    segment_fids = scan_id_fids(providers["segments"], "id", batch_size=spec.batch_size)
-    if not catchment_fids or any(_is_missing_id(value) for value in catchment_fids):
-        raise TerrainProductsError("Mini catchment IDs must be non-null")
-    if any(_is_missing_id(value) for value in segment_fids):
-        raise TerrainProductsError("Mini segment IDs must be non-null")
-    if set(catchment_fids) != set(segment_fids):
-        raise TerrainProductsError("Mini catchment and segment IDs do not match")
-    if len(catchment_fids) > np.iinfo(np.int32).max:
-        raise TerrainProductsError("Too many minis for int32 ownership labels")
+    dataset = PreparedDataset.open(prepared_root)
     try:
-        bound_fids, raw_bounds = pyogrio.read_bounds(catchment_path)
+        index_path = dataset.asset_path(dataset.manifest["assets"]["mini_index"]["path"])
+        table = pd.read_parquet(index_path)
     except Exception as exc:
-        raise TerrainProductsError("Cannot read indexed mini bounds") from exc
-    bounds_by_fid = {
-        int(fid): tuple(float(raw_bounds[row, index]) for row in range(4))
-        for index, fid in enumerate(bound_fids)
-    }
-    ordered_ids = sorted(catchment_fids, key=_mini_id_sort_key)
+        raise TerrainProductsError("Cannot read prepared mini index") from exc
+    required = ["mini_label", "mini_id", "minx", "miny", "maxx", "maxy"]
+    if list(table.columns) != required or table.empty or table["mini_label"].duplicated().any():
+        raise TerrainProductsError("Prepared mini index schema is invalid")
     labels_by_key = {
-        f"mini-{label:010d}": (label, mini_id)
-        for label, mini_id in enumerate(ordered_ids, start=1)
+        f"mini-{int(row.mini_label):010d}": (int(row.mini_label), row.mini_id)
+        for row in table.itertuples(index=False)
     }
-    try:
-        unit_bounds = [
-            (
-                key,
-                bounds_by_fid[catchment_fids[mini_id]],
-            )
-            for key, (_, mini_id) in labels_by_key.items()
-        ]
-    except KeyError as exc:
-        raise TerrainProductsError("Mini bounds do not match provider FIDs") from exc
+    unit_bounds = [
+        (f"mini-{int(row.mini_label):010d}", (float(row.minx), float(row.miny), float(row.maxx), float(row.maxy)))
+        for row in table.itertuples(index=False)
+    ]
     planned = plan_raster_units(
         grid,
         unit_bounds,
@@ -1447,20 +1355,17 @@ def _plan_minis(
             raster,
             labels_by_key[raster.key][0],
             labels_by_key[raster.key][1],
-            catchment_fids[labels_by_key[raster.key][1]],
-            segment_fids[labels_by_key[raster.key][1]],
         )
         for raster in planned
     )
     mini_index = pd.DataFrame(
         {
-            "mini_label": np.arange(1, len(ordered_ids) + 1, dtype="int32"),
-            "mini_id": ordered_ids,
+            "mini_label": table["mini_label"].to_numpy(dtype="int32"),
+            "mini_id": table["mini_id"].to_numpy(),
         }
     )
     identity = {
-        "catchments": _file_identity(catchment_path),
-        "segments": _file_identity(segment_path),
+        "mini_index": _file_identity(index_path),
     }
     return result, mini_index, identity
 
@@ -1909,7 +1814,6 @@ def _terrain_manifest(
         "grid": grid.to_manifest(),
         "inputs": {
             "prepared": str(Path(spec.prepared).resolve()),
-            "minis": str(Path(spec.minis).resolve()),
             "mini_assets": mini_identity,
         },
         "routing": {

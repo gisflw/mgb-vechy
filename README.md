@@ -6,8 +6,8 @@ vector networks that expose explicit segment and downstream topology columns;
 BHO is supported as the initial regression dataset rather than as a fixed
 schema.
 
-The implemented workflow prepares canonical raster inputs, selects raw vectors into
-a region of interest, aggregates source units into mini-basins, generates HAND
+The implemented workflow selects raw vectors into a region of interest, aggregates
+source units into mini-basins, prepares aligned raster and mini-domain inputs, generates HAND
 and local terrain-to-drainage products, and samples terrain and existing HRU
 classes onto mini-basins. HRU class construction and final MGB file generation
 remain planned work.
@@ -23,16 +23,18 @@ python -m pip install -e .
 
 ## Commands
 
+Run the stages in this order: define an ROI, aggregate mini-basins, prepare
+the raster/mini domain, then generate terrain products. The preparation command
+is documented first because it defines the reusable raster input contract.
+
 ### Prepare canonical inputs
 
-Create aligned COG rasters on one authoritative grid (Stage 0 does not read
-vectors):
+Clip already aligned rasters and rasterize the aggregated mini domain:
 
 ```bash
 mgb-vec-hydro prepare \
   --dem data/dem.tif \
-  --crs EPSG:6933 \
-  --resolution 30 \
+  --minis output/minis \
   --categorical-raster hru data/hru.tif \
   --output-dir prepared
 ```
@@ -43,7 +45,7 @@ Select all catchments and segments upstream of one or more outlets:
 
 ```bash
 mgb-vec-hydro define-roi \
-  --prepared prepared \
+  --crs EPSG:6933 \
   --catchments data/catchments.gpkg \
   --segments data/segments.gpkg \
   --outlet-id 123 \
@@ -51,6 +53,8 @@ mgb-vec-hydro define-roi \
   --id-down-col id_down \
   --strahler-order-col strahler_order \
   --upstream-area-col upstream_area \
+  --unit-length-col unit_length_km \
+  --unit-area-col unit_area_km2 \
   --output-dir output/roi
 ```
 
@@ -75,7 +79,6 @@ Create strict mini-confined HAND and local terrain-to-drainage COGs. Add
 ```bash
 mgb-vec-hydro terrain-products \
   --prepared prepared \
-  --minis output/minis \
   --direction-source dem \
   --output-dir output/terrain
 ```
@@ -101,10 +104,11 @@ Use `mgb-vec-hydro COMMAND --help` for the complete option list.
 
 ## Documentation
 
-- [Prepare-data contract](docs/stage0_prepare_data.md)
+- [ROI and working CRS](docs/stage1_roi_cli.md)
+- [Prepare-data contract](docs/stage3_prepare_data.md)
 - [ROI CLI and normalized schema](docs/stage1_roi_cli.md)
 - [Mini-basin aggregation CLI](docs/stage2_aggregation_cli.md)
-- [Terrain-products CLI](docs/stage3_terrain_cli.md)
+- [Terrain-products CLI](docs/stage4_terrain_cli.md)
 - [Mini-basin sampling CLI](docs/stage5_mini_sampling_cli.md)
 - [Remaining workflow plans](docs/plan/README.md)
 - [Larger-than-memory processing change](docs/changes/larger-than-memory-processing.md)

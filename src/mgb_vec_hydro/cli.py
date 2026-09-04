@@ -30,12 +30,10 @@ _NAMED_RASTER = click.Tuple(
     type=click.Path(exists=True, dir_okay=False, path_type=Path),
     required=True,
 )
-@click.option("--crs", required=True, help="Canonical projected CRS with metre units.")
 @click.option(
-    "--resolution",
-    type=click.FloatRange(min=0, min_open=True),
+    "--minis",
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
     required=True,
-    help="Canonical square-cell resolution in metres.",
 )
 @click.option(
     "--continuous-raster",
@@ -57,6 +55,7 @@ _NAMED_RASTER = click.Tuple(
     default=512,
     show_default=True,
 )
+@click.option("--buffer-cells", type=click.IntRange(min=0), default=1, show_default=True)
 @click.option(
     "--output-dir",
     type=click.Path(file_okay=False, path_type=Path),
@@ -64,13 +63,13 @@ _NAMED_RASTER = click.Tuple(
 )
 def prepare_command(
     dem: Path,
-    crs: str,
-    resolution: float,
+    minis: Path,
     continuous_raster: tuple[tuple[str, Path], ...],
     categorical_raster: tuple[tuple[str, Path], ...],
     d8: Path | None,
     d8_encoding: str | None,
     memory_limit_mb: int,
+    buffer_cells: int,
     output_dir: Path,
 ) -> None:
     """Stage a canonical grid and COG raster inputs."""
@@ -82,12 +81,12 @@ def prepare_command(
         report = prepare_dataset(
             PreparationSpec(
                 dem=dem,
-                crs=crs,
-                resolution=resolution,
+                minis=minis,
                 rasters=rasters,
                 d8=d8,
                 d8_encoding=d8_encoding,
                 memory_limit_mb=memory_limit_mb,
+                buffer_cells=buffer_cells,
                 output_dir=output_dir,
             )
         )
@@ -98,11 +97,7 @@ def prepare_command(
 
 
 @main.command("define-roi")
-@click.option(
-    "--prepared",
-    type=click.Path(exists=True, file_okay=False, path_type=Path),
-    required=True,
-)
+@click.option("--crs", required=True, help="Working projected CRS with metre units.")
 @click.option(
     "--catchments",
     "catchments_path",
@@ -124,6 +119,8 @@ def prepare_command(
 @click.option("--id-down-col", required=True)
 @click.option("--strahler-order-col", required=True)
 @click.option("--upstream-area-col", required=True)
+@click.option("--unit-length-col", required=True, help="Segment length column in km.")
+@click.option("--unit-area-col", required=True, help="Catchment area column in km².")
 @click.option(
     "--output-dir",
     type=click.Path(file_okay=False, path_type=Path),
@@ -141,7 +138,7 @@ def prepare_command(
 )
 @click.option("--checkpoint-dir", type=click.Path(file_okay=False, path_type=Path))
 def define_roi_command(
-    prepared: Path,
+    crs: str,
     catchments_path: Path,
     catchments_layer: str | None,
     catchments_source_crs: str | None,
@@ -153,6 +150,8 @@ def define_roi_command(
     id_down_col: str,
     strahler_order_col: str,
     upstream_area_col: str,
+    unit_length_col: str,
+    unit_area_col: str,
     output_dir: Path,
     workers: int,
     memory_limit_mb: int,
@@ -165,7 +164,7 @@ def define_roi_command(
     try:
         report = define_roi_dataset(
             RoiSpec(
-                prepared=prepared,
+                crs=crs,
                 catchments=catchments_path,
                 catchments_layer=catchments_layer,
                 catchments_source_crs=catchments_source_crs,
@@ -177,6 +176,8 @@ def define_roi_command(
                 id_down_col=id_down_col,
                 strahler_order_col=strahler_order_col,
                 upstream_area_col=upstream_area_col,
+                unit_length_col=unit_length_col,
+                unit_area_col=unit_area_col,
                 output_dir=output_dir,
                 workers=workers,
                 memory_limit_mb=memory_limit_mb,
@@ -258,11 +259,6 @@ def aggregate_command(
     required=True,
 )
 @click.option(
-    "--minis",
-    type=click.Path(exists=True, file_okay=False, path_type=Path),
-    required=True,
-)
-@click.option(
     "--output-dir",
     type=click.Path(file_okay=False, path_type=Path),
     required=True,
@@ -308,7 +304,6 @@ def aggregate_command(
 @click.option("--checkpoint-dir", type=click.Path(file_okay=False, path_type=Path))
 def terrain_products_command(
     prepared: Path,
-    minis: Path,
     output_dir: Path,
     direction_source: str,
     write_flow_direction: bool,
@@ -327,7 +322,6 @@ def terrain_products_command(
         report = create_terrain_dataset(
             TerrainSpec(
                 prepared=prepared,
-                minis=minis,
                 output_dir=output_dir,
                 direction_source=direction_source.lower(),
                 write_flow_direction=write_flow_direction,

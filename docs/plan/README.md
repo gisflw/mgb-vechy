@@ -6,16 +6,17 @@ sampling stages.
 
 The implemented commands are:
 
-1. `prepare`, which writes canonical vector and raster inputs. See the
-   [Stage 0 CLI guide](../stage0_prepare_data.md).
-2. `define-roi`, which writes normalized ROI catchments and segments. See the
+1. `define-roi`, which defines the working CRS and writes normalized ROI
+   catchments and segments. See the
    [Stage 1 CLI guide](../stage1_roi_cli.md).
-3. `aggregate`, which writes aggregated mini-basin catchments, reaches, and
+2. `aggregate`, which writes aggregated mini-basin catchments, reaches, and
    source-to-mini mapping. See the
    [Stage 2 CLI guide](../stage2_aggregation_cli.md).
-4. `terrain-products`, which writes a versioned canonical-grid domain, HAND,
-   and local terrain-to-drainage dataset. See the
-   [Stage 3 CLI guide](../stage3_terrain_cli.md).
+3. `prepare`, which writes clipped raster and rasterized mini-domain inputs.
+   See the [Stage 3 CLI guide](../stage3_prepare_data.md).
+4. `terrain-products`, which writes HAND and local terrain-to-drainage
+   products. See the
+   [Stage 4 CLI guide](../stage4_terrain_cli.md).
 5. `sample-minis`, which samples terrain and existing HRU classes into a
    mini-basin attribute table. See the
    [Stage 5 CLI guide](../stage5_mini_sampling_cli.md).

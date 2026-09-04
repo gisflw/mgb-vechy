@@ -35,7 +35,7 @@ from mgb_vec_hydro.execution.vector import (
     id_predicate,
     inspect_vector_provider,
 )
-from mgb_vec_hydro.preparation import PreparedDataset
+from mgb_vec_hydro.crs_utils import parse_metric_crs
 
 DEFAULT_STRAHLER_ORDER_COL = "strahler_order"
 ROI_CONTRACT = "mgb-roi-dataset"
@@ -48,7 +48,7 @@ ROI_COLUMNS = [
 
 @dataclass(frozen=True)
 class RoiSpec:
-    prepared: Path
+    crs: str
     catchments: Path
     segments: Path
     outlet_ids: tuple[str, ...]
@@ -56,6 +56,8 @@ class RoiSpec:
     id_down_col: str
     strahler_order_col: str
     upstream_area_col: str
+    unit_length_col: str
+    unit_area_col: str
     output_dir: Path
     catchments_layer: str | None = None
     segments_layer: str | None = None
@@ -150,19 +152,18 @@ class _Provider:
 def define_roi_dataset(spec: RoiSpec) -> RoiReport:
     """Select from raw providers and atomically publish a normalized ROI."""
     _validate_spec(spec)
-    prepared = PreparedDataset.open(spec.prepared)
-    prepared.validate()
-    checkpoint = _roi_checkpoint(spec, prepared.manifest)
-    target_crs = CRS.from_wkt(prepared.manifest["grid"]["crs_wkt"])
+    target_crs = parse_metric_crs(spec.crs)
+    checkpoint = _roi_checkpoint(spec, target_crs)
     segment_provider = _provider(
         spec.segments, spec.segments_layer, spec.segments_source_crs,
         {"id": spec.id_col, "id_down": spec.id_down_col,
          "strahler_order": spec.strahler_order_col,
-         "upstream_area": spec.upstream_area_col}, "segments",
+         "upstream_area": spec.upstream_area_col,
+         "unit_length": spec.unit_length_col}, "segments",
     )
     catchment_provider = _provider(
         spec.catchments, spec.catchments_layer, spec.catchments_source_crs,
-        {"id": spec.id_col}, "catchments",
+        {"id": spec.id_col, "unit_area": spec.unit_area_col}, "catchments",
     )
     topology, segment_fids = _read_topology(segment_provider, spec.batch_size)
     outlet_ids = _coerce_outlets(spec.outlet_ids, topology["id"])
@@ -197,7 +198,6 @@ def define_roi_dataset(spec: RoiSpec) -> RoiReport:
         manifest = {
             "contract": ROI_CONTRACT,
             "version": ROI_CONTRACT_VERSION,
-            "prepared": str(Path(spec.prepared).resolve()),
             "crs_wkt": target_crs.to_wkt(version="WKT2_2019", pretty=False),
             "assets": {
                 "catchments": _asset(catchments_path, staging, len(result.catchments)),
@@ -221,7 +221,7 @@ def define_roi_dataset(spec: RoiSpec) -> RoiReport:
 
 
 def _roi_checkpoint(
-    spec: RoiSpec, prepared_manifest: dict[str, Any]
+    spec: RoiSpec, target_crs: CRS
 ) -> CheckpointStore[Any] | None:
     if spec.checkpoint_dir is None:
         return None
@@ -234,11 +234,11 @@ def _roi_checkpoint(
     fingerprint = execution_fingerprint(
         algorithm="define-roi",
         version="1",
-        prepared_manifest=prepared_manifest,
+        prepared_manifest={"crs_wkt": target_crs.to_wkt(version="WKT2_2019", pretty=False)},
         parameters={
             "sources": sources,
             "outlets": list(spec.outlet_ids),
-            "columns": [spec.id_col, spec.id_down_col, spec.strahler_order_col, spec.upstream_area_col],
+            "columns": [spec.id_col, spec.id_down_col, spec.strahler_order_col, spec.upstream_area_col, spec.unit_length_col, spec.unit_area_col],
             "layers": [spec.catchments_layer, spec.segments_layer],
             "source_crs": [spec.catchments_source_crs, spec.segments_source_crs],
         },
@@ -253,7 +253,7 @@ def define_roi(spec: RoiSpec) -> RoiReport:
 
 
 def _validate_spec(spec: RoiSpec) -> None:
-    for label, path in (("prepared", spec.prepared), ("catchments", spec.catchments), ("segments", spec.segments)):
+    for label, path in (("catchments", spec.catchments), ("segments", spec.segments)):
         if not Path(path).exists():
             raise PreparedDataError(f"{label} input does not exist: {path}")
     if not spec.outlet_ids:
@@ -263,6 +263,7 @@ def _validate_spec(spec: RoiSpec) -> None:
             raise InvalidInputSchemaError(f"{name} must be a positive integer")
     if spec.workers > 4:
         raise InvalidInputSchemaError("workers cannot exceed four")
+    parse_metric_crs(spec.crs)
 
 
 def _provider(path: Path, layer: str | None, override: str | None, requested: dict[str, str], label: str) -> _Provider:
@@ -332,7 +333,7 @@ def _read_topology(provider: _Provider, batch_size: int) -> tuple[pd.DataFrame, 
         )
     fids = dict(zip(frame["id"], frame[fid_column], strict=True))
     return (
-        frame[["id", "id_down", "strahler_order", "upstream_area"]].reset_index(drop=True),
+        frame[["id", "id_down", "strahler_order", "upstream_area", "unit_length"]].reset_index(drop=True),
         fids,
     )
 
@@ -428,6 +429,11 @@ def _validate_selected_attributes(frame: pd.DataFrame) -> None:
         raise InvalidInputSchemaError(
             "Selected upstream areas must be finite non-negative numeric values"
         )
+    length = pd.to_numeric(frame["unit_length"], errors="coerce").to_numpy(dtype=float)
+    if not np.all(np.isfinite(length)) or np.any(length < 0):
+        raise InvalidInputSchemaError(
+            "Selected unit lengths must be finite non-negative numeric values"
+        )
 
 
 def _read_selected(
@@ -455,7 +461,7 @@ def _read_selected(
                 values = ordered[start : start + packet_size]
                 frames.append(pyogrio.read_dataframe(
                     provider.path, layer=provider.layer,
-                    columns=[provider.fields["id"]],
+                    columns=list(dict.fromkeys(provider.fields.values())),
                     where=id_predicate(provider.fields["id"], values),
                     use_arrow=True,
                 ))
@@ -482,7 +488,7 @@ def _read_selected(
             for start in range(0, len(selected_fids), rows_per_packet):
                 frames.append(pyogrio.read_dataframe(
                     provider.path, layer=provider.layer,
-                    columns=[provider.fields["id"]],
+                    columns=list(dict.fromkeys(provider.fields.values())),
                     fids=selected_fids[start : start + rows_per_packet],
                     use_arrow=True,
                 ))
@@ -494,7 +500,7 @@ def _read_selected(
         raise InvalidInputSchemaError("Provider returned no selected geometries")
     frame = pd.concat(frames, ignore_index=True)
     frame = gpd.GeoDataFrame(frame, geometry=frames[0].geometry.name, crs=frames[0].crs)
-    frame = frame.rename(columns={provider.fields["id"]: "id"})
+    frame = frame.rename(columns={actual: normalized for normalized, actual in provider.fields.items()})
     if frame.geometry.name != "geometry":
         frame = frame.rename_geometry("geometry")
     returned = frame["id"]
@@ -516,7 +522,7 @@ def _read_selected(
         raise InvalidInputSchemaError(
             "Selected geometry packet exceeds the configured memory budget"
         )
-    return frame[["id", "geometry"]]
+    return frame[[*provider.fields.keys(), "geometry"]]
 
 
 def _scan_fids(provider: _Provider, batch_size: int) -> dict[Hashable, int]:
@@ -563,8 +569,12 @@ def _normalize_selected(
     attrs = attrs.set_index("id", drop=False)
     segments = segments.set_index("id").loc[attrs.index]
     catchments = catchments.set_index("id").loc[attrs.index]
-    unit_length = segments.geometry.length.astype(float) / 1000.0
-    unit_area = catchments.geometry.area.astype(float) / 1_000_000.0
+    unit_length = attrs["unit_length"].astype("float64")
+    unit_area = pd.to_numeric(catchments["unit_area"], errors="coerce").astype("float64")
+    if not np.isfinite(unit_area.to_numpy()).all() or (unit_area < 0).any():
+        raise InvalidInputSchemaError(
+            "Selected unit areas must be finite non-negative numeric values"
+        )
     downstream = attrs["id_down"].to_dict()
     selected_ids = set(attrs.index.tolist())
     order = _topological_order(selected_ids, downstream)

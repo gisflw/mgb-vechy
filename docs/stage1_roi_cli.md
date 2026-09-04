@@ -1,12 +1,12 @@
 # Stage 1: define ROI
 
 `mgb-vec-hydro define-roi` reads raw GeoPackage or FlatGeobuf providers and
-selects topology upstream of one or more outlets. Its target CRS comes only
-from the Stage 0 manifest.
+selects topology upstream of one or more outlets. It defines the working CRS;
+the DEM is validated against that CRS later by `prepare`.
 
 ```bash
 mgb-vec-hydro define-roi \
-  --prepared prepared \
+  --crs ESRI:102033 \
   --catchments data/catchments.gpkg \
   --segments data/segments.gpkg \
   --outlet-id 90497 \
@@ -14,6 +14,8 @@ mgb-vec-hydro define-roi \
   --id-down-col nutrjus \
   --strahler-order-col nustrahler \
   --upstream-area-col nuareamont \
+  --unit-length-col nucomptrec \
+  --unit-area-col nuareacont \
   --output-dir roi
 ```
 
@@ -35,8 +37,10 @@ Only selected geometry is decoded and reprojected. The output columns are:
 `id`, `id_down`, `sub`, `strahler_order`, `unit_length`, `upstream_length`,
 `unit_area`, `upstream_area`, `water_course`, `geometry`.
 
-Lengths (km), areas (km²), and upstream length are computed after reprojection.
-`upstream_area` is copied directly from the required provider column.
+`unit_length` is required from the segments provider in km and `unit_area` is
+required from the catchments provider in km². Both must be finite and
+non-negative. `upstream_length` is derived from topology by summing supplied
+unit lengths; `upstream_area` is copied from the required provider column.
 Repeated outlets are ordered downstream to upstream; later overlapping outlet
 domains overwrite `sub` assignments.
 
