@@ -23,6 +23,7 @@ from mgb_vec_hydro.exceptions import (
     ExecutionConfigurationError,
     WorkerExecutionError,
     WorkMemoryError,
+    memory_limit_exceeded_message,
 )
 
 PayloadT = TypeVar("PayloadT")
@@ -393,11 +394,11 @@ class LocalExecutor:
                         expected_ordinal += 1
                         task_count += 1
                         if next_item.estimated_bytes > self.config.memory_limit_bytes:
-                            raise WorkMemoryError(
-                                f"Work item {next_item.key} requires "
-                                f"{next_item.estimated_bytes} bytes, exceeding the "
-                                f"{self.config.memory_limit_bytes}-byte budget"
-                            )
+                            raise WorkMemoryError(memory_limit_exceeded_message(
+                                f"work item {next_item.key}",
+                                next_item.estimated_bytes,
+                                self.config.memory_limit_bytes,
+                            ))
                     if next_item is None:
                         break
                     if (

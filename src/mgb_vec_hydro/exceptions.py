@@ -1,3 +1,22 @@
+import math
+
+
+def memory_limit_exceeded_message(
+    subject: str, required_bytes: int, limit_bytes: int
+) -> str:
+    """Format the actionable diagnostic shared by all bounded executors."""
+
+    def mib(value: int) -> str:
+        amount = math.ceil(value / 1024**2 * 100) / 100
+        return f"{amount:.2f}".rstrip("0").rstrip(".")
+
+    return (
+        f"Memory limit exceeded: {subject} requires {mib(required_bytes)} MiB, "
+        f"but the limit is {mib(limit_bytes)} MiB. Increase "
+        "`--memory-limit-mb` to accommodate the current discretization."
+    )
+
+
 class MgbVecHydroError(Exception):
     """Base error for package-level failures."""
 

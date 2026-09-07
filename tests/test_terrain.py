@@ -336,7 +336,7 @@ def test_terrain_rejects_missing_d8_and_oversized_complete_mini(tmp_path):
     assert not missing_output.exists()
 
     oversized_output = tmp_path / "oversized"
-    with pytest.raises(WorkMemoryError, match="packet budget"):
+    with pytest.raises(WorkMemoryError, match="Memory limit exceeded"):
         create_terrain_dataset(
             TerrainSpec(
                 prepared=prepared,

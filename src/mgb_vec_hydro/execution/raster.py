@@ -21,6 +21,7 @@ from mgb_vec_hydro.exceptions import (
     RasterGridError,
     RasterWriteConflictError,
     WorkMemoryError,
+    memory_limit_exceeded_message,
 )
 from mgb_vec_hydro.execution.executor import WorkerContext
 from mgb_vec_hydro.preparation import (
@@ -151,10 +152,9 @@ def packet_raster_units(
     current_bytes = 0
     for unit in sorted(units, key=lambda value: (value.spatial_key, value.key)):
         if unit.estimated_bytes > memory_limit_bytes:
-            raise WorkMemoryError(
-                f"Raster unit {unit.key} requires {unit.estimated_bytes} bytes, "
-                f"exceeding the {memory_limit_bytes}-byte packet budget"
-            )
+            raise WorkMemoryError(memory_limit_exceeded_message(
+                f"raster unit {unit.key}", unit.estimated_bytes, memory_limit_bytes
+            ))
         full = max_units is not None and len(current) >= max_units
         if current and (
             full or current_bytes + unit.estimated_bytes > memory_limit_bytes
