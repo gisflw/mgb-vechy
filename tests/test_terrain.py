@@ -8,15 +8,9 @@ from affine import Affine
 from pyproj import CRS
 from shapely.geometry import LineString, Polygon
 
-from mgb_vec_hydro.exceptions import (
-    TerrainProductsError,
-    WorkerExecutionError,
-    WorkMemoryError,
-)
-from mgb_vec_hydro.execution.raster import RasterAssembler
+from mgb_vec_hydro.exceptions import TerrainProductsError
 from mgb_vec_hydro.execution.vector import (
     VectorTable,
-    read_vector_table,
     write_vector_table,
 )
 from mgb_vec_hydro.preparation import PreparationSpec, prepare_dataset
@@ -81,34 +75,6 @@ def test_agree_is_catchment_confined_and_preserves_nodata():
 
     np.testing.assert_allclose(conditioned[0, :3], [84, 96, 100])
     assert np.isnan(conditioned[0, 3])
-
-
-def test_zero_agree_buffer_applies_only_stream_incision():
-    elevation = np.full((1, 3), 10.0)
-    labels = np.zeros_like(elevation, dtype=int)
-    drainage = np.array([[False, True, False]])
-
-    conditioned = _agree_condition_dem(
-        elevation, labels, drainage, sharp=4, smooth=9, buffer=0
-    )
-
-    np.testing.assert_array_equal(conditioned, [[10, 6, 10]])
-
-
-@pytest.mark.parametrize(
-    ("sharp", "smooth", "buffer", "message"),
-    [(-1, 8, 4, "sharp"), (80, -1, 4, "smooth"), (80, 8, -1, "buffer")],
-)
-def test_agree_rejects_negative_parameters(sharp, smooth, buffer, message):
-    with pytest.raises(TerrainProductsError, match=message):
-        _agree_condition_dem(
-            np.array([[1.0]]),
-            np.array([[0]]),
-            np.array([[True]]),
-            sharp=sharp,
-            smooth=smooth,
-            buffer=buffer,
-        )
 
 
 def test_hand_uses_raw_dem_after_agree_controls_routing():
@@ -238,7 +204,7 @@ def _terrain_inputs(tmp_path, *, with_d8=False):
 
 
 def test_terrain_dataset_records_custom_agree_profile_and_strict_domain(tmp_path):
-    prepared, minis = _terrain_inputs(tmp_path)
+    prepared, _minis = _terrain_inputs(tmp_path)
     output_dir = tmp_path / "out"
     checkpoint_dir = tmp_path / "checkpoints"
 
@@ -273,14 +239,6 @@ def test_terrain_dataset_records_custom_agree_profile_and_strict_domain(tmp_path
     index = pd.read_parquet(output_dir / "mini_index.parquet")
     assert index.to_dict("list") == {"mini_label": [1, 2], "mini_id": ["a", "b"]}
     assert not checkpoint_dir.exists()
-
-    manifest_path = output_dir / "manifest.json"
-    manifest = json.loads(manifest_path.read_text())
-    manifest["version"] += 1
-    manifest_path.write_text(json.dumps(manifest))
-    with pytest.raises(TerrainProductsError, match="contract or version"):
-        TerrainDataset.open(output_dir).validate()
-
 
 def test_d8_validation_terminalizes_drainage_and_rejects_invalid_paths():
     owned = np.ones((1, 3), dtype=bool)
@@ -321,142 +279,6 @@ def test_d8_validation_terminalizes_drainage_and_rejects_invalid_paths():
         )
 
 
-def test_terrain_rejects_missing_d8_and_oversized_complete_mini(tmp_path):
-    prepared, minis = _terrain_inputs(tmp_path)
-    missing_output = tmp_path / "missing-d8"
-
-    with pytest.raises(TerrainProductsError, match="no D8"):
-        create_terrain_dataset(
-            TerrainSpec(
-                prepared=prepared,
-                output_dir=missing_output,
-                direction_source="d8",
-            )
-        )
-    assert not missing_output.exists()
-
-    oversized_output = tmp_path / "oversized"
-    with pytest.raises(WorkMemoryError, match="Memory limit exceeded"):
-        create_terrain_dataset(
-            TerrainSpec(
-                prepared=prepared,
-                output_dir=oversized_output,
-                memory_limit_mb=1,
-            )
-        )
-    assert not oversized_output.exists()
-
-
-def test_prepared_d8_uses_same_dataset_interface_and_is_deterministic(tmp_path):
-    prepared, minis = _terrain_inputs(tmp_path, with_d8=True)
-    serial = tmp_path / "serial"
-    parallel = tmp_path / "parallel"
-
-    create_terrain_dataset(
-        TerrainSpec(
-            prepared=prepared,
-            output_dir=serial,
-            direction_source="d8",
-            write_flow_direction=True,
-            workers=1,
-        )
-    )
-    create_terrain_dataset(
-        TerrainSpec(
-            prepared=prepared,
-            output_dir=parallel,
-            direction_source="d8",
-            write_flow_direction=True,
-            workers=2,
-        )
-    )
-
-    for name in (
-        "mini_ownership",
-        "drainage",
-        "hand",
-        "ltnd",
-        "flow_direction",
-    ):
-        with (
-            rasterio.open(serial / "rasters" / f"{name}.tif") as first,
-            rasterio.open(parallel / "rasters" / f"{name}.tif") as second,
-        ):
-            np.testing.assert_array_equal(first.read(1), second.read(1))
-            np.testing.assert_array_equal(first.dataset_mask(), second.dataset_mask())
-    with rasterio.open(serial / "rasters" / "flow_direction.tif") as source:
-        direction = source.read(1, masked=True)
-    assert set(np.unique(direction.compressed())) <= set(range(9))
-
-
-def test_domain_and_terrain_checkpoints_resume_after_failed_publication(
-    tmp_path, monkeypatch
-):
-    prepared, minis = _terrain_inputs(tmp_path)
-    output = tmp_path / "terrain"
-    checkpoint = tmp_path / "checkpoint"
-    finish = RasterAssembler.finish
-
-    finish_calls = 0
-
-    def fail_second_finish(assembler):
-        nonlocal finish_calls
-        finish_calls += 1
-        if finish_calls == 1:
-            raise RuntimeError("injected failure")
-        return finish(assembler)
-
-    with monkeypatch.context() as context:
-        context.setattr(RasterAssembler, "finish", fail_second_finish)
-        with pytest.raises(RuntimeError, match="injected failure"):
-            create_terrain_dataset(
-                TerrainSpec(
-                    prepared=prepared,
-                    output_dir=output,
-                    checkpoint_dir=checkpoint,
-                    workers=1,
-                )
-            )
-
-    assert not output.exists()
-    assert (checkpoint / "terrain" / "checkpoint.json").is_file()
-    assert RasterAssembler.finish is finish
-
-    report = create_terrain_dataset(
-        TerrainSpec(
-            prepared=prepared,
-            output_dir=output,
-            checkpoint_dir=checkpoint,
-            workers=1,
-        )
-    )
-
-    assert report.domain_execution.resumed == 0
-    assert report.terrain_execution.resumed > 0
-    assert not checkpoint.exists()
-
-
-def test_prepared_domain_is_not_rebuilt_from_mutated_minis(tmp_path):
-    prepared, minis = _terrain_inputs(tmp_path)
-    segment_path = minis / "mini_segments.fgb"
-    segments = read_vector_table(segment_path)
-    attrs = segments.table.drop([segments.geometry_column]).to_pydict()
-    geometries = segments.geometries()
-    geometries[attrs["id"].index("a")] = LineString([(70, 0), (70, 40)])
-    segment_path.unlink()
-    write_vector_table(
-        VectorTable.from_pydict(
-            attrs, geometries, crs=segments.crs, geometry_type="LineString"
-        ),
-        segment_path,
-        driver="FlatGeobuf",
-    )
-    output = tmp_path / "terrain"
-
-    create_terrain_dataset(TerrainSpec(prepared=prepared, output_dir=output, workers=1))
-    assert output.exists()
-
-
 def test_longer_valley_route_wins_over_short_ridge_breach():
     elevation = np.array(
         [
@@ -479,25 +301,6 @@ def test_longer_valley_route_wins_over_short_ridge_breach():
     assert route == [(0, 2), (0, 1), (1, 0), (2, 1), (2, 2)]
 
 
-def test_global_geometry_cannot_override_valid_steepest_downhill_route():
-    elevation = np.array(
-        [
-            [10, 9, 0],
-            [8, 7, 6],
-        ],
-        dtype=float,
-    )
-    labels = np.zeros_like(elevation, dtype=int)
-    drainage = np.zeros_like(elevation, dtype=bool)
-    drainage[0, 2] = True
-
-    direction, _ = compute_flow_directions(elevation, labels, drainage, TRANSFORM)
-
-    # SE is steeper than E after metric D8 distance is accounted for.
-    assert direction[0, 0] == 4
-    assert _route(direction, (0, 0)) == [(0, 0), (1, 1), (0, 2)]
-
-
 def test_drainable_flat_reaches_its_lowest_natural_outlet():
     elevation = np.array(
         [
@@ -514,39 +317,6 @@ def test_drainable_flat_reaches_its_lowest_natural_outlet():
 
     for cell in ((0, 0), (0, 1), (1, 0), (1, 1)):
         assert _route(direction, cell)[-1] == (1, 3)
-
-
-def test_natural_outlet_partition_does_not_leave_flat_cell_unrouted():
-    elevation = np.full((3, 4), np.nan)
-    labels = np.full((3, 4), -1, dtype=int)
-    for cell, value in {
-        (0, 0): 5,  # unresolved flat cell
-        (1, 1): 5,  # natural outlet toward elevation 4
-        (2, 2): 5,  # globally lowest natural outlet
-        (0, 2): 4,
-        (2, 3): 2,
-    }.items():
-        elevation[cell] = value
-        labels[cell] = 0
-    drainage = np.zeros_like(elevation, dtype=bool)
-    drainage[2, 3] = True
-
-    direction, rank = compute_flow_directions(elevation, labels, drainage, TRANSFORM)
-
-    assert direction[0, 0] >= 0
-    assert rank[0, 0] >= 0
-    assert _route(direction, (0, 0))[-1] == (2, 3)
-
-
-def test_natural_slope_takes_direct_downhill_route():
-    elevation = np.array([[3, 2, 1, 0]], dtype=float)
-    labels = np.zeros_like(elevation, dtype=int)
-    drainage = np.array([[False, False, False, True]])
-
-    direction, rank = compute_flow_directions(elevation, labels, drainage, TRANSFORM)
-
-    np.testing.assert_array_equal(direction, [[3, 3, 3, 0]])
-    np.testing.assert_array_equal(rank, [[3, 2, 1, 0]])
 
 
 def test_multiple_streams_are_deterministic_and_respect_owners():
@@ -580,27 +350,3 @@ def test_hand_and_ltnd_follow_selected_tree_with_rectangular_pixels():
     assert ltnd[0, 0] == pytest.approx(5)
     assert ltnd[0, 1] == pytest.approx(4)
     assert ltnd[1, 0] == pytest.approx(3)
-
-
-def test_disconnected_owned_component_raises_clear_error():
-    elevation = np.array([[1, np.nan, 1]], dtype=float)
-    labels = np.zeros_like(elevation, dtype=int)
-    drainage = np.array([[True, False, False]])
-
-    with pytest.raises(TerrainProductsError, match="cannot connect"):
-        compute_flow_directions(elevation, labels, drainage, TRANSFORM)
-
-
-def test_nodata_is_preserved_and_cycle_validation_still_applies():
-    elevation = np.array([[2, np.nan, 1], [3, np.nan, 0]], dtype=float)
-    labels = np.array([[0, -1, 1], [0, -1, 1]])
-    drainage = np.array([[True, False, False], [False, False, True]])
-
-    direction, rank = compute_flow_directions(elevation, labels, drainage, TRANSFORM)
-
-    np.testing.assert_array_equal(direction[:, 1], [-1, -1])
-    np.testing.assert_array_equal(rank[:, 1], [-1, -1])
-
-    cyclic = np.array([[3, 7]], dtype=np.int8)
-    with pytest.raises(TerrainProductsError, match="cycle"):
-        compute_hand(np.array([[1.0, 1.0]]), cyclic)

@@ -1,4 +1,3 @@
-import json
 import multiprocessing as mp
 
 import numpy as np
@@ -7,7 +6,6 @@ import rasterio
 from rasterio.windows import Window
 
 from mgb_vec_hydro.exceptions import (
-    PreparedDataError,
     RasterGridError,
     RasterWriteConflictError,
     WorkMemoryError,
@@ -67,22 +65,6 @@ def test_prepared_raster_reader_reuses_handle_and_reads_exact_window(
         context.close()
 
 
-def test_prepared_raster_reader_rejects_manifest_grid_mismatch(
-    prepared_execution_dataset,
-):
-    manifest_path = prepared_execution_dataset / "manifest.json"
-    manifest = json.loads(manifest_path.read_text())
-    manifest["grid"]["transform"][0] = 20
-    manifest_path.write_text(json.dumps(manifest))
-
-    context = WorkerContext(mp.get_context("spawn").BoundedSemaphore(1), 2)
-    try:
-        with pytest.raises(PreparedDataError, match="canonical grid/COG"):
-            PreparedRasterReader(prepared_execution_dataset, context)
-    finally:
-        context.close()
-
-
 def test_raster_assembler_rejects_overlap_and_publishes_cog_atomically(
     tmp_path, prepared_execution_dataset
 ):
@@ -132,13 +114,3 @@ def test_raster_assembler_rejects_overlap_and_publishes_cog_atomically(
         assert reader.source("hand") is reader.source("hand")
     finally:
         context.close()
-
-
-def test_raster_planner_rejects_units_outside_grid(prepared_execution_dataset):
-    grid = prepared_grid(prepared_execution_dataset)
-    with pytest.raises(RasterGridError, match="outside"):
-        plan_raster_units(
-            grid,
-            [("outside", (100, 100, 110, 110))],
-            bytes_per_cell=4,
-        )

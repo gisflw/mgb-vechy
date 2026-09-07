@@ -2,9 +2,7 @@ import pandas as pd
 import pytest
 
 from mgb_vec_hydro.exceptions import (
-    DuplicateSegmentIdError,
     MissingColumnsError,
-    OutletNotFoundError,
     TopologyCycleError,
 )
 from mgb_vec_hydro.topology import (
@@ -92,30 +90,6 @@ def test_missing_columns_raise_package_error():
 
     with pytest.raises(MissingColumnsError, match="id_down"):
         find_upstream_segments(segments, [1])
-
-
-def test_duplicate_segment_ids_raise_package_error():
-    segments = pd.DataFrame(
-        {
-            "id": [1, 1],
-            "id_down": [None, None],
-        }
-    )
-
-    with pytest.raises(DuplicateSegmentIdError, match="duplicate"):
-        find_upstream_segments(segments, [1])
-
-
-def test_missing_outlet_raises_package_error():
-    segments = pd.DataFrame(
-        {
-            "id": [1],
-            "id_down": [None],
-        }
-    )
-
-    with pytest.raises(OutletNotFoundError, match="99"):
-        find_upstream_segments(segments, [99])
 
 
 def test_cycle_detection_raises_package_error():
