@@ -254,11 +254,13 @@ class RasterAssembler:
         *,
         block_size: int = BLOCK_SIZE,
         compression_threads: int = 1,
+        working_compression: str | None = "DEFLATE",
     ):
         self.root = Path(staging_dir)
         self.grid = grid
         self.block_size = block_size
         self.compression_threads = compression_threads
+        self.working_compression = working_compression
         product_list = tuple(products)
         self.specs = {spec.name: spec for spec in product_list}
         if not self.specs or len(self.specs) != len(product_list):
@@ -294,27 +296,31 @@ class RasterAssembler:
         self.root.mkdir(parents=True, exist_ok=True)
         self._sources: dict[str, Any] = {}
         self._mask_initialized: set[str] = set()
+        self._exclusive_blocks: dict[str, set[tuple[int, int]]] = {
+            spec.name: set() for spec in product_list
+        }
+        self._nonexclusive_products: set[str] = set()
         self._finished = False
         try:
             for spec in self.specs.values():
                 path = self.root / f".{spec.name}.working.tif"
-                source = rasterio.open(
-                    path,
-                    "w+",
-                    driver="GTiff",
-                    width=grid.width,
-                    height=grid.height,
-                    count=1,
-                    dtype=np.dtype(spec.dtype).name,
-                    crs=grid.crs,
-                    transform=grid.transform,
-                    tiled=True,
-                    blockxsize=block_size,
-                    blockysize=block_size,
-                    compress="DEFLATE",
-                    nodata=None,
-                    BIGTIFF="IF_SAFER",
-                )
+                options = {
+                    "driver": "GTiff",
+                    "width": grid.width,
+                    "height": grid.height,
+                    "count": 1,
+                    "dtype": np.dtype(spec.dtype).name,
+                    "crs": grid.crs,
+                    "transform": grid.transform,
+                    "tiled": True,
+                    "blockxsize": block_size,
+                    "blockysize": block_size,
+                    "nodata": None,
+                    "BIGTIFF": "IF_SAFER",
+                }
+                if working_compression is not None:
+                    options["compress"] = working_compression
+                source = rasterio.open(path, "w+", **options)
                 self._sources[spec.name] = source
         except Exception:
             self.close()
@@ -350,6 +356,76 @@ class RasterAssembler:
             ((existing_valid | valid) * 255).astype("uint8"), window=patch.window
         )
         self._mask_initialized.add(patch.product)
+        self._nonexclusive_products.add(patch.product)
+
+    def write_block(self, patch: RasterPatch) -> None:
+        """Write one canonical block without a read-modify-write cycle.
+
+        This path is for initial assembly only. A product block can be supplied
+        exactly once; subsequent corrections must use :meth:`replace`.
+        """
+        if self._finished:
+            raise RasterGridError("Raster assembler is already finalized")
+        if patch.product not in self._sources:
+            raise RasterGridError(f"Unknown raster product: {patch.product}")
+        _require_integer_window(patch.window, self.grid)
+        col = int(patch.window.col_off)
+        row = int(patch.window.row_off)
+        expected_width = min(self.block_size, self.grid.width - col)
+        expected_height = min(self.block_size, self.grid.height - row)
+        if (
+            col % self.block_size
+            or row % self.block_size
+            or int(patch.window.width) != expected_width
+            or int(patch.window.height) != expected_height
+        ):
+            raise RasterGridError("Exclusive writes must cover one canonical block")
+        shape = (expected_height, expected_width)
+        data = np.asarray(patch.data)
+        valid = np.asarray(patch.valid, dtype=bool)
+        if data.shape != shape or valid.shape != shape:
+            raise RasterGridError("Raster patch arrays do not match their window")
+        key = (row // self.block_size, col // self.block_size)
+        if patch.product in self._nonexclusive_products:
+            raise RasterWriteConflictError(
+                f"Raster product {patch.product} already has non-exclusive writes"
+            )
+        if key in self._exclusive_blocks[patch.product]:
+            raise RasterWriteConflictError(
+                f"Raster block {patch.product} was already written"
+            )
+        source = self._sources[patch.product]
+        source.write(data.astype(source.dtypes[0], copy=False), 1, window=patch.window)
+        source.write_mask((valid * 255).astype("uint8"), window=patch.window)
+        self._exclusive_blocks[patch.product].add(key)
+        self._mask_initialized.add(patch.product)
+
+    def read(self, product: str, window: Window, *, masked: bool = True) -> np.ndarray:
+        """Read a bounded window from a working product before finalization."""
+        if self._finished:
+            raise RasterGridError("Raster assembler is already finalized")
+        if product not in self._sources:
+            raise RasterGridError(f"Unknown raster product: {product}")
+        _require_integer_window(window, self.grid)
+        return self._sources[product].read(1, window=window, masked=masked)
+
+    def replace(self, patch: RasterPatch) -> None:
+        """Replace a complete bounded window, including its validity mask."""
+        if self._finished:
+            raise RasterGridError("Raster assembler is already finalized")
+        if patch.product not in self._sources:
+            raise RasterGridError(f"Unknown raster product: {patch.product}")
+        _require_integer_window(patch.window, self.grid)
+        shape = (int(patch.window.height), int(patch.window.width))
+        data = np.asarray(patch.data)
+        valid = np.asarray(patch.valid, dtype=bool)
+        if data.shape != shape or valid.shape != shape:
+            raise RasterGridError("Raster patch arrays do not match their window")
+        source = self._sources[patch.product]
+        source.write(data.astype(source.dtypes[0], copy=False), 1, window=patch.window)
+        source.write_mask((valid * 255).astype("uint8"), window=patch.window)
+        self._mask_initialized.add(patch.product)
+        self._nonexclusive_products.add(patch.product)
 
     def finish(self) -> dict[str, Path]:
         if self._finished:
@@ -391,6 +467,8 @@ class RasterAssembler:
             path.unlink(missing_ok=True)
         self._sources.clear()
         self._mask_initialized.clear()
+        self._exclusive_blocks.clear()
+        self._nonexclusive_products.clear()
 
     def __enter__(self):
         return self

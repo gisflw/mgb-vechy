@@ -84,11 +84,14 @@ windows.
 
 `RasterAssembler` is coordinator-only. It merges valid cells from bounded
 `RasterPatch` values into tiled working rasters, reading the existing mask to
-reject duplicate cell ownership without a continent-wide ownership array. On
-the first patch it creates the mask lazily, leaving untouched blocks invalid
-instead of initializing the complete grid. On completion it creates one
-internally masked COG per `RasterProductSpec`, with a bounded number of GDAL
-compression threads.
+reject duplicate cell ownership without a continent-wide ownership array. Its
+exclusive initial-assembly path accepts each canonical block exactly once and
+writes its data and mask without a read-modify-write cycle; duplicate blocks and
+mixing later non-exclusive writes back into that path are rejected. Bounded
+replacement writes support corrections staged before mutation. On the first
+patch it creates the mask lazily, leaving untouched blocks invalid instead of
+initializing the complete grid. On completion it creates one internally masked
+COG per `RasterProductSpec`, with a bounded number of GDAL compression threads.
 
 Stage 4 first rasterizes complete aggregated minis into ownership and matching
 drainage COGs. A second bounded execution pass reads those products with the

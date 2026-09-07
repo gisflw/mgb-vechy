@@ -114,3 +114,35 @@ def test_raster_assembler_rejects_overlap_and_publishes_cog_atomically(
         assert reader.source("hand") is reader.source("hand")
     finally:
         context.close()
+
+
+def test_raster_assembler_exclusive_block_write_avoids_reads_and_rejects_reuse(
+    tmp_path, prepared_execution_dataset
+):
+    grid = prepared_grid(prepared_execution_dataset)
+    with RasterAssembler(
+        tmp_path, grid, [RasterProductSpec("labels", "int32")], block_size=128
+    ) as assembler:
+        # The tiny fixture is one edge block even though its dimensions are < 128.
+        block = RasterPatch(
+            "labels",
+            Window(0, 0, grid.width, grid.height),
+            np.arange(grid.width * grid.height, dtype="int32").reshape(
+                grid.height, grid.width
+            ),
+            np.ones((grid.height, grid.width), dtype=bool),
+        )
+        assembler.write_block(block)
+        with pytest.raises(RasterWriteConflictError, match="already written"):
+            assembler.write_block(block)
+        assembler.replace(
+            RasterPatch(
+                "labels",
+                block.window,
+                np.full(block.data.shape, 7, dtype="int32"),
+                block.valid,
+            )
+        )
+        outputs = assembler.finish()
+    with rasterio.open(outputs["labels"]) as result:
+        np.testing.assert_array_equal(result.read(1), np.full(block.data.shape, 7))
