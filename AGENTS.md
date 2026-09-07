@@ -79,6 +79,7 @@ suite before handoff. The scaling suites are opt-in:
 RUN_PREPARATION_BENCHMARKS=1 pytest tests/benchmark/test_preparation_scaling.py
 RUN_EXECUTION_BENCHMARKS=1 pytest tests/benchmark/execution
 RUN_TERRAIN_BENCHMARKS=1 pytest tests/benchmark/test_terrain_scaling.py
+RUN_SAMPLING_BENCHMARKS=1 pytest tests/benchmark/test_sampling_scaling.py
 ```
 
 The full terrain benchmark also requires `BHAE_PREPARED` and `BHAE_MINIS` to

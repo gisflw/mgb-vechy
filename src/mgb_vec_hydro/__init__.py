@@ -1,5 +1,6 @@
 """QGIS-free vector hydrography preprocessing for MGB inputs."""
 
+from mgb_vec_hydro.execution.vector import VectorTable
 from mgb_vec_hydro.preparation import (
     NamedRaster,
     PreparationReport,
@@ -8,7 +9,11 @@ from mgb_vec_hydro.preparation import (
     prepare_dataset,
 )
 from mgb_vec_hydro.roi import RoiDataset, RoiReport, RoiSpec, define_roi_dataset
-from mgb_vec_hydro.sampling import MiniSamplingResult, sample_minibasins
+from mgb_vec_hydro.sampling import (
+    MiniSamplingReport,
+    MiniSamplingSpec,
+    sample_minibasins,
+)
 from mgb_vec_hydro.terrain import (
     TerrainDataset,
     TerrainReport,
@@ -18,12 +23,12 @@ from mgb_vec_hydro.terrain import (
     compute_ltnd,
     create_terrain_dataset,
 )
-from mgb_vec_hydro.execution.vector import VectorTable
 
 __version__ = "0.1.0"
 
 __all__ = [
-    "MiniSamplingResult",
+    "MiniSamplingReport",
+    "MiniSamplingSpec",
     "NamedRaster",
     "PreparationReport",
     "PreparationSpec",

@@ -19,6 +19,7 @@ from mgb_vec_hydro.execution.raster import (
     RasterPatch,
     RasterProductSpec,
     packet_raster_units,
+    packet_raster_units_by_block,
     plan_raster_units,
     prepared_grid,
 )
@@ -146,3 +147,39 @@ def test_raster_assembler_exclusive_block_write_avoids_reads_and_rejects_reuse(
         outputs = assembler.finish()
     with rasterio.open(outputs["labels"]) as result:
         np.testing.assert_array_equal(result.read(1), np.full(block.data.shape, 7))
+
+
+def test_block_packets_charge_overlapping_blocks_once(prepared_execution_dataset):
+    grid = prepared_grid(prepared_execution_dataset)
+    units = plan_raster_units(
+        grid,
+        [
+            ("left", (0, 10, 10, 20)),
+            ("middle", (10, 10, 20, 20)),
+            ("right", (20, 10, 30, 20)),
+        ],
+        bytes_per_cell=4,
+        block_size=2,
+    )
+    packets = packet_raster_units_by_block(
+        grid,
+        units,
+        memory_limit_bytes=10,
+        bytes_per_cell=2,
+        max_units=3,
+        block_size=2,
+    )
+    assert [[unit.key for unit in packet.units] for packet in packets] == [
+        ["left", "middle"],
+        ["right"],
+    ]
+    assert packets[0].estimated_bytes == 8
+    assert packets[0].blocks == (Window(0, 0, 2, 2),)
+    with pytest.raises(WorkMemoryError, match="right"):
+        packet_raster_units_by_block(
+            grid,
+            units[-1:],
+            memory_limit_bytes=3,
+            bytes_per_cell=2,
+            block_size=2,
+        )

@@ -38,6 +38,9 @@ minis/
 The version-2 aggregation contract retains the normalized ROI schema and CRS.
 Input is read through Pyogrio Arrow, while grouped polygon and line geometry is
 dissolved by GDAL's SQLite `ST_Union` implementation and streamed to FlatGeobuf.
+Both output layers receive the same aggregated non-geometry attributes:
+`unit_length` and `upstream_length` are reduced from segment groups, while
+`unit_area` and `upstream_area` are reduced from catchment groups.
 `source_to_mini.csv` contains exactly `id`, `mini_id`, `sub`, `longitude`, and
 `latitude`. Every ROI source ID occurs once. Coordinates come from each source
 catchment's centroid calculated in the projected ROI CRS and then transformed

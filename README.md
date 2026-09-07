@@ -91,13 +91,10 @@ categorical HRU raster into a geometry-free CSV:
 
 ```bash
 mgb-vec-hydro sample-minis \
-  --catchments output/minis/mini_catchments.fgb \
-  --segments output/minis/mini_segments.fgb \
-  --dem prepared/rasters/dem.tif \
-  --hand output/terrain/rasters/hand.tif \
-  --ltnd output/terrain/rasters/ltnd.tif \
-  --hru prepared/rasters/hru.tif \
-  --crs EPSG:6933 \
+  --minis output/minis \
+  --prepared prepared \
+  --terrain output/terrain \
+  --hru-name hru \
   --output-dir output/sampled
 ```
 

@@ -2,10 +2,12 @@
 
 ## Status
 
-Implementation in progress. Work areas 1 through 4 are implemented. Raster
-preparation now follows aggregation: ROI defines the working CRS, and prepare
+Implemented. Work areas 1 through 5 use the shared bounded execution
+architecture. Raster preparation now follows aggregation: ROI defines the working CRS, and prepare
 validates and clips already aligned source rasters while producing the bounded
-mini ownership/drainage inputs used by terrain. Only work area 5 remains.
+mini ownership/drainage inputs used by terrain. Mini-basin sampling now uses
+block-aware complete-mini packets, canonical labels, and exact bounded
+reductions.
 
 ## Compatibility policy
 
@@ -162,24 +164,24 @@ Results are assembled into one final COG per terrain product without concurrent
 worker writes. Domain and terrain checkpoints remain resumable until the
 validated directory is atomically published.
 
-### 5. Refactor mini-basin sampling
+### 5. Refactored mini-basin sampling
 
-Refactor mini-basin sampling to depend on the shared raster execution layer and
+Mini-basin sampling depends on the shared raster execution layer and
 the post-aggregation rasterized domain and terrain products.
 
-Sampling will avoid repeated arbitrary polygon-window reads where blockwise or
+Sampling avoids repeated arbitrary polygon-window reads where blockwise or
 unit-based reductions are possible. Unit-catchment labels and the aggregation
-mini index will associate raster cells with mini basins. Per-partition
-statistics will use deterministic, mergeable accumulators where the statistic
+mini index associate raster cells with mini basins. Per-partition
+statistics use deterministic, mergeable accumulators where the statistic
 permits it.
 
-Statistics that cannot be reduced directly, including exact quantiles, will use
-a bounded strategy chosen during implementation. Any change from exact to
+Statistics that cannot be reduced directly, including exact quantiles, use complete-mini exact arrays admitted under the
+configured memory budget. Any change from exact to
 approximate statistics would require an explicit new product definition; it
 will not be introduced implicitly as an optimization.
 
-The sampling stage will consume terrain and categorical rasters from the
-canonical grid and will not perform implicit reprojection or alignment.
+The sampling stage consumes terrain and categorical rasters from the
+canonical grid and does not perform implicit reprojection or alignment.
 
 ## Dependencies and sequencing
 

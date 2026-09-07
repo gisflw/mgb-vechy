@@ -137,16 +137,26 @@ def _aggregate_minibasins(
     source_assignment = state["catchment_assignment"]
     reach_assignment = state["reach_assignment"]
     groups = _groups_from_assignment(reach_assignment)
-    attrs = _mini_attributes(segments, groups, reach_assignment, state["downstream"])
 
     catchment_ids = catchments["id"].tolist()
     catchment_mini = [source_assignment[value] for value in catchment_ids]
     catchment_geometry_by_id = dict(zip(catchment_ids, catchment_geometry, strict=True))
     segment_geometry_by_id = dict(zip(segments["id"], segment_geometry, strict=True))
-    catchment_area_by_id = dict(
-        zip(catchments["id"], catchments["unit_area"], strict=True)
-    )
     catchment_groups = _groups_from_assignment(source_assignment)
+
+    segment_attributes = _mini_attributes(
+        segments, groups, reach_assignment, state["downstream"]
+    )
+    catchment_metrics = _mini_metric_attributes(
+        catchments,
+        catchment_groups,
+        unit_column="unit_area",
+        upstream_column="upstream_area",
+    )
+    attrs = {
+        mini_id: {**segment_attributes[mini_id], **catchment_metrics[mini_id]}
+        for mini_id in groups
+    }
 
     segment_rows: list[dict[str, Any]] = []
     catchment_rows: list[dict[str, Any]] = []
@@ -168,9 +178,6 @@ def _aggregate_minibasins(
         catchment_rows.append(
             {
                 **attrs[mini_id],
-                "unit_area": float(
-                    sum(catchment_area_by_id[value] for value in source_members)
-                ),
                 "geometry": (
                     shapely.union_all(
                         [catchment_geometry_by_id[value] for value in source_members]
@@ -423,12 +430,21 @@ def _mini_attributes(segments, groups, assignment, downstream):
             "sub": representative["sub"],
             "strahler_order": representative["strahler_order"],
             "unit_length": float(row_by_id.loc[list(members), "unit_length"].sum()),
-            "upstream_length": representative["upstream_length"],
-            "unit_area": float(row_by_id.loc[list(members), "unit_area"].sum()),
-            "upstream_area": representative["upstream_area"],
+            "upstream_length": float(representative["upstream_length"]),
             "water_course": representative["water_course"],
         }
     return result
+
+
+def _mini_metric_attributes(source, groups, *, unit_column, upstream_column):
+    source_by_id = source.set_index("id", drop=False)
+    return {
+        mini_id: {
+            unit_column: float(source_by_id.loc[list(members), unit_column].sum()),
+            upstream_column: float(source_by_id.at[mini_id, upstream_column]),
+        }
+        for mini_id, members in groups.items()
+    }
 
 
 def aggregate_roi_dataset(spec: AggregationSpec) -> AggregationReport:

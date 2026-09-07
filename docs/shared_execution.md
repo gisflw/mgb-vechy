@@ -103,3 +103,12 @@ exclude fixed Python and imported-library process overhead.
 
 Scientific work areas remain responsible for work payloads, memory factors,
 checkpoint codecs, topology and ownership rules, and product schemas.
+
+## Sampling reductions
+
+Stage 5 derives block-aware packets from complete mini windows. Packet estimates
+charge the union of canonical blocks, and workers read each distinct block once
+per raster while reusing cached COG handles. Exact per-mini values and fixed-size
+HRU accumulators are returned through ordered execution; bounded Arrow packet
+artifacts are streamed into the final CSV after the global sampled class set is
+known.

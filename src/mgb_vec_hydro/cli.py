@@ -5,12 +5,10 @@ from pathlib import Path
 import click
 
 from mgb_vec_hydro.aggregation import AggregationSpec, aggregate_roi_dataset
-from mgb_vec_hydro.crs_utils import DEFAULT_CRS
 from mgb_vec_hydro.exceptions import MgbVecHydroError
-from mgb_vec_hydro.io import read_vector
 from mgb_vec_hydro.preparation import NamedRaster, PreparationSpec, prepare_dataset
 from mgb_vec_hydro.roi import RoiSpec, define_roi_dataset
-from mgb_vec_hydro.sampling import sample_minibasins
+from mgb_vec_hydro.sampling import MiniSamplingSpec, sample_minibasins
 from mgb_vec_hydro.terrain import TerrainSpec, create_terrain_dataset
 
 
@@ -27,9 +25,7 @@ _NAMED_RASTER = click.Tuple(
 def _echo_timings(timings: dict[str, float]) -> None:
     click.echo(
         "Timing: "
-        + ", ".join(
-            f"{name} {seconds:.3f}s" for name, seconds in timings.items()
-        )
+        + ", ".join(f"{name} {seconds:.3f}s" for name, seconds in timings.items())
     )
 
 
@@ -64,7 +60,9 @@ def _echo_timings(timings: dict[str, float]) -> None:
     default=512,
     show_default=True,
 )
-@click.option("--buffer-cells", type=click.IntRange(min=0), default=1, show_default=True)
+@click.option(
+    "--buffer-cells", type=click.IntRange(min=0), default=1, show_default=True
+)
 @click.option(
     "--output-dir",
     type=click.Path(file_okay=False, path_type=Path),
@@ -107,7 +105,11 @@ def prepare_command(
 
 
 @main.command("define-roi")
-@click.option("--crs", required=True, help="Output CRS; geographic and projected CRSs are supported.")
+@click.option(
+    "--crs",
+    required=True,
+    help="Output CRS; geographic and projected CRSs are supported.",
+)
 @click.option(
     "--catchments",
     "catchments_path",
@@ -361,71 +363,76 @@ def terrain_products_command(
 
 @main.command("sample-minis")
 @click.option(
-    "--catchments",
-    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    "--minis",
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
     required=True,
 )
 @click.option(
-    "--segments",
-    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    "--prepared",
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
     required=True,
 )
 @click.option(
-    "--dem", type=click.Path(exists=True, dir_okay=False, path_type=Path), required=True
-)
-@click.option(
-    "--hand",
-    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    "--terrain",
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
     required=True,
 )
-@click.option(
-    "--ltnd",
-    type=click.Path(exists=True, dir_okay=False, path_type=Path),
-    required=True,
-)
-@click.option(
-    "--hru", type=click.Path(exists=True, dir_okay=False, path_type=Path), required=True
-)
+@click.option("--hru-name", default="hru", show_default=True)
 @click.option(
     "--output-dir", type=click.Path(file_okay=False, path_type=Path), required=True
 )
-@click.option("--crs", default=DEFAULT_CRS, show_default=True)
+@click.option(
+    "--workers", type=click.IntRange(min=1, max=4), default=4, show_default=True
+)
+@click.option(
+    "--memory-limit-mb", type=click.IntRange(min=1), default=512, show_default=True
+)
+@click.option("--io-slots", type=click.IntRange(min=1), default=2, show_default=True)
+@click.option(
+    "--batch-size", type=click.IntRange(min=1), default=10_000, show_default=True
+)
+@click.option("--checkpoint-dir", type=click.Path(file_okay=False, path_type=Path))
 def sample_minis_command(
-    catchments: Path,
-    segments: Path,
-    dem: Path,
-    hand: Path,
-    ltnd: Path,
-    hru: Path,
+    minis: Path,
+    prepared: Path,
+    terrain: Path,
+    hru_name: str,
     output_dir: Path,
-    crs: str,
+    workers: int,
+    memory_limit_mb: int,
+    io_slots: int,
+    batch_size: int,
+    checkpoint_dir: Path | None,
 ) -> None:
-    """Sample terrain and HRU attributes onto mini-basins."""
+    """Sample canonical terrain and HRU attributes onto mini-basins."""
     try:
-        result = sample_minibasins(
-            read_vector(catchments),
-            read_vector(segments),
-            dem,
-            hand,
-            ltnd,
-            hru,
-            crs=crs,
+        report = sample_minibasins(
+            MiniSamplingSpec(
+                minis=minis,
+                prepared=prepared,
+                terrain=terrain,
+                hru_name=hru_name,
+                output_dir=output_dir,
+                workers=workers,
+                memory_limit_mb=memory_limit_mb,
+                io_slots=io_slots,
+                batch_size=batch_size,
+                checkpoint_dir=checkpoint_dir,
+            )
         )
-        output_dir.mkdir(parents=True, exist_ok=True)
-        output = output_dir / "sampled_minis.csv"
-        result.sampled_minis.to_csv(output, index=False)
     except MgbVecHydroError as exc:
         raise click.ClickException(str(exc)) from exc
-    click.echo(f"Wrote {output}")
+    click.echo(f"Wrote {report.sampled_minis}")
     click.echo(
-        f"Sampled {result.diagnostics['minis']} minis; "
-        f"{result.diagnostics['catchment_cells']} catchment cells and "
-        f"{result.diagnostics['reach_cells']} reach cells"
+        f"Sampled {report.mini_count} minis; "
+        f"{report.catchment_cells} catchment cells and "
+        f"{report.reach_cells} reach cells"
     )
     click.echo(
-        f"HRU classes ({result.diagnostics['hru_class_count']}): "
-        + ", ".join(str(value) for value in result.diagnostics["hru_class_ids"])
+        f"HRU classes ({len(report.hru_class_ids)}): "
+        + ", ".join(str(value) for value in report.hru_class_ids)
     )
+    _echo_timings(report.timings)
 
 
 if __name__ == "__main__":

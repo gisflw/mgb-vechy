@@ -9,7 +9,7 @@ def test_public_stage_commands_expose_their_primary_inputs():
         "aggregate": ("--roi", "--uparea-min", "--lmin"),
         "prepare": ("--dem", "--minis", "--output-dir"),
         "terrain-products": ("--prepared", "--direction-source"),
-        "sample-minis": ("--catchments", "--segments", "--hru"),
+        "sample-minis": ("--minis", "--prepared", "--terrain", "--hru-name"),
     }
     runner = CliRunner()
     for command, options in expected.items():

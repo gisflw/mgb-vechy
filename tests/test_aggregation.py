@@ -46,6 +46,17 @@ def _inputs(
     return catchments, segments
 
 
+def _with_attributes(vector, **updates):
+    attributes = vector.table.drop([vector.geometry_column]).to_pydict()
+    attributes.update(updates)
+    return VectorTable.from_pydict(
+        attributes,
+        vector.geometries(),
+        crs=vector.crs,
+        geometry_type=vector.geometry_type,
+    )
+
+
 def test_accepts_the_canonical_schema_and_rejects_a_missing_column():
     catchments, segments = _inputs()
     result = aggregate_minibasins(catchments, segments, uparea_min=0, lmin=0)
@@ -61,6 +72,41 @@ def test_accepts_the_canonical_schema_and_rejects_a_missing_column():
     )
     with pytest.raises(InvalidInputSchemaError, match="exact input columns"):
         aggregate_minibasins(invalid, segments, uparea_min=0, lmin=0)
+
+
+def test_metric_provenance_is_shared_between_catchments_and_segments():
+    catchments, segments = _inputs(
+        ids=(1, 2),
+        id_down=(None, 1),
+        sub=(1, 1),
+        unit_length=(2.0, 3.0),
+        upstream_area=(300.0, 200.0),
+        water_course=(1, 1),
+    )
+    catchments = _with_attributes(
+        catchments,
+        unit_length=(70.0, 80.0),
+        upstream_length=(700.0, 800.0),
+        unit_area=(10.0, 20.0),
+        upstream_area=(30.0, 20.0),
+    )
+    segments = _with_attributes(
+        segments,
+        upstream_length=(5.0, 3.0),
+        unit_area=(100.0, 200.0),
+        upstream_area=(300.0, 200.0),
+    )
+
+    result = aggregate_minibasins(catchments, segments, uparea_min=0, lmin=0)
+    catchment_attributes = result.catchments.to_pandas().drop(columns="geometry")
+    segment_attributes = result.segments.to_pandas().drop(columns="geometry")
+
+    assert catchment_attributes.equals(segment_attributes)
+    row = segment_attributes.iloc[0]
+    assert row["unit_length"] == pytest.approx(5.0)
+    assert row["upstream_length"] == pytest.approx(5.0)
+    assert row["unit_area"] == pytest.approx(30.0)
+    assert row["upstream_area"] == pytest.approx(30.0)
 
 
 def test_confluence_continues_the_branch_with_greatest_upstream_area():

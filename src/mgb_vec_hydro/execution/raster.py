@@ -51,6 +51,16 @@ class RasterPacket:
 
 
 @dataclass(frozen=True)
+class RasterBlockPacket:
+    """Complete raster units grouped by the distinct canonical blocks they use."""
+
+    key: str
+    units: tuple[RasterUnit, ...]
+    blocks: tuple[Window, ...]
+    estimated_bytes: int
+
+
+@dataclass(frozen=True)
 class RasterPatch:
     product: str
     window: Window
@@ -152,9 +162,11 @@ def packet_raster_units(
     current_bytes = 0
     for unit in sorted(units, key=lambda value: (value.spatial_key, value.key)):
         if unit.estimated_bytes > memory_limit_bytes:
-            raise WorkMemoryError(memory_limit_exceeded_message(
-                f"raster unit {unit.key}", unit.estimated_bytes, memory_limit_bytes
-            ))
+            raise WorkMemoryError(
+                memory_limit_exceeded_message(
+                    f"raster unit {unit.key}", unit.estimated_bytes, memory_limit_bytes
+                )
+            )
         full = max_units is not None and len(current) >= max_units
         if current and (
             full or current_bytes + unit.estimated_bytes > memory_limit_bytes
@@ -165,6 +177,92 @@ def packet_raster_units(
         current_bytes += unit.estimated_bytes
     if current:
         packets.append(_packet(current, current_bytes))
+    return tuple(packets)
+
+
+def packet_raster_units_by_block(
+    grid: GridSpec,
+    units: Iterable[RasterUnit],
+    *,
+    memory_limit_bytes: int,
+    bytes_per_cell: int,
+    fixed_bytes: int = 0,
+    max_units: int | None = None,
+    block_size: int = BLOCK_SIZE,
+) -> tuple[RasterBlockPacket, ...]:
+    """Packet units while charging each shared canonical block only once."""
+
+    if (
+        memory_limit_bytes <= 0
+        or bytes_per_cell <= 0
+        or fixed_bytes < 0
+        or block_size <= 0
+        or (max_units is not None and max_units <= 0)
+    ):
+        raise RasterGridError("Raster block-packet limits must be positive")
+
+    ordered = tuple(sorted(units, key=lambda value: (value.spatial_key, value.key)))
+    packets: list[RasterBlockPacket] = []
+    current: list[RasterUnit] = []
+    current_blocks: set[tuple[int, int]] = set()
+
+    def block_keys(unit: RasterUnit) -> set[tuple[int, int]]:
+        col0 = int(unit.window.col_off) // block_size
+        row0 = int(unit.window.row_off) // block_size
+        col1 = (int(unit.window.col_off + unit.window.width) - 1) // block_size
+        row1 = (int(unit.window.row_off + unit.window.height) - 1) // block_size
+        return {
+            (row, col) for row in range(row0, row1 + 1) for col in range(col0, col1 + 1)
+        }
+
+    def estimate(keys: set[tuple[int, int]]) -> int:
+        cells = 0
+        for row, col in keys:
+            cells += min(block_size, grid.height - row * block_size) * min(
+                block_size, grid.width - col * block_size
+            )
+        return max(1, cells * bytes_per_cell + fixed_bytes)
+
+    def emit() -> None:
+        if not current:
+            return
+        windows = tuple(
+            Window(
+                col * block_size,
+                row * block_size,
+                min(block_size, grid.width - col * block_size),
+                min(block_size, grid.height - row * block_size),
+            )
+            for row, col in sorted(current_blocks)
+        )
+        packets.append(
+            RasterBlockPacket(
+                f"{current[0].key}..{current[-1].key}",
+                tuple(current),
+                windows,
+                estimate(current_blocks),
+            )
+        )
+
+    for unit in ordered:
+        unit_blocks = block_keys(unit)
+        unit_estimate = estimate(unit_blocks)
+        if unit_estimate > memory_limit_bytes:
+            raise WorkMemoryError(
+                memory_limit_exceeded_message(
+                    f"raster unit {unit.key}", unit_estimate, memory_limit_bytes
+                )
+            )
+        combined = current_blocks | unit_blocks
+        combined_estimate = estimate(combined)
+        full = max_units is not None and len(current) >= max_units
+        if current and (full or combined_estimate > memory_limit_bytes):
+            emit()
+            current = []
+            current_blocks = set()
+        current.append(unit)
+        current_blocks.update(unit_blocks)
+    emit()
     return tuple(packets)
 
 
