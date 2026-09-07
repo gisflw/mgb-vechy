@@ -1,7 +1,7 @@
 """Opt-in Stage 5 throughput and block-reuse measurements.
 
-Set RUN_SAMPLING_BENCHMARKS=1 and provide BHAE_MINIS, BHAE_PREPARED,
-and BHAE_TERRAIN as published integration dataset directories.
+Set RUN_SAMPLING_BENCHMARKS=1 and provide the explicit BHAE mini vector,
+index, raster, and terrain-product file paths.
 """
 
 import os
@@ -22,22 +22,36 @@ def _input(name: str) -> Path:
     if not value:
         pytest.skip(f"{name} is required for the sampling benchmark")
     path = Path(value)
-    if not path.is_dir():
-        pytest.skip(f"{name} does not identify a dataset directory")
+    if not path.is_file():
+        pytest.skip(f"{name} does not identify a local file")
     return path
 
 
 def test_sampling_reports_serial_and_parallel_throughput(tmp_path, record_property):
-    minis = _input("BHAE_MINIS")
-    prepared = _input("BHAE_PREPARED")
-    terrain = _input("BHAE_TERRAIN")
+    paths = {name: _input(name) for name in (
+        "BHAE_MINI_CATCHMENTS",
+        "BHAE_MINI_SEGMENTS",
+        "BHAE_MINI_INDEX",
+        "BHAE_DEM",
+        "BHAE_MINI_OWNERSHIP",
+        "BHAE_DRAINAGE",
+        "BHAE_HAND",
+        "BHAE_LTND",
+        "BHAE_HRU",
+    )}
     reports = {}
     for workers in (1, 4):
         reports[workers] = sample_minibasins(
             MiniSamplingSpec(
-                minis=minis,
-                prepared=prepared,
-                terrain=terrain,
+                mini_catchments=paths["BHAE_MINI_CATCHMENTS"],
+                mini_segments=paths["BHAE_MINI_SEGMENTS"],
+                mini_index=paths["BHAE_MINI_INDEX"],
+                dem=paths["BHAE_DEM"],
+                mini_ownership=paths["BHAE_MINI_OWNERSHIP"],
+                drainage=paths["BHAE_DRAINAGE"],
+                hand=paths["BHAE_HAND"],
+                ltnd=paths["BHAE_LTND"],
+                hru=paths["BHAE_HRU"],
                 output_dir=tmp_path / f"workers-{workers}",
                 workers=workers,
             )

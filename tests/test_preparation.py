@@ -1,4 +1,5 @@
 import numpy as np
+import pandas as pd
 import pytest
 import rasterio
 from rasterio.transform import from_origin
@@ -12,7 +13,6 @@ from mgb_vec_hydro.preparation import (
     GridSpec,
     NamedRaster,
     PreparationSpec,
-    PreparedDataset,
     _BlockConnectivity,
     _label_components,
     _plan_connectivity_correction,
@@ -71,20 +71,29 @@ def test_prepare_pipeline_publishes_valid_canonical_dataset(tmp_path):
             workers=1,
         )
     )
-    aggregate_roi_dataset(
+    aggregation = aggregate_roi_dataset(
         AggregationSpec(
-            roi=tmp_path / "roi",
+            roi_catchments=tmp_path / "roi" / "roi_catchments.fgb",
+            roi_segments=tmp_path / "roi" / "roi_segments.fgb",
             uparea_min=0,
             lmin=0,
             output_dir=tmp_path / "minis",
             workers=1,
         )
     )
+    assert sorted(path.name for path in aggregation.output_dir.iterdir()) == [
+        "mini_catchments.fgb",
+        "mini_segments.fgb",
+        "source_to_mini.csv",
+    ]
+    assert not (aggregation.output_dir / "manifest.json").exists()
+    assert not any(path.is_dir() for path in aggregation.output_dir.iterdir())
 
     report = prepare_dataset(
         PreparationSpec(
             dem=dem,
-            minis=tmp_path / "minis",
+            mini_catchments=tmp_path / "minis" / "mini_catchments.fgb",
+            mini_segments=tmp_path / "minis" / "mini_segments.fgb",
             rasters=(NamedRaster("land", land, "categorical"),),
             output_dir=tmp_path / "prepared",
             memory_limit_mb=16,
@@ -93,17 +102,26 @@ def test_prepare_pipeline_publishes_valid_canonical_dataset(tmp_path):
     )
 
     assert report.raster_count == 2
-    dataset = PreparedDataset.open(report.output_dir)
-    dataset.validate()
-    assert dataset.manifest["version"] == 4
-    assert set(dataset.manifest["assets"]) == {
-        "rasters",
-        "mini_ownership",
-        "drainage",
-        "mini_index",
-    }
+    assert sorted(path.name for path in report.output_dir.iterdir()) == [
+        "dem.tif",
+        "drainage.tif",
+        "land.tif",
+        "mini_index.parquet",
+        "mini_ownership.tif",
+    ]
+    assert not (report.output_dir / "manifest.json").exists()
+    assert not any(path.is_dir() for path in report.output_dir.iterdir())
+    index = pd.read_parquet(report.mini_index)
+    assert list(index.columns) == [
+        "mini_label",
+        "mini_id",
+        "minx",
+        "miny",
+        "maxx",
+        "maxy",
+    ]
     for name in ("dem", "land"):
-        with rasterio.open(report.output_dir / f"rasters/{name}.tif") as source:
+        with rasterio.open(report.output_dir / f"{name}.tif") as source:
             assert source.tags(ns="IMAGE_STRUCTURE")["LAYOUT"] == "COG"
 
 

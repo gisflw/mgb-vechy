@@ -36,8 +36,13 @@ def _echo_timings(timings: dict[str, float]) -> None:
     required=True,
 )
 @click.option(
-    "--minis",
-    type=click.Path(exists=True, file_okay=False, path_type=Path),
+    "--mini-catchments",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    required=True,
+)
+@click.option(
+    "--mini-segments",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
     required=True,
 )
 @click.option(
@@ -70,7 +75,8 @@ def _echo_timings(timings: dict[str, float]) -> None:
 )
 def prepare_command(
     dem: Path,
-    minis: Path,
+    mini_catchments: Path,
+    mini_segments: Path,
     continuous_raster: tuple[tuple[str, Path], ...],
     categorical_raster: tuple[tuple[str, Path], ...],
     d8: Path | None,
@@ -79,7 +85,7 @@ def prepare_command(
     buffer_cells: int,
     output_dir: Path,
 ) -> None:
-    """Stage a canonical grid and COG raster inputs."""
+    """Prepare explicit mini vectors and aligned raster files as flat COGs."""
     rasters = tuple(
         [NamedRaster(name, path, "continuous") for name, path in continuous_raster]
         + [NamedRaster(name, path, "categorical") for name, path in categorical_raster]
@@ -88,7 +94,8 @@ def prepare_command(
         report = prepare_dataset(
             PreparationSpec(
                 dem=dem,
-                minis=minis,
+                mini_catchments=mini_catchments,
+                mini_segments=mini_segments,
                 rasters=rasters,
                 d8=d8,
                 d8_encoding=d8_encoding,
@@ -99,7 +106,8 @@ def prepare_command(
         )
     except MgbVecHydroError as exc:
         raise click.ClickException(str(exc)) from exc
-    click.echo(f"Wrote {report.manifest}")
+    for path in report.files:
+        click.echo(f"Wrote {path}")
     click.echo(f"Prepared {report.raster_count} raster(s)")
     _echo_timings(report.timings)
 
@@ -192,15 +200,21 @@ def define_roi_command(
     except MgbVecHydroError as exc:
         raise click.ClickException(str(exc)) from exc
 
-    click.echo(f"Wrote {report.manifest}")
+    click.echo(f"Wrote {report.catchments}")
+    click.echo(f"Wrote {report.segments}")
     click.echo(f"Selected {report.segment_count} source pairs")
     _echo_timings(report.timings)
 
 
 @main.command("aggregate")
 @click.option(
-    "--roi",
-    type=click.Path(exists=True, file_okay=False, path_type=Path),
+    "--roi-catchments",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    required=True,
+)
+@click.option(
+    "--roi-segments",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
     required=True,
 )
 @click.option("--uparea-min", type=float, required=True)
@@ -222,7 +236,8 @@ def define_roi_command(
 )
 @click.option("--checkpoint-dir", type=click.Path(file_okay=False, path_type=Path))
 def aggregate_command(
-    roi: Path,
+    roi_catchments: Path,
+    roi_segments: Path,
     uparea_min: float,
     lmin: float,
     output_dir: Path,
@@ -232,12 +247,13 @@ def aggregate_command(
     batch_size: int,
     checkpoint_dir: Path | None,
 ) -> None:
-    """Aggregate a versioned ROI into mini-basins."""
+    """Aggregate explicit ROI files into mini-basins."""
 
     try:
         report = aggregate_roi_dataset(
             AggregationSpec(
-                roi=roi,
+                roi_catchments=roi_catchments,
+                roi_segments=roi_segments,
                 uparea_min=uparea_min,
                 lmin=lmin,
                 output_dir=output_dir,
@@ -251,17 +267,37 @@ def aggregate_command(
     except MgbVecHydroError as exc:
         raise click.ClickException(str(exc)) from exc
 
-    click.echo(f"Wrote {report.output_dir / 'mini_catchments.fgb'}")
-    click.echo(f"Wrote {report.output_dir / 'mini_segments.fgb'}")
-    click.echo(f"Wrote {report.output_dir / 'source_to_mini.csv'}")
+    click.echo(f"Wrote {report.mini_catchments}")
+    click.echo(f"Wrote {report.mini_segments}")
+    click.echo(f"Wrote {report.source_to_mini}")
     _echo_timings(report.timings)
 
 
 @main.command("terrain-products")
 @click.option(
-    "--prepared",
-    type=click.Path(exists=True, file_okay=False, path_type=Path),
+    "--dem",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
     required=True,
+)
+@click.option(
+    "--mini-ownership",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    required=True,
+)
+@click.option(
+    "--drainage",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    required=True,
+)
+@click.option(
+    "--mini-index",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    required=True,
+)
+@click.option(
+    "--d8",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    help="Canonical D8 raster; required when --direction-source=d8.",
 )
 @click.option(
     "--output-dir",
@@ -308,7 +344,11 @@ def aggregate_command(
 )
 @click.option("--checkpoint-dir", type=click.Path(file_okay=False, path_type=Path))
 def terrain_products_command(
-    prepared: Path,
+    dem: Path,
+    mini_ownership: Path,
+    drainage: Path,
+    mini_index: Path,
+    d8: Path | None,
     output_dir: Path,
     direction_source: str,
     write_flow_direction: bool,
@@ -321,12 +361,16 @@ def terrain_products_command(
     batch_size: int,
     checkpoint_dir: Path | None,
 ) -> None:
-    """Generate bounded mini-confined terrain products."""
+    """Generate flat bounded terrain COG files from explicit inputs."""
 
     try:
         report = create_terrain_dataset(
             TerrainSpec(
-                prepared=prepared,
+                dem=dem,
+                mini_ownership=mini_ownership,
+                drainage=drainage,
+                mini_index=mini_index,
+                d8=d8,
                 output_dir=output_dir,
                 direction_source=direction_source.lower(),
                 write_flow_direction=write_flow_direction,
@@ -343,7 +387,10 @@ def terrain_products_command(
     except MgbVecHydroError as exc:
         raise click.ClickException(str(exc)) from exc
 
-    click.echo(f"Wrote {report.manifest}")
+    click.echo(f"Wrote {report.hand}")
+    click.echo(f"Wrote {report.ltnd}")
+    if report.flow_direction is not None:
+        click.echo(f"Wrote {report.flow_direction}")
     click.echo(f"Processed {report.mini_count} complete minis")
     click.echo(f"Cells: {report.owned_cells} owned, {report.drainage_cells} drainage")
     click.echo(
@@ -363,21 +410,50 @@ def terrain_products_command(
 
 @main.command("sample-minis")
 @click.option(
-    "--minis",
-    type=click.Path(exists=True, file_okay=False, path_type=Path),
+    "--mini-catchments",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
     required=True,
 )
 @click.option(
-    "--prepared",
-    type=click.Path(exists=True, file_okay=False, path_type=Path),
+    "--mini-segments",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
     required=True,
 )
 @click.option(
-    "--terrain",
-    type=click.Path(exists=True, file_okay=False, path_type=Path),
+    "--mini-index",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
     required=True,
 )
-@click.option("--hru-name", default="hru", show_default=True)
+@click.option(
+    "--dem",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    required=True,
+)
+@click.option(
+    "--mini-ownership",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    required=True,
+)
+@click.option(
+    "--drainage",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    required=True,
+)
+@click.option(
+    "--hand",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    required=True,
+)
+@click.option(
+    "--ltnd",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    required=True,
+)
+@click.option(
+    "--hru",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    required=True,
+)
 @click.option(
     "--output-dir", type=click.Path(file_okay=False, path_type=Path), required=True
 )
@@ -393,10 +469,15 @@ def terrain_products_command(
 )
 @click.option("--checkpoint-dir", type=click.Path(file_okay=False, path_type=Path))
 def sample_minis_command(
-    minis: Path,
-    prepared: Path,
-    terrain: Path,
-    hru_name: str,
+    mini_catchments: Path,
+    mini_segments: Path,
+    mini_index: Path,
+    dem: Path,
+    mini_ownership: Path,
+    drainage: Path,
+    hand: Path,
+    ltnd: Path,
+    hru: Path,
     output_dir: Path,
     workers: int,
     memory_limit_mb: int,
@@ -404,14 +485,19 @@ def sample_minis_command(
     batch_size: int,
     checkpoint_dir: Path | None,
 ) -> None:
-    """Sample canonical terrain and HRU attributes onto mini-basins."""
+    """Sample explicit canonical rasters and mini vectors into one CSV."""
     try:
         report = sample_minibasins(
             MiniSamplingSpec(
-                minis=minis,
-                prepared=prepared,
-                terrain=terrain,
-                hru_name=hru_name,
+                mini_catchments=mini_catchments,
+                mini_segments=mini_segments,
+                mini_index=mini_index,
+                dem=dem,
+                mini_ownership=mini_ownership,
+                drainage=drainage,
+                hand=hand,
+                ltnd=ltnd,
+                hru=hru,
                 output_dir=output_dir,
                 workers=workers,
                 memory_limit_mb=memory_limit_mb,

@@ -13,11 +13,9 @@ import rasterio
 from pyproj import CRS
 from rasterio.enums import MaskFlags, Resampling
 from rasterio.shutil import copy as copy_raster
-from rasterio.transform import Affine
 from rasterio.windows import Window, from_bounds
 
 from mgb_vec_hydro.exceptions import (
-    PreparedDataError,
     RasterGridError,
     RasterWriteConflictError,
     WorkMemoryError,
@@ -28,7 +26,6 @@ from mgb_vec_hydro.preparation import (
     BLOCK_SIZE,
     NAME_RE,
     GridSpec,
-    PreparedDataset,
 )
 
 Bounds = tuple[float, float, float, float]
@@ -76,19 +73,26 @@ class RasterProductSpec:
     tags: dict[str, Any] = field(default_factory=dict)
 
 
-def prepared_grid(prepared_root: str | Path) -> GridSpec:
-    dataset = PreparedDataset.open(prepared_root)
-    dataset.validate()
-    grid = dataset.manifest["grid"]
+def grid_from_dem(dem: str | Path) -> GridSpec:
+    """Discover the canonical grid directly from an explicit DEM file."""
+
+    path = Path(dem)
+    if not path.is_file():
+        raise RasterGridError(f"DEM input is not a local file: {path}")
     try:
-        result = GridSpec(
-            CRS.from_wkt(grid["crs_wkt"]),
-            Affine(*grid["transform"]),
-            int(grid["width"]),
-            int(grid["height"]),
-        )
-    except (KeyError, TypeError, ValueError) as exc:
-        raise RasterGridError("Prepared canonical grid is invalid") from exc
+        with rasterio.open(path) as source:
+            if source.count != 1 or source.crs is None:
+                raise RasterGridError("DEM must be single-band and declare a CRS")
+            result = GridSpec(
+                CRS.from_user_input(source.crs),
+                source.transform,
+                int(source.width),
+                int(source.height),
+            )
+    except RasterGridError:
+        raise
+    except (rasterio.errors.RasterioError, TypeError, ValueError) as exc:
+        raise RasterGridError(f"Cannot inspect DEM grid: {path}") from exc
     if (
         result.width <= 0
         or result.height <= 0
@@ -97,7 +101,7 @@ def prepared_grid(prepared_root: str | Path) -> GridSpec:
         or result.transform.a <= 0
         or result.transform.e >= 0
     ):
-        raise RasterGridError("Prepared canonical grid must be north-up and non-empty")
+        raise RasterGridError("DEM canonical grid must be north-up and non-empty")
     return result
 
 
@@ -266,45 +270,8 @@ def packet_raster_units_by_block(
     return tuple(packets)
 
 
-class PreparedRasterReader:
-    """Read exact windows from manifest-declared COGs, caching worker handles."""
-
-    def __init__(self, prepared_root: str | Path, context: WorkerContext):
-        self.root = Path(prepared_root).resolve()
-        self.context = context
-        self.grid = prepared_grid(self.root)
-        self.dataset = PreparedDataset.open(self.root)
-
-    def source(self, name: str):
-        try:
-            asset = self.dataset.manifest["assets"]["rasters"][name]
-        except KeyError as exc:
-            raise PreparedDataError(f"Unknown prepared raster asset: {name}") from exc
-        if asset.get("driver") != "COG":
-            raise PreparedDataError(f"Prepared raster {name} is not a COG")
-        path = self.dataset.asset_path(asset["path"])
-        key = f"prepared-raster:{path}"
-
-        def open_source():
-            source = rasterio.open(path)
-            try:
-                _require_grid(source, self.grid, name)
-            except Exception:
-                source.close()
-                raise
-            return source
-
-        return self.context.resources.get(key, open_source)
-
-    def read(self, name: str, window: Window, *, masked: bool = True) -> np.ndarray:
-        source = self.source(name)
-        _require_integer_window(window, self.grid)
-        with self.context.io_bound():
-            return source.read(1, window=window, masked=masked)
-
-
 class AlignedRasterReader:
-    """Read named COGs that use an already validated canonical grid."""
+    """Read explicit named COG paths tied to a canonical grid."""
 
     def __init__(
         self,
@@ -321,6 +288,8 @@ class AlignedRasterReader:
             path = self.assets[name]
         except KeyError as exc:
             raise RasterGridError(f"Unknown aligned raster asset: {name}") from exc
+        if not path.is_file():
+            raise RasterGridError(f"Aligned raster input is missing: {path}")
         key = f"aligned-raster:{path}"
 
         def open_source():
@@ -603,7 +572,7 @@ def _require_grid(source, grid: GridSpec, name: str) -> None:
         or MaskFlags.per_dataset not in source.mask_flag_enums[0]
     ):
         raise RasterGridError(
-            f"Prepared raster {name} does not match the canonical grid"
+            f"Aligned raster {name} does not match the canonical grid"
         )
 
 

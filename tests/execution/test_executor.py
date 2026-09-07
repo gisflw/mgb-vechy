@@ -62,7 +62,7 @@ def test_checkpoint_resume_skips_completed_work(tmp_path):
     fingerprint = execution_fingerprint(
         algorithm="test",
         version="1",
-        prepared_manifest={"version": 4},
+        input_identity={"input": {"path": "input.tif", "size": 1, "mtime_ns": 1}},
         parameters={"x": 1},
         work_items=items,
     )

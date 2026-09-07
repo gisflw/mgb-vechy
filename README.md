@@ -7,10 +7,11 @@ BHO is supported as the initial regression dataset rather than as a fixed
 schema.
 
 The implemented workflow selects raw vectors into a region of interest, aggregates
-source units into mini-basins, prepares aligned raster and mini-domain inputs, generates HAND
-and local terrain-to-drainage products, and samples terrain and existing HRU
-classes onto mini-basins. HRU class construction and final MGB file generation
-remain planned work.
+source units into mini-basins, prepares aligned raster and mini-domain inputs,
+generates HAND and local terrain-to-drainage products, and samples terrain and
+existing HRU classes onto mini-basins. Each stage receives the files it needs
+explicitly and publishes a flat output directory. HRU class construction and
+final MGB file generation remain planned work.
 
 ## Installation
 
@@ -24,8 +25,9 @@ python -m pip install -e .
 ## Commands
 
 Run the stages in this order: define an ROI, aggregate mini-basins, prepare
-the raster/mini domain, then generate terrain products. The preparation command
-is documented first because it defines the reusable raster input contract.
+the raster/mini domain, generate terrain products, then sample the mini-basins.
+`--output-dir` is the publication destination. Optional `--checkpoint-dir`
+locations are operational scratch space and must be outside that destination.
 
 ### Prepare canonical inputs
 
@@ -34,7 +36,8 @@ Clip already aligned rasters and rasterize the aggregated mini domain:
 ```bash
 mgb-vec-hydro prepare \
   --dem data/dem.tif \
-  --minis output/minis \
+  --mini-catchments output/minis/mini_catchments.fgb \
+  --mini-segments output/minis/mini_segments.fgb \
   --categorical-raster hru data/hru.tif \
   --output-dir prepared
 ```
@@ -65,7 +68,8 @@ Aggregate the normalized ROI using upstream-area and minimum-length thresholds:
 
 ```bash
 mgb-vec-hydro aggregate \
-  --roi output/roi \
+  --roi-catchments output/roi/roi_catchments.fgb \
+  --roi-segments output/roi/roi_segments.fgb \
   --uparea-min 30 \
   --lmin 6 \
   --output-dir output/minis
@@ -79,7 +83,10 @@ Create strict mini-confined HAND and local terrain-to-drainage COGs. Add
 
 ```bash
 mgb-vec-hydro terrain-products \
-  --prepared prepared \
+  --dem prepared/dem.tif \
+  --mini-ownership prepared/mini_ownership.tif \
+  --drainage prepared/drainage.tif \
+  --mini-index prepared/mini_index.parquet \
   --direction-source dem \
   --output-dir output/terrain
 ```
@@ -91,10 +98,15 @@ categorical HRU raster into a geometry-free CSV:
 
 ```bash
 mgb-vec-hydro sample-minis \
-  --minis output/minis \
-  --prepared prepared \
-  --terrain output/terrain \
-  --hru-name hru \
+  --mini-catchments output/minis/mini_catchments.fgb \
+  --mini-segments output/minis/mini_segments.fgb \
+  --mini-index prepared/mini_index.parquet \
+  --dem prepared/dem.tif \
+  --mini-ownership prepared/mini_ownership.tif \
+  --drainage prepared/drainage.tif \
+  --hand output/terrain/hand.tif \
+  --ltnd output/terrain/ltnd.tif \
+  --hru prepared/hru.tif \
   --output-dir output/sampled
 ```
 

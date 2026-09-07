@@ -1,9 +1,8 @@
 # Stage 1: define ROI
 
-`mgb-vec-hydro define-roi` reads raw GeoPackage, FlatGeobuf, or ESRI FileGDB
-providers and selects topology upstream of one or more outlets. It defines the output CRS;
-the CRS may be geographic or projected. The DEM is validated against that CRS
-later by `prepare`.
+`mgb-vec-hydro define-roi` reads raw GeoPackage, FlatGeobuf, or ESRI
+FileGDB providers and selects topology upstream of one or more outlets. It
+defines the authoritative output CRS for the downstream vector stages.
 
 ```bash
 mgb-vec-hydro define-roi \
@@ -18,46 +17,35 @@ mgb-vec-hydro define-roi \
 ```
 
 Use `--catchments-layer` and `--segments-layer` for multi-layer containers.
-FileGDB inputs require the corresponding layer option; the layer options also
-select layers in GeoPackage inputs.
-The independent `--catchments-source-crs` and `--segments-source-crs` options
-replace missing or incorrect provider metadata. There is no target-CRS option.
-Column matching is case-insensitive.
+`--catchments-source-crs` and `--segments-source-crs` are the only source-CRS
+overrides; they replace missing or incorrect provider metadata. The target
+CRS remains the explicit `--crs` value.
 
-Topology attributes are streamed without geometry in Arrow batches of 10,000.
-Null, non-finite, and below-one Strahler rows are removed before traversal;
-selected values must then be integral. Null downstream IDs are sinks. An outlet may
-drain outside the ROI, while every other selected segment must connect toward
-a selected outlet. Duplicate IDs, cycles, missing source pairs, and invalid
-polygon/line geometries are rejected.
+Topology attributes are streamed in bounded Arrow batches. Null, non-finite,
+and below-one Strahler rows are removed before traversal; selected values must
+then be integral. Null downstream IDs are sinks. Duplicate IDs, cycles,
+missing source pairs, incompatible CRS values, and invalid polygon/line
+geometries are rejected.
 
-Only selected geometry is decoded. Selected FIDs are processed in bounded worker
-packets, validated and reprojected with Shapely/PyProj, checkpointed as Arrow IPC,
-and written directly through Pyogrio. Each source geometry is read and transformed
-once. The output columns are:
+The normalized output schema is:
 
 `id`, `id_down`, `sub`, `strahler_order`, `unit_length`, `upstream_length`,
 `unit_area`, `upstream_area`, `water_course`, `geometry`.
 
-`unit_length` is computed from segment geometry using the source CRS ellipsoid
-and geodesic calculations, in km. `unit_area` is computed similarly from
-catchment geometry, in km². `upstream_length` and `upstream_area` are derived
-from topology by summing the selected unit metrics.
-Repeated outlets are ordered downstream to upstream; later overlapping outlet
-domains overwrite `sub` assignments.
+`unit_length` is geodesic length in km and `unit_area` is geodesic area in
+km². Upstream metrics are deterministic topology reductions. Selected
+geometry is processed in bounded worker packets, checkpointed when requested,
+and written to spatially indexed FlatGeobuf files.
 
-The versioned directory is atomically published as:
+The published directory contains exactly these root-level files:
 
 ```text
 roi/
-├── manifest.json
-└── vectors/
-    ├── roi_catchments.fgb
-    └── roi_segments.fgb
+├── roi_catchments.fgb
+└── roi_segments.fgb
 ```
 
-Published vectors are spatially indexed FlatGeobuf. Execution defaults are
-512 MB, four workers, two concurrent I/O operations, and 10,000-row scans.
-On successful completion, the command also prints runtime timings for
-provider/topology loading, metric calculation, output publication, and total
-time.
+There is no `manifest.json` and no nested output directory. The report and
+CLI status identify both concrete paths. Defaults are 512 MB, four workers,
+two concurrent I/O operations, and 10,000-row scans. Checkpoints are scratch
+state outside `--output-dir` and are removed after successful publication.

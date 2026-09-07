@@ -44,16 +44,16 @@ def execution_fingerprint(
     *,
     algorithm: str,
     version: str,
-    prepared_manifest: Mapping[str, Any] | None,
+    input_identity: Mapping[str, Any] | None,
     parameters: Mapping[str, Any],
     work_items: Iterable[WorkItem[Any]],
 ) -> str:
-    """Hash canonical job identity, including the ordered work-plan identity."""
+    """Hash explicit input identity and the ordered work-plan identity."""
 
     value = {
         "algorithm": algorithm,
         "version": version,
-        "prepared_manifest": prepared_manifest,
+        "input_identity": input_identity,
         "parameters": parameters,
     }
     digest = hashlib.sha256(b"mgb-execution-fingerprint-v1\n")
@@ -74,6 +74,23 @@ def execution_fingerprint(
     except (TypeError, ValueError) as exc:
         raise CheckpointError("Job identity is not canonical JSON") from exc
     return digest.hexdigest()
+
+
+def file_identity(path: str | Path) -> dict[str, Any]:
+    """Return stable local-file identity for resumable stage inputs."""
+
+    candidate = Path(path)
+    try:
+        stat = candidate.stat()
+    except OSError as exc:
+        raise CheckpointError(f"Cannot inspect input file: {candidate}") from exc
+    if not candidate.is_file():
+        raise CheckpointError(f"Input is not a local file: {candidate}")
+    return {
+        "path": str(candidate.resolve()),
+        "size": stat.st_size,
+        "mtime_ns": stat.st_mtime_ns,
+    }
 
 
 class CheckpointStore(Generic[ResultT]):

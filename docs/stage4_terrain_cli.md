@@ -1,80 +1,55 @@
-# Stage 4 Terrain Products CLI
+# Stage 4: terrain products
 
-`mgb-vec-hydro terrain-products` creates a versioned, canonical-grid terrain
-dataset from prepared rasters, including the mini domain prepared after
-aggregation. It
-uses bounded complete-mini work units, deterministic local multiprocessing, and
-coordinator-only COG assembly.
-
-## Basic usage
+`mgb-vec-hydro terrain-products` consumes explicit prepared files. The DEM is
+authoritative for the canonical CRS, transform, dimensions, and grid. The
+ownership, drainage, optional D8, and index inputs must match that grid exactly.
 
 ```bash
 mgb-vec-hydro terrain-products \
-  --prepared prepared \
-  --output-dir output/terrain \
+  --dem prepared/dem.tif \
+  --mini-ownership prepared/mini_ownership.tif \
+  --drainage prepared/drainage.tif \
+  --mini-index prepared/mini_index.parquet \
   --direction-source dem \
   --agree-sharp 80 \
   --agree-smooth 8 \
-  --agree-buffer 4
+  --agree-buffer 4 \
+  --output-dir terrain
 ```
 
-`--prepared` and `--output-dir` are required.
-`--direction-source` is either `dem` (the default) or `d8`. Use
-`--write-flow-direction` to publish the selected direction raster. Execution
-defaults are four workers, 512 MB of admitted task memory, two concurrent I/O
-operations, 10,000-row vector scans, and at most eight spatially adjacent minis
-per packet. `--checkpoint-dir` enables resumable domain and terrain packets.
+`--direction-source` is `dem` by default or `d8`. D8 mode requires an explicit
+`--d8` raster containing canonical clockwise codes. Use
+`--write-flow-direction` to publish the directions selected by the run.
+Execution defaults are four workers, 512 MB of admitted task memory, two I/O
+slots, and at most eight complete minis per packet. `--checkpoint-dir` enables
+resumable terrain packets and must be outside `--output-dir`.
 
-AGREE controls apply only to DEM-derived directions. Sharp and smooth values
-must be finite and non-negative, and the AGREE buffer is a non-negative number
-of pixels.
+Terrain reads `mini_index.parquet` directly and never republishes it. It does
+not read mini vectors or regenerate ownership and drainage. Each mini is an
+indivisible work unit. Workers use the shared aligned COG reader, preserve
+strict ownership without buffering, and the coordinator alone assembles final
+COGs.
 
-## Inputs and ownership
+DEM mode applies catchment-confined AGREE conditioning, deterministic flat
+handling, and targeted shallow breaching to matching drainage. HAND always
+uses the unmodified DEM. D8 mode terminalizes matching drainage cells; every
+other owned cell must have a valid direction, stay within its mini, avoid
+cycles, and terminate on matching drainage. Invalid D8 paths fail before any
+output is published.
 
-The prepared version-4 dataset supplies the authoritative projected CRS,
-transform, dimensions, DEM, optional canonical-clockwise D8 COG, rasterized
-ownership, drainage, and the dense mini index. Terrain does not open mini
-vectors or rasterize geometry.
-
-Each aggregated mini is an indivisible processing unit. Gaps remain masked,
-ownership conflicts are rejected, and ownership is never buffered. Terrain
-workers read only prepared COG windows.
-
-## Direction behavior
-
-DEM mode applies catchment-confined AGREE conditioning, retains steepest metric
-D8 descent, resolves flats deterministically, and uses targeted shallow
-breaching to connect trapped basins to matching drainage. HAND elevations
-always come from the unmodified DEM, so negative HAND is possible.
-
-D8 mode requires the prepared `d8` asset. Rasterized drainage cells become
-terminals. Every other owned cell must have direction 1 through 8, remain inside
-the same mini, avoid nodata, contain no cycle, and terminate on matching
-drainage. Invalid minis fail the job without publishing output.
-
-## Output contract
-
-The directory is staged privately, validated, and published with one rename:
+The published directory contains exactly these root-level files:
 
 ```text
 terrain/
-├── manifest.json
-├── mini_index.parquet
-└── rasters/
-    ├── mini_ownership.tif
-    ├── drainage.tif
-    ├── hand.tif
-    ├── ltnd.tif
-    └── flow_direction.tif  # optional
+├── hand.tif
+├── ltnd.tif
+└── flow_direction.tif     # optional
 ```
 
-`mini_index.parquet` maps deterministic one-based `int32` labels to original
-mini IDs without changing their type. Every raster is a full canonical-grid COG
-with an internal validity mask. Ownership is `int32`; drainage and optional
-directions are `uint8`; HAND and LTND are `float32`. Direction codes are
-0 for drainage and 1 through 8 for N, NE, E, SE, S, SW, W, and NW.
-
-The report separates planning, vector reads, rasterization, raster reads,
-conditioning or D8 validation, routing, product calculation, coordination,
-checkpointing, output writes, compression, and total time. It also reports
-mini, owned-cell, drainage-cell, and negative-HAND counts.
+There is no `manifest.json`, no copied domain raster, no index copy, and no
+nested directory. All outputs are full canonical-grid COGs with internal
+validity masks: HAND and LTND are `float32`, and flow direction is `uint8`
+with codes 0 for drainage and 1–8 for N, NE, E, SE, S, SW, W, and NW. The
+report and CLI status identify the concrete paths written and include planning,
+raster-read, conditioning/D8-validation, routing, compression, checkpoint, and
+cell-count diagnostics.

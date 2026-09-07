@@ -1,11 +1,9 @@
-import json
-
 import numpy as np
 import pandas as pd
 import pytest
 import rasterio
 from affine import Affine
-from pyproj import CRS, Transformer
+from pyproj import Transformer
 from shapely.geometry import LineString, Polygon
 
 from mgb_vec_hydro.exceptions import MiniSamplingError, WorkMemoryError
@@ -82,73 +80,62 @@ def _sampling_inputs(tmp_path):
     (minis / "source_to_mini.csv").write_text(
         "id,mini_id,sub,longitude,latitude\na,a,1,0,0\nb,b,1,0,0\n"
     )
-    roi = tmp_path / "roi"
-    (roi / "vectors").mkdir(parents=True)
-    write_vector_table(
-        catchments, roi / "vectors" / "roi_catchments.fgb", driver="FlatGeobuf"
-    )
-    (roi / "manifest.json").write_text(
-        json.dumps(
-            {
-                "crs_wkt": CRS.from_epsg(3857).to_wkt(),
-                "assets": {"catchments": {"path": "vectors/roi_catchments.fgb"}},
-            }
-        )
-    )
-    (minis / "manifest.json").write_text(
-        json.dumps(
-            {
-                "contract": "mgb-aggregation-dataset",
-                "version": 2,
-                "roi": str(roi.resolve()),
-                "crs_wkt": CRS.from_epsg(3857).to_wkt(),
-                "assets": {
-                    "catchments": {
-                        "path": "mini_catchments.fgb",
-                        "driver": "FlatGeobuf",
-                    },
-                    "segments": {
-                        "path": "mini_segments.fgb",
-                        "driver": "FlatGeobuf",
-                    },
-                    "mapping": {
-                        "path": "source_to_mini.csv",
-                        "driver": "CSV",
-                    },
-                },
-            }
-        )
-    )
-
     prepared = tmp_path / "prepared"
-    prepare_dataset(
+    preparation = prepare_dataset(
         PreparationSpec(
             dem=tmp_path / "dem.tif",
-            minis=minis,
+            mini_catchments=minis / "mini_catchments.fgb",
+            mini_segments=minis / "mini_segments.fgb",
             rasters=(NamedRaster("hru", tmp_path / "hru.tif", "categorical"),),
             output_dir=prepared,
             buffer_cells=0,
         )
     )
     terrain = tmp_path / "terrain"
-    create_terrain_dataset(
-        TerrainSpec(prepared=prepared, output_dir=terrain, workers=1)
+    terrain_report = create_terrain_dataset(
+        TerrainSpec(
+            dem=preparation.dem,
+            mini_ownership=preparation.mini_ownership,
+            drainage=preparation.drainage,
+            mini_index=preparation.mini_index,
+            output_dir=terrain,
+            workers=1,
+        )
     )
-    return minis, prepared, terrain
+    return minis, preparation, terrain_report
+
+
+def _sampling_spec(
+    minis,
+    prepared,
+    terrain,
+    output,
+    *,
+    hru=None,
+    workers=1,
+    memory_limit_mb=64,
+):
+    return MiniSamplingSpec(
+        mini_catchments=minis / "mini_catchments.fgb",
+        mini_segments=minis / "mini_segments.fgb",
+        mini_index=prepared.mini_index,
+        dem=prepared.dem,
+        mini_ownership=prepared.mini_ownership,
+        drainage=prepared.drainage,
+        hand=terrain.hand,
+        ltnd=terrain.ltnd,
+        hru=prepared.rasters["hru"] if hru is None else hru,
+        output_dir=output,
+        workers=workers,
+        memory_limit_mb=memory_limit_mb,
+    )
 
 
 def test_sampling_pipeline_is_exact_block_reusing_and_atomic(tmp_path):
     minis, prepared, terrain = _sampling_inputs(tmp_path)
     output = tmp_path / "sampled"
     report = sample_minibasins(
-        MiniSamplingSpec(
-            minis=minis,
-            prepared=prepared,
-            terrain=terrain,
-            output_dir=output,
-            workers=1,
-            memory_limit_mb=64,
-        )
+        _sampling_spec(minis, prepared, terrain, output)
     )
 
     frame = pd.read_csv(report.sampled_minis)
@@ -172,11 +159,11 @@ def test_sampling_pipeline_is_exact_block_reusing_and_atomic(tmp_path):
     assert sorted(path.name for path in output.iterdir()) == ["sampled_minis.csv"]
 
     with (
-        rasterio.open(prepared / "rasters" / "dem.tif") as dem,
-        rasterio.open(terrain / "rasters" / "mini_ownership.tif") as ownership,
-        rasterio.open(terrain / "rasters" / "drainage.tif") as drainage,
-        rasterio.open(terrain / "rasters" / "hand.tif") as hand,
-        rasterio.open(terrain / "rasters" / "ltnd.tif") as ltnd,
+        rasterio.open(prepared.dem) as dem,
+        rasterio.open(prepared.mini_ownership) as ownership,
+        rasterio.open(prepared.drainage) as drainage,
+        rasterio.open(terrain.hand) as hand,
+        rasterio.open(terrain.ltnd) as ltnd,
     ):
         labels = ownership.read(1)
         drain = drainage.read(1) != 0
@@ -208,14 +195,7 @@ def test_sampling_serial_runs_are_byte_deterministic(tmp_path):
     paths = []
     for name, workers in (("serial", 1), ("parallel", 2)):
         report = sample_minibasins(
-            MiniSamplingSpec(
-                minis=minis,
-                prepared=prepared,
-                terrain=terrain,
-                output_dir=tmp_path / name,
-                workers=workers,
-                memory_limit_mb=64,
-            )
+            _sampling_spec(minis, prepared, terrain, tmp_path / name, workers=workers)
         )
         paths.append(report.sampled_minis)
     assert paths[0].read_bytes() == paths[1].read_bytes()
@@ -225,15 +205,14 @@ def test_sampling_rejects_missing_hru_and_oversized_unit_without_publication(tmp
     minis, prepared, terrain = _sampling_inputs(tmp_path)
 
     missing_output = tmp_path / "missing"
-    with pytest.raises(MiniSamplingError, match="no categorical raster"):
+    with pytest.raises(MiniSamplingError, match="HRU input is not a local file"):
         sample_minibasins(
-            MiniSamplingSpec(
-                minis=minis,
-                prepared=prepared,
-                terrain=terrain,
-                hru_name="missing",
-                output_dir=missing_output,
-                workers=1,
+            _sampling_spec(
+                minis,
+                prepared,
+                terrain,
+                missing_output,
+                hru=tmp_path / "missing.tif",
             )
         )
     assert not missing_output.exists()
@@ -241,11 +220,11 @@ def test_sampling_rejects_missing_hru_and_oversized_unit_without_publication(tmp
     memory_output = tmp_path / "memory"
     with pytest.raises(WorkMemoryError, match="raster unit"):
         sample_minibasins(
-            MiniSamplingSpec(
-                minis=minis,
-                prepared=prepared,
-                terrain=terrain,
-                output_dir=memory_output,
+            _sampling_spec(
+                minis,
+                prepared,
+                terrain,
+                memory_output,
                 workers=1,
                 memory_limit_mb=1,
             )

@@ -3,7 +3,6 @@ from __future__ import annotations
 from collections import defaultdict
 from collections.abc import Hashable
 from dataclasses import dataclass, field
-import json
 from pathlib import Path
 import shutil
 import time
@@ -24,6 +23,7 @@ from mgb_vec_hydro.exceptions import (
 from mgb_vec_hydro.execution.checkpoints import (
     CheckpointStore,
     execution_fingerprint,
+    file_identity,
 )
 from mgb_vec_hydro.execution.executor import ExecutionConfig, LocalExecutor, WorkItem
 from mgb_vec_hydro.execution.publication import AtomicOutputDirectory
@@ -33,7 +33,7 @@ from mgb_vec_hydro.execution.vector import (
     read_vector_table,
     write_vector_table,
 )
-from mgb_vec_hydro.roi import ROI_COLUMNS, RoiDataset
+from mgb_vec_hydro.roi import ROI_COLUMNS
 from mgb_vec_hydro.topology import _is_sink_value
 
 INPUT_COLUMNS = [
@@ -48,8 +48,6 @@ INPUT_COLUMNS = [
     "water_course",
     "geometry",
 ]
-AGGREGATION_CONTRACT = "mgb-aggregation-dataset"
-AGGREGATION_CONTRACT_VERSION = 2
 
 
 @dataclass(frozen=True)
@@ -67,7 +65,8 @@ class AggregationResult:
 
 @dataclass(frozen=True)
 class AggregationSpec:
-    roi: Path
+    roi_catchments: Path
+    roi_segments: Path
     uparea_min: float
     lmin: float
     output_dir: Path
@@ -81,7 +80,9 @@ class AggregationSpec:
 @dataclass(frozen=True)
 class AggregationReport:
     output_dir: Path
-    manifest: Path
+    mini_catchments: Path
+    mini_segments: Path
+    source_to_mini: Path
     catchment_count: int
     segment_count: int
     mapping_count: int
@@ -451,13 +452,11 @@ def aggregate_roi_dataset(spec: AggregationSpec) -> AggregationReport:
     overall_started = time.perf_counter()
     _validate_spec(spec)
     phase_started = time.perf_counter()
-    dataset = RoiDataset.open(spec.roi)
-    dataset.validate()
-    catchments = read_vector_table(dataset.path("catchments", validate=False))
-    segments = read_vector_table(dataset.path("segments", validate=False))
-    expected_crs = CRS.from_wkt(dataset.manifest["crs_wkt"])
-    if catchments.crs != expected_crs or segments.crs != expected_crs:
-        raise InvalidInputSchemaError("ROI assets do not use the manifest CRS")
+    catchments = read_vector_table(spec.roi_catchments)
+    segments = read_vector_table(spec.roi_segments)
+    expected_crs = catchments.crs
+    if segments.crs != expected_crs:
+        raise InvalidInputSchemaError("ROI catchment and segment CRS values differ")
     roi_input_seconds = time.perf_counter() - phase_started
     phase_started = time.perf_counter()
     result = _aggregate_minibasins(
@@ -479,7 +478,11 @@ def aggregate_roi_dataset(spec: AggregationSpec) -> AggregationReport:
         fingerprint = execution_fingerprint(
             algorithm="aggregate",
             version="2",
-            prepared_manifest=dataset.manifest,
+            input_identity={
+                "roi_catchments": file_identity(spec.roi_catchments),
+                "roi_segments": file_identity(spec.roi_segments),
+                "crs": expected_crs.to_wkt(version="WKT2_2019", pretty=False),
+            },
             parameters={"uparea_min": spec.uparea_min, "lmin": spec.lmin},
             work_items=items,
         )
@@ -536,41 +539,15 @@ def aggregate_roi_dataset(spec: AggregationSpec) -> AggregationReport:
             expected_crs=expected_crs,
             source_ids=set(catchments.table["id"].to_pylist()),
         )
-        manifest = {
-            "contract": AGGREGATION_CONTRACT,
-            "version": AGGREGATION_CONTRACT_VERSION,
-            "roi": str(Path(spec.roi).resolve()),
-            "crs_wkt": expected_crs.to_wkt(version="WKT2_2019", pretty=False),
-            "assets": {
-                "catchments": {
-                    "path": catchment_path.name,
-                    "driver": "FlatGeobuf",
-                    "feature_count": len(result.catchments),
-                },
-                "segments": {
-                    "path": segment_path.name,
-                    "driver": "FlatGeobuf",
-                    "feature_count": len(result.segments),
-                },
-                "mapping": {
-                    "path": mapping_path.name,
-                    "driver": "CSV",
-                    "feature_count": len(mapping),
-                },
-            },
-        }
-        (staging / "manifest.json").write_text(
-            json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
-        )
-        publisher.publish(
-            ("manifest.json", catchment_path.name, segment_path.name, mapping_path.name)
-        )
+        publisher.publish((catchment_path.name, segment_path.name, mapping_path.name))
     output_publication_seconds = time.perf_counter() - phase_started
     if checkpoint is not None:
         checkpoint.cleanup()
     return AggregationReport(
         output,
-        output / "manifest.json",
+        output / "mini_catchments.fgb",
+        output / "mini_segments.fgb",
+        output / "source_to_mini.csv",
         len(result.catchments),
         len(result.segments),
         len(result.mapping),
@@ -741,12 +718,31 @@ def _gdal_dissolve_outputs(
 
 
 def _validate_spec(spec):
+    for name, path in (
+        ("roi catchments", spec.roi_catchments),
+        ("roi segments", spec.roi_segments),
+    ):
+        if not Path(path).is_file():
+            raise InvalidInputSchemaError(f"{name} input is not a local file: {path}")
     if spec.workers <= 0 or spec.workers > 4:
         raise InvalidInputSchemaError("workers must be between one and four")
     if spec.memory_limit_mb <= 0 or spec.io_slots <= 0 or spec.batch_size <= 0:
         raise InvalidInputSchemaError("execution limits must be positive")
     if spec.uparea_min < 0 or spec.lmin < 0:
         raise InvalidInputSchemaError("uparea-min and lmin must be non-negative")
+    output = Path(spec.output_dir)
+    if output.exists():
+        raise InvalidInputSchemaError(f"Output directory already exists: {output}")
+    if spec.checkpoint_dir is not None:
+        checkpoint = Path(spec.checkpoint_dir).resolve()
+        try:
+            checkpoint.relative_to(output.resolve())
+        except ValueError:
+            pass
+        else:
+            raise InvalidInputSchemaError(
+                "Checkpoint directory cannot be inside the output directory"
+            )
 
 
 def _validate_aggregation_outputs(

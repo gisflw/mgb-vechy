@@ -1,114 +1,85 @@
 # Shared vector and raster execution
 
-The shared execution layer provides internal infrastructure for bounded vector
-and raster processing. It is not a CLI and is not exported from the package
-root. Processing stages import the contracts from
-`mgb_vec_hydro.execution.executor`, `mgb_vec_hydro.execution.checkpoints`,
-`mgb_vec_hydro.execution.vector`, `mgb_vec_hydro.execution.raster`, and
-`mgb_vec_hydro.execution.publication`.
+The shared execution layer provides bounded, deterministic infrastructure for
+the CLI stages. It is internal and is not exported from the package root.
+Stages import contracts from `execution.executor`, `execution.checkpoints`,
+`execution.vector`, `execution.raster`, and `execution.publication`.
 
 ## Local execution
 
 `LocalExecutor` starts persistent worker processes with Python's `spawn`
-context. Worker callables and payloads must therefore be pickleable, and worker
-callables should be module-level functions. Applications invoking it from a
-script must use the normal `if __name__ == "__main__"` guard.
+context. Every `WorkItem` has a unique stable key, contiguous zero-based
+ordinal, and estimated peak byte cost. Admission, task/result queues, and
+backpressure keep live declared task memory within
+`ExecutionConfig.memory_limit_bytes`; a complete unit is never split.
 
-Every `WorkItem` has a unique stable text key, a contiguous zero-based ordinal,
-and an estimated peak byte cost. The executor admits an item only when the sum
-of live estimates remains within `ExecutionConfig.memory_limit_bytes`. The
-limit covers declared task and result payloads, not interpreter or imported
-library overhead. A task larger than the complete budget is rejected.
-
-Task and result queues are bounded by `max_in_flight`, which defaults to the
-worker count. Results may finish in any order but are reduced in ordinal order.
-The executor retains admission for an out-of-order result until it is reduced,
-so completed values cannot form an unbounded queue behind a slow task.
-
-`WorkerContext` provides:
-
-- A process-local LRU cache for context-managed data sources.
-- `io_bound()`, backed by a semaphore shared by all workers. Vector and raster
-  readers use it automatically.
-
-Progress callbacks execute in the coordinator. Reports contain work counts,
-peak admitted bytes, planning, coordination, checkpoint, reduction and worker
-timings, ordered worker diagnostics, cancellation state, and remote failure
-details. Cancellation or failure terminates workers and closes their cached
-resources.
+Results may finish out of order but are reduced in ordinal order. Worker
+contexts provide process-local LRU caches for context-managed data sources and
+an `io_bound()` semaphore shared by all workers. Reports include counts,
+admitted-memory peaks, ordered diagnostics, timings, cancellation, and remote
+failures.
 
 ## Checkpoints and publication
 
-`CheckpointStore` is opt-in. A job supplies a fingerprint produced by
-`execution_fingerprint`; it covers the algorithm and version, relevant prepared
-manifest, parameters, and ordered work descriptors. Each result is serialized
-by a stage-provided `CheckpointCodec`. The coordinator writes and hashes the
-artifact before atomically creating its completion marker.
+`CheckpointStore` is optional. `execution_fingerprint` hashes the algorithm,
+version, explicit input identity, parameters, and ordered work descriptors.
+Stage input identity records each concrete local file path, size, and
+modification time, along with authoritative CRS where relevant. This means a
+checkpoint cannot silently resume against a different input file or processing
+contract. Stage checkpoint directories are scratch locations outside the
+published output and are cleaned only after successful atomic publication.
 
-On restart, compatible completed results are loaded and reduced in their
-original order. Missing, changed, or corrupt state is rejected. Checkpoints are
-retained after failure, cancellation, and successful execution. The stage calls
-`CheckpointStore.cleanup()` only after its atomic output publication succeeds.
+`AtomicOutputDirectory` creates a private sibling staging directory. A stage
+validates every expected file, removes packet/work artifacts, rejects extra
+files and nested directories, and publishes with one directory rename. A
+published stage output is therefore the documented flat root-level file set;
+there is no generated `manifest.json`.
 
-`AtomicOutputDirectory` creates a private sibling staging directory. A caller
-builds every final product there, validates its expected files, and publishes
-the directory with one rename. Destinations that already exist are rejected.
+## Vector access
 
-## Raw-provider and ROI vector access
+Stage 1 is the raw-provider boundary. It inspects GeoPackage, FlatGeobuf, and
+FileGDB schemas and CRS without eagerly loading all geometry. Topology is
+streamed through Arrow, selected IDs are read in bounded packets, and selected
+geometry is validated, transformed, and reduced deterministically.
 
-Stage 1 inspects GeoPackage and FlatGeobuf schemas and CRS without loading
-geometry. Topology attributes are streamed through Arrow. Selected IDs use
-safely quoted provider predicates when practical; otherwise one geometry-free
-ID/FID scan is followed by bounded random-FID reads. Exact IDs, duplicates,
-geometry types, and packet estimates are checked before results are admitted.
+Stages 2–5 receive explicit paths to the files they consume. They infer CRS
+from the authoritative explicit input for that stage and reject missing or
+mismatched CRS metadata. FlatGeobuf output is spatially indexed and all
+published vector files are root-level files.
 
-Versioned ROI assets are indexed FlatGeobuf. Vector packets use Arrow-native WKB
-with explicit CRS metadata; checkpoint artifacts use Arrow IPC. Ordered
-reduction and central topology resolution keep output deterministic, and GDAL's
-SQLite engine performs the final grouped geometry union without GeoDataFrame
-materialization.
+## Raster access
 
-## Prepared raster access
+`grid_from_dem` discovers the canonical grid directly from the explicit DEM.
+`plan_raster_units` maps complete mini bounds to covering grid windows and
+orders them by deterministic Morton block key. `packet_raster_units` and
+`packet_raster_units_by_block` charge conservative memory estimates without
+splitting a mini.
 
-`prepared_grid` reconstructs the canonical grid from the versioned manifest.
-`plan_raster_units` maps complete-unit bounds to covering grid windows, derives
-conservative byte estimates, and sorts units by a deterministic Morton block
-key. `packet_raster_units` combines adjacent complete units up to byte and count
-limits; it never splits a unit.
-
-`PreparedRasterReader` verifies every named COG against the canonical CRS,
-transform, shape, and band contract, then reuses its Rasterio handle inside the
-worker. `AlignedRasterReader` provides the same cached access for derived COGs
-that have already been tied to a canonical grid. Reads require bounded integer
-windows.
+`AlignedRasterReader` accepts a direct map of raster names to COG paths. It
+validates each source against the canonical CRS, transform, dimensions, band,
+nodata, COG, and internal-mask contract, then reuses handles in each worker.
+All raster stages use this reader; there is no directory or manifest-backed
+raster reader. Reads require bounded integer windows.
 
 `RasterAssembler` is coordinator-only. It merges valid cells from bounded
-`RasterPatch` values into tiled working rasters, reading the existing mask to
-reject duplicate cell ownership without a continent-wide ownership array. Its
-exclusive initial-assembly path accepts each canonical block exactly once and
-writes its data and mask without a read-modify-write cycle; duplicate blocks and
-mixing later non-exclusive writes back into that path are rejected. Bounded
-replacement writes support corrections staged before mutation. On the first
-patch it creates the mask lazily, leaving untouched blocks invalid instead of
-initializing the complete grid. On completion it creates one internally masked
-COG per `RasterProductSpec`, with a bounded number of GDAL compression threads.
+`RasterPatch` values, rejects duplicate ownership, supports exclusive initial
+block writes and bounded corrections, and creates internally masked COGs with
+bounded compression threads. Working rasters are deleted before publication.
 
-Stage 4 first rasterizes complete aggregated minis into ownership and matching
-drainage COGs. A second bounded execution pass reads those products with the
-prepared DEM or D8 COG; terrain workers never receive vector geometry and only
-the coordinator assembles final products. Both passes use independent,
-compatible checkpoints. Stage 4 also caps GDAL's otherwise machine-relative
-block cache in the coordinator and each worker; task admission estimates still
-exclude fixed Python and imported-library process overhead.
+Preparation derives the raster domain from the explicit mini-catchment file and
+produces `mini_index.parquet` with exactly `mini_label`, `mini_id`, `minx`,
+`miny`, `maxx`, and `maxy`. Terrain and sampling consume that same index by
+direct path; terrain does not copy or republish it.
 
-Scientific work areas remain responsible for work payloads, memory factors,
-checkpoint codecs, topology and ownership rules, and product schemas.
+## Stage execution
 
-## Sampling reductions
+ROI and aggregation use bounded vector packets and coordinator-side grouped
+geometry publication. Preparation clips aligned sources and rasterizes strict
+ownership/drainage with deterministic connectivity correction. Terrain reads
+direct COG windows for complete minis and assembles HAND, LTND, and optional
+flow direction. Sampling derives block-aware packets and reduces exact mini
+statistics into the single sampled CSV.
 
-Stage 5 derives block-aware packets from complete mini windows. Packet estimates
-charge the union of canonical blocks, and workers read each distinct block once
-per raster while reusing cached COG handles. Exact per-mini values and fixed-size
-HRU accumulators are returned through ordered execution; bounded Arrow packet
-artifacts are streamed into the final CSV after the global sampled class set is
-known.
+Scientific kernels remain responsible for their schemas, validation,
+memory factors, checkpoint codecs, topology, ownership, and product rules;
+shared infrastructure remains independent of those rules.

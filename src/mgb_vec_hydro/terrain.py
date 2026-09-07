@@ -8,8 +8,6 @@ drainage. HAND elevations continue to use the unmodified DEM.
 from __future__ import annotations
 
 import heapq
-import importlib.metadata
-import json
 import math
 import pickle
 import time
@@ -19,20 +17,19 @@ from typing import Any, Literal
 
 import numpy as np
 import pandas as pd
-import pyogrio
 import rasterio
-from rasterio.shutil import copy as copy_raster
 from affine import Affine
 from numba import njit
-from pyproj import CRS
-from rasterio.enums import MaskFlags, Resampling
+from rasterio.enums import Resampling
 from rasterio.env import get_gdal_config, set_gdal_config
-from rasterio.features import rasterize
 from rasterio.windows import Window
 
-from mgb_vec_hydro.aggregation import INPUT_COLUMNS
-from mgb_vec_hydro.exceptions import TerrainProductsError
-from mgb_vec_hydro.execution.checkpoints import CheckpointStore, execution_fingerprint
+from mgb_vec_hydro.exceptions import RasterGridError, TerrainProductsError
+from mgb_vec_hydro.execution.checkpoints import (
+    CheckpointStore,
+    execution_fingerprint,
+    file_identity,
+)
 from mgb_vec_hydro.execution.executor import (
     ExecutionConfig,
     ExecutionReport,
@@ -44,7 +41,6 @@ from mgb_vec_hydro.execution.executor import (
 from mgb_vec_hydro.execution.publication import AtomicOutputDirectory
 from mgb_vec_hydro.execution.raster import (
     AlignedRasterReader,
-    PreparedRasterReader,
     RasterAssembler,
     RasterPacket,
     RasterPatch,
@@ -52,10 +48,10 @@ from mgb_vec_hydro.execution.raster import (
     RasterUnit,
     packet_raster_units,
     plan_raster_units,
-    prepared_grid,
+    grid_from_dem,
+    _require_grid,
 )
-from mgb_vec_hydro.execution.vector import inspect_vector_provider, scan_id_fids
-from mgb_vec_hydro.preparation import BLOCK_SIZE, GridSpec, PreparedDataset
+from mgb_vec_hydro.preparation import GridSpec
 
 # Code, row delta, column delta. This order is also the final tie-break.
 _DIRECTIONS = (
@@ -74,8 +70,6 @@ _DR = np.array([-1, -1, 0, 1, 1, 1, 0, -1], dtype=np.int8)
 _DC = np.array([0, 1, 1, 1, 0, -1, -1, -1], dtype=np.int8)
 
 
-TERRAIN_CONTRACT = "mgb-terrain-dataset"
-TERRAIN_CONTRACT_VERSION = 1
 MAX_PACKET_UNITS = 8
 DOMAIN_BYTES_PER_CELL = 16
 DEM_BYTES_PER_CELL = 128
@@ -85,8 +79,12 @@ TASK_FIXED_BYTES = 8 * 1024 * 1024
 
 @dataclass(frozen=True)
 class TerrainSpec:
-    prepared: Path
+    dem: Path
+    mini_ownership: Path
+    drainage: Path
+    mini_index: Path
     output_dir: Path
+    d8: Path | None = None
     direction_source: Literal["dem", "d8"] = "dem"
     write_flow_direction: bool = False
     agree_sharp: float = 80.0
@@ -102,7 +100,9 @@ class TerrainSpec:
 @dataclass(frozen=True)
 class TerrainReport:
     output_dir: Path
-    manifest: Path
+    hand: Path
+    ltnd: Path
+    flow_direction: Path | None
     mini_count: int
     owned_cells: int
     drainage_cells: int
@@ -113,116 +113,6 @@ class TerrainReport:
     domain_execution: ExecutionReport
     terrain_execution: ExecutionReport
     timings: dict[str, float]
-
-
-class TerrainDataset:
-    """Reader and validator for a published Stage 4 terrain dataset."""
-
-    def __init__(self, root: Path, manifest: dict[str, Any]):
-        self.root = root
-        self.manifest = manifest
-
-    @classmethod
-    def open(cls, root: str | Path) -> TerrainDataset:
-        root = Path(root)
-        path = root / "manifest.json"
-        try:
-            manifest = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as exc:
-            raise TerrainProductsError(f"Cannot read terrain manifest: {path}") from exc
-        return cls(root, manifest)
-
-    def path(self, name: str) -> Path:
-        try:
-            relative = self.manifest["assets"][name]["path"]
-        except (KeyError, TypeError) as exc:
-            raise TerrainProductsError(f"Unknown terrain asset: {name}") from exc
-        candidate = (self.root / relative).resolve()
-        try:
-            candidate.relative_to(self.root.resolve())
-        except ValueError as exc:
-            raise TerrainProductsError(
-                f"Terrain asset escapes dataset: {relative}"
-            ) from exc
-        return candidate
-
-    def validate(self) -> None:
-        value = self.manifest
-        if (
-            value.get("contract") != TERRAIN_CONTRACT
-            or value.get("version") != TERRAIN_CONTRACT_VERSION
-        ):
-            raise TerrainProductsError(
-                "Unsupported terrain dataset contract or version"
-            )
-        try:
-            grid_value = value["grid"]
-            grid = GridSpec(
-                CRS.from_wkt(grid_value["crs_wkt"]),
-                Affine(*grid_value["transform"]),
-                int(grid_value["width"]),
-                int(grid_value["height"]),
-            )
-            assets = value["assets"]
-        except (KeyError, TypeError, ValueError) as exc:
-            raise TerrainProductsError("Terrain manifest is incomplete") from exc
-        required = {"mini_index", "mini_ownership", "drainage", "hand", "ltnd"}
-        if not required.issubset(assets):
-            raise TerrainProductsError("Terrain manifest is missing required assets")
-        index = self.path("mini_index")
-        if not index.is_file():
-            raise TerrainProductsError("Terrain mini index is missing")
-        try:
-            table = pd.read_parquet(index)
-        except Exception as exc:
-            raise TerrainProductsError("Cannot read terrain mini index") from exc
-        if list(table.columns) != ["mini_label", "mini_id"]:
-            raise TerrainProductsError("Terrain mini index schema is invalid")
-        if (
-            table.empty
-            or table["mini_label"].dtype != np.dtype("int32")
-            or table["mini_label"].duplicated().any()
-            or table["mini_id"].isna().any()
-            or table["mini_id"].duplicated().any()
-        ):
-            raise TerrainProductsError("Terrain mini index values are invalid")
-        if not np.array_equal(
-            table["mini_label"].to_numpy(),
-            np.arange(1, len(table) + 1, dtype="int32"),
-        ):
-            raise TerrainProductsError("Terrain mini labels must be contiguous")
-        expected_dtypes = {
-            "mini_ownership": "int32",
-            "drainage": "uint8",
-            "hand": "float32",
-            "ltnd": "float32",
-            "flow_direction": "uint8",
-        }
-        raster_assets = (required - {"mini_index"}) | ({"flow_direction"} & set(assets))
-        for name in raster_assets:
-            path = self.path(name)
-            if not path.is_file():
-                raise TerrainProductsError(f"Terrain raster asset is missing: {name}")
-            try:
-                with rasterio.open(path) as source:
-                    if (
-                        source.count != 1
-                        or source.crs is None
-                        or CRS.from_user_input(source.crs) != grid.crs
-                        or source.transform != grid.transform
-                        or source.shape != (grid.height, grid.width)
-                        or source.nodata is not None
-                        or source.dtypes[0] != expected_dtypes[name]
-                        or MaskFlags.per_dataset not in source.mask_flag_enums[0]
-                        or source.tags(ns="IMAGE_STRUCTURE").get("LAYOUT") != "COG"
-                    ):
-                        raise TerrainProductsError(
-                            f"Terrain raster does not match the canonical grid: {name}"
-                        )
-            except rasterio.errors.RasterioError as exc:
-                raise TerrainProductsError(
-                    f"Cannot inspect terrain raster: {name}"
-                ) from exc
 
 
 def _pixel_sizes(transform: Affine) -> tuple[float, float]:
@@ -1034,19 +924,9 @@ class _MiniUnit:
 
 
 @dataclass(frozen=True)
-class _DomainPayload:
-    grid: GridSpec
-    catchments: Path
-    segments: Path
-    units: tuple[_MiniUnit, ...]
-
-
-@dataclass(frozen=True)
 class _TerrainPayload:
-    prepared: Path
     grid: GridSpec
-    ownership: Path
-    drainage: Path
+    raster_assets: dict[str, Path]
     units: tuple[_MiniUnit, ...]
     direction_source: str
     write_flow_direction: bool
@@ -1054,14 +934,6 @@ class _TerrainPayload:
     agree_smooth: float
     agree_buffer: int
     gdal_cache_bytes: int
-
-
-@dataclass(frozen=True)
-class _DomainPatch:
-    window: Window
-    valid: np.ndarray
-    ownership: np.ndarray
-    drainage: np.ndarray
 
 
 @dataclass(frozen=True)
@@ -1108,11 +980,21 @@ def _create_terrain_dataset(spec: TerrainSpec) -> TerrainReport:
 
     overall_started = time.perf_counter()
     _validate_terrain_spec(spec)
-    prepared = PreparedDataset.open(spec.prepared)
-    prepared.validate()
-    grid = prepared_grid(spec.prepared)
+    try:
+        grid = grid_from_dem(spec.dem)
+    except RasterGridError as exc:
+        raise TerrainProductsError("Cannot discover the canonical DEM grid") from exc
+    raster_assets = {
+        "dem": Path(spec.dem),
+        "mini_ownership": Path(spec.mini_ownership),
+        "drainage": Path(spec.drainage),
+    }
+    if spec.d8 is not None:
+        raster_assets["d8"] = Path(spec.d8)
+    _validate_terrain_inputs(raster_assets, grid)
+
     planning_started = time.perf_counter()
-    mini_units, mini_index, mini_identity = _plan_minis(spec.prepared, grid)
+    mini_units, mini_identity = _plan_minis(Path(spec.mini_index), grid)
     memory_bytes = spec.memory_limit_mb * 1024 * 1024
     planning_seconds = time.perf_counter() - planning_started
     config = ExecutionConfig(
@@ -1122,38 +1004,27 @@ def _create_terrain_dataset(spec: TerrainSpec) -> TerrainReport:
         io_slots=spec.io_slots,
     )
     checkpoint_root = Path(spec.checkpoint_dir) if spec.checkpoint_dir else None
-    domain_checkpoint = None
+    domain_report = ExecutionReport(0, 0, 0, 0, 0, 0, 0.0, {}, ())
+    terrain_checkpoint = None
 
     publisher = AtomicOutputDirectory(spec.output_dir)
     compression_seconds = 0.0
     with publisher as staging:
-        raster_root = staging / "rasters"
-        raster_root.mkdir()
-        mini_index_path = staging / "mini_index.parquet"
-        mini_index.to_parquet(mini_index_path, index=False)
-
-        domain_paths = {}
-        for name in ("mini_ownership", "drainage"):
-            source = prepared.asset_path(prepared.manifest["assets"][name]["path"])
-            target = raster_root / f"{name}.tif"
-            copy_raster(source, target, driver="COG", BLOCKSIZE=BLOCK_SIZE, COMPRESS="DEFLATE")
-            domain_paths[name] = target
-        domain_report = ExecutionReport(0, 0, 0, 0, 0, 0, 0.0, {}, ())
-
         terrain_items = _terrain_work_items(
             mini_units,
             spec,
             grid,
-            domain_paths["mini_ownership"],
-            domain_paths["drainage"],
+            raster_assets,
             memory_bytes,
         )
+        input_identity = {
+            name: file_identity(path) for name, path in raster_assets.items()
+        } | mini_identity
         terrain_checkpoint = _checkpoint(
             checkpoint_root / "terrain" if checkpoint_root else None,
             "terrain-products",
-            prepared.manifest,
+            input_identity,
             {
-                "minis": mini_identity,
                 "direction_source": spec.direction_source,
                 "write_flow_direction": spec.write_flow_direction,
                 "agree_sharp": spec.agree_sharp,
@@ -1187,7 +1058,7 @@ def _create_terrain_dataset(spec: TerrainSpec) -> TerrainReport:
                 )
             )
         with RasterAssembler(
-            raster_root,
+            staging,
             grid,
             terrain_specs,
             compression_threads=min(spec.workers, 4),
@@ -1223,21 +1094,9 @@ def _create_terrain_dataset(spec: TerrainSpec) -> TerrainReport:
             terrain_paths = terrain_assembler.finish()
             compression_seconds += time.perf_counter() - started
 
-        paths = domain_paths | terrain_paths
-        manifest = _terrain_manifest(spec, grid, mini_identity, mini_index_path, paths)
-        manifest_path = staging / "manifest.json"
-        manifest_path.write_text(
-            json.dumps(manifest, indent=2, sort_keys=True, allow_nan=False) + "\n",
-            encoding="utf-8",
-        )
-        TerrainDataset(staging, manifest).validate()
-        expected = ["manifest.json", "mini_index.parquet"] + [
-            str(path.relative_to(staging)) for path in paths.values()
-        ]
-        publisher.publish(tuple(expected))
+        _validate_terrain_outputs(terrain_paths, grid)
+        publisher.publish(tuple(path.name for path in terrain_paths.values()))
 
-    if domain_checkpoint is not None:
-        domain_checkpoint.cleanup()
     if terrain_checkpoint is not None:
         terrain_checkpoint.cleanup()
     if checkpoint_root is not None:
@@ -1269,9 +1128,12 @@ def _create_terrain_dataset(spec: TerrainSpec) -> TerrainReport:
         terrain_report,
         overall_started,
     )
+    output_dir = Path(spec.output_dir)
     return TerrainReport(
-        Path(spec.output_dir),
-        Path(spec.output_dir) / "manifest.json",
+        output_dir,
+        output_dir / "hand.tif",
+        output_dir / "ltnd.tif",
+        output_dir / "flow_direction.tif" if spec.write_flow_direction else None,
         len(mini_units),
         owned_cells,
         drainage_cells,
@@ -1286,8 +1148,18 @@ def _create_terrain_dataset(spec: TerrainSpec) -> TerrainReport:
 
 
 def _validate_terrain_spec(spec: TerrainSpec) -> None:
-    if not Path(spec.prepared).is_dir():
-        raise TerrainProductsError(f"prepared input is not a directory: {spec.prepared}")
+    for name, path in (
+        ("DEM", spec.dem),
+        ("mini ownership", spec.mini_ownership),
+        ("drainage", spec.drainage),
+        ("mini index", spec.mini_index),
+    ):
+        if not Path(path).is_file():
+            raise TerrainProductsError(f"{name} input is not a local file: {path}")
+    if spec.d8 is not None and not Path(spec.d8).is_file():
+        raise TerrainProductsError(f"D8 input is not a local file: {spec.d8}")
+    if spec.direction_source == "d8" and spec.d8 is None:
+        raise TerrainProductsError("D8 input is required when direction source is 'd8'")
     if spec.direction_source not in {"dem", "d8"}:
         raise TerrainProductsError("direction source must be 'dem' or 'd8'")
     for name, value in (
@@ -1314,28 +1186,91 @@ def _validate_terrain_spec(spec: TerrainSpec) -> None:
                 "Checkpoint directory cannot be inside the output directory"
             )
     _validate_agree_parameters(spec.agree_sharp, spec.agree_smooth, spec.agree_buffer)
-    if spec.direction_source == "d8":
-        prepared = PreparedDataset.open(spec.prepared)
-        prepared.validate()
-        asset = prepared.manifest.get("assets", {}).get("rasters", {}).get("d8")
-        if not isinstance(asset, dict):
-            raise TerrainProductsError("Prepared dataset has no D8 raster")
-        if asset.get("encoding") != "canonical-clockwise":
-            raise TerrainProductsError("Prepared D8 raster has an unsupported encoding")
+
+
+def _validate_terrain_inputs(assets: dict[str, Path], grid: GridSpec) -> None:
+    expected_dtypes = {
+        "dem": None,
+        "mini_ownership": "int32",
+        "drainage": "uint8",
+        "d8": "uint8",
+    }
+    for name, path in assets.items():
+        try:
+            with rasterio.open(path) as source:
+                _require_grid(source, grid, name)
+                expected = expected_dtypes[name]
+                if expected is not None and source.dtypes[0] != expected:
+                    raise TerrainProductsError(
+                        f"{name} raster has dtype {source.dtypes[0]}, "
+                        f"expected {expected}"
+                    )
+        except TerrainProductsError:
+            raise
+        except RasterGridError as exc:
+            raise TerrainProductsError(
+                f"Explicit {name} raster does not match the canonical DEM grid"
+            ) from exc
+        except (OSError, rasterio.errors.RasterioError, TypeError, ValueError) as exc:
+            raise TerrainProductsError(
+                f"Cannot inspect explicit {name} raster: {path}"
+            ) from exc
+
+
+def _validate_terrain_outputs(paths: dict[str, Path], grid: GridSpec) -> None:
+    expected = {"hand", "ltnd"}
+    if paths.keys() != expected and paths.keys() != expected | {"flow_direction"}:
+        raise TerrainProductsError("Terrain output file set is incomplete")
+    expected_dtypes = {"hand": "float32", "ltnd": "float32", "flow_direction": "uint8"}
+    for name, path in paths.items():
+        try:
+            with rasterio.open(path) as source:
+                _require_grid(source, grid, name)
+                if source.dtypes[0] != expected_dtypes[name]:
+                    raise TerrainProductsError(
+                        f"Terrain raster {name} has unexpected dtype {source.dtypes[0]}"
+                    )
+        except TerrainProductsError:
+            raise
+        except RasterGridError as exc:
+            raise TerrainProductsError(
+                f"Terrain output {name} does not match the canonical DEM grid"
+            ) from exc
+        except (OSError, rasterio.errors.RasterioError, TypeError, ValueError) as exc:
+            raise TerrainProductsError(f"Cannot inspect terrain output: {path}") from exc
 
 
 def _plan_minis(
-    prepared_root: Path, grid: GridSpec
-) -> tuple[tuple[_MiniUnit, ...], pd.DataFrame, dict[str, Any]]:
-    dataset = PreparedDataset.open(prepared_root)
+    index_path: Path, grid: GridSpec
+) -> tuple[tuple[_MiniUnit, ...], dict[str, Any]]:
     try:
-        index_path = dataset.asset_path(dataset.manifest["assets"]["mini_index"]["path"])
         table = pd.read_parquet(index_path)
     except Exception as exc:
-        raise TerrainProductsError("Cannot read prepared mini index") from exc
+        raise TerrainProductsError(f"Cannot read explicit mini index: {index_path}") from exc
     required = ["mini_label", "mini_id", "minx", "miny", "maxx", "maxy"]
-    if list(table.columns) != required or table.empty or table["mini_label"].duplicated().any():
-        raise TerrainProductsError("Prepared mini index schema is invalid")
+    if (
+        list(table.columns) != required
+        or table.empty
+        or table["mini_label"].dtype != np.dtype("int32")
+        or table["mini_label"].duplicated().any()
+        or table["mini_id"].isna().any()
+        or table["mini_id"].duplicated().any()
+        or not np.array_equal(
+            table["mini_label"].to_numpy(),
+            np.arange(1, len(table) + 1, dtype="int32"),
+        )
+    ):
+        raise TerrainProductsError("Mini index schema or values are invalid")
+    try:
+        bounds = table[["minx", "miny", "maxx", "maxy"]].to_numpy(dtype=float)
+    except (TypeError, ValueError) as exc:
+        raise TerrainProductsError("Mini index bounds are invalid") from exc
+    if (
+        not np.isfinite(bounds).all()
+        or np.any(bounds[:, 0] > bounds[:, 2])
+        or np.any(bounds[:, 1] > bounds[:, 3])
+    ):
+        raise TerrainProductsError("Mini index bounds are invalid")
     labels_by_key = {
         f"mini-{int(row.mini_label):010d}": (int(row.mini_label), row.mini_id)
         for row in table.itertuples(index=False)
@@ -1344,12 +1279,15 @@ def _plan_minis(
         (f"mini-{int(row.mini_label):010d}", (float(row.minx), float(row.miny), float(row.maxx), float(row.maxy)))
         for row in table.itertuples(index=False)
     ]
-    planned = plan_raster_units(
-        grid,
-        unit_bounds,
-        bytes_per_cell=DOMAIN_BYTES_PER_CELL,
-        fixed_bytes=TASK_FIXED_BYTES,
-    )
+    try:
+        planned = plan_raster_units(
+            grid,
+            unit_bounds,
+            bytes_per_cell=DOMAIN_BYTES_PER_CELL,
+            fixed_bytes=TASK_FIXED_BYTES,
+        )
+    except RasterGridError as exc:
+        raise TerrainProductsError("Mini index bounds do not overlap the DEM grid") from exc
     result = tuple(
         _MiniUnit(
             raster,
@@ -1358,16 +1296,10 @@ def _plan_minis(
         )
         for raster in planned
     )
-    mini_index = pd.DataFrame(
-        {
-            "mini_label": table["mini_label"].to_numpy(dtype="int32"),
-            "mini_id": table["mini_id"].to_numpy(),
-        }
-    )
     identity = {
-        "mini_index": _file_identity(index_path),
+        "mini_index": file_identity(index_path),
     }
-    return result, mini_index, identity
+    return result, identity
 
 
 def _reestimated_units(
@@ -1403,38 +1335,11 @@ def _packet_units(
     )
 
 
-def _domain_work_items(
-    units: tuple[_MiniUnit, ...],
-    spec: TerrainSpec,
-    grid: GridSpec,
-    memory_limit_bytes: int,
-) -> tuple[WorkItem[_DomainPayload], ...]:
-    result = []
-    for ordinal, (packet, packet_units) in enumerate(
-        _packet_units(units, DOMAIN_BYTES_PER_CELL, memory_limit_bytes)
-    ):
-        result.append(
-            WorkItem(
-                packet.key,
-                ordinal,
-                packet.estimated_bytes,
-                _DomainPayload(
-                    grid,
-                    Path(spec.minis) / "mini_catchments.fgb",
-                    Path(spec.minis) / "mini_segments.fgb",
-                    packet_units,
-                ),
-            )
-        )
-    return tuple(result)
-
-
 def _terrain_work_items(
     units: tuple[_MiniUnit, ...],
     spec: TerrainSpec,
     grid: GridSpec,
-    ownership: Path,
-    drainage: Path,
+    raster_assets: dict[str, Path],
     memory_limit_bytes: int,
 ) -> tuple[WorkItem[_TerrainPayload], ...]:
     bytes_per_cell = (
@@ -1450,10 +1355,8 @@ def _terrain_work_items(
                 ordinal,
                 packet.estimated_bytes,
                 _TerrainPayload(
-                    Path(spec.prepared),
                     grid,
-                    ownership,
-                    drainage,
+                    raster_assets,
                     packet_units,
                     spec.direction_source,
                     spec.write_flow_direction,
@@ -1465,97 +1368,6 @@ def _terrain_work_items(
             )
         )
     return tuple(result)
-
-
-def _domain_worker(
-    payload: _DomainPayload, context: WorkerContext
-) -> WorkerOutput[_PacketValue]:
-    started = time.perf_counter()
-    with context.io_bound():
-        catchments = pyogrio.read_dataframe(
-            payload.catchments,
-            columns=["id"],
-            fids=[unit.catchment_fid for unit in payload.units],
-            use_arrow=True,
-        )
-    with context.io_bound():
-        segments = pyogrio.read_dataframe(
-            payload.segments,
-            columns=["id"],
-            fids=[unit.segment_fid for unit in payload.units],
-            use_arrow=True,
-        )
-    vector_seconds = time.perf_counter() - started
-    catchment_by_id = dict(zip(catchments["id"], catchments.geometry, strict=True))
-    segment_by_id = dict(zip(segments["id"], segments.geometry, strict=True))
-    patches = []
-    raster_started = time.perf_counter()
-    owned_count = drainage_count = 0
-    for unit in payload.units:
-        try:
-            catchment = catchment_by_id[unit.mini_id]
-            segment = segment_by_id[unit.mini_id]
-        except KeyError as exc:
-            raise TerrainProductsError(
-                f"Cannot read geometry for mini {unit.mini_id}"
-            ) from exc
-        if (
-            catchment is None
-            or segment is None
-            or catchment.is_empty
-            or segment.is_empty
-            or not catchment.is_valid
-            or not segment.is_valid
-        ):
-            raise TerrainProductsError(f"Mini {unit.mini_id} has invalid geometry")
-        window = unit.raster.window
-        shape = (int(window.height), int(window.width))
-        transform = rasterio.windows.transform(window, payload.grid.transform)
-        valid = rasterize(
-            [(catchment, 1)],
-            out_shape=shape,
-            transform=transform,
-            fill=0,
-            dtype="uint8",
-            all_touched=False,
-        ).astype(bool)
-        if not np.any(valid):
-            raise TerrainProductsError(
-                f"Mini {unit.mini_id} owns no canonical-grid cells"
-            )
-        drainage = (
-            rasterize(
-                [(segment, 1)],
-                out_shape=shape,
-                transform=transform,
-                fill=0,
-                dtype="uint8",
-                all_touched=True,
-            ).astype(bool)
-            & valid
-        )
-        if not np.any(drainage):
-            raise TerrainProductsError(
-                f"Mini {unit.mini_id} has no matching drainage cells"
-            )
-        patches.append(
-            _DomainPatch(
-                window,
-                valid,
-                np.full(shape, unit.mini_label, dtype="int32"),
-                drainage.astype("uint8", copy=False),
-            )
-        )
-        owned_count += int(valid.sum())
-        drainage_count += int(drainage.sum())
-    return WorkerOutput(
-        _PacketValue(tuple(patches)),
-        {
-            "vector_read": vector_seconds,
-            "rasterization": time.perf_counter() - raster_started,
-        },
-        {"owned_cells": owned_count, "drainage_cells": drainage_count},
-    )
 
 
 def _terrain_worker(
@@ -1575,15 +1387,15 @@ def _terrain_worker_with_cache(
     jit_started = time.perf_counter()
     context.resources.get("terrain-numba-kernels-v1", _warm_worker_kernels)
     jit_seconds = time.perf_counter() - jit_started
-    prepared_reader = context.resources.get(
-        f"terrain-prepared:{Path(payload.prepared).resolve()}",
-        lambda: PreparedRasterReader(payload.prepared, context),
-    )
     aligned_reader = context.resources.get(
-        f"terrain-domain:{Path(payload.ownership).resolve()}",
+        "terrain-aligned-inputs:"
+        + ":".join(
+            f"{name}={Path(path).resolve()}"
+            for name, path in sorted(payload.raster_assets.items())
+        ),
         lambda: AlignedRasterReader(
             payload.grid,
-            {"ownership": payload.ownership, "drainage": payload.drainage},
+            payload.raster_assets,
             context,
         ),
     )
@@ -1601,11 +1413,11 @@ def _terrain_worker_with_cache(
     for unit in payload.units:
         window = unit.raster.window
         read_started = time.perf_counter()
-        ownership = aligned_reader.read("ownership", window)
+        ownership = aligned_reader.read("mini_ownership", window)
         drainage_values = aligned_reader.read("drainage", window)
-        dem = prepared_reader.read("dem", window)
+        dem = aligned_reader.read("dem", window)
         d8 = (
-            prepared_reader.read("d8", window)
+            aligned_reader.read("d8", window)
             if payload.direction_source == "d8"
             else None
         )
@@ -1700,7 +1512,7 @@ def _validated_d8(
     mini_id: Any,
 ) -> tuple[np.ndarray, np.ndarray]:
     if values is None:
-        raise TerrainProductsError("Prepared D8 values were not loaded")
+        raise TerrainProductsError("Explicit D8 values were not loaded")
     if np.any(np.ma.getmaskarray(values)[owned]):
         raise TerrainProductsError(f"D8 contains nodata within mini {mini_id}")
     raw = np.asarray(values.data)
@@ -1740,7 +1552,7 @@ def _terrain_products_float32(
 def _checkpoint(
     root: Path | None,
     algorithm: str,
-    prepared_manifest: dict[str, Any],
+    input_identity: dict[str, Any],
     parameters: dict[str, Any],
     items: tuple[WorkItem[Any], ...],
 ) -> CheckpointStore[Any] | None:
@@ -1749,7 +1561,7 @@ def _checkpoint(
     fingerprint = execution_fingerprint(
         algorithm=algorithm,
         version="1",
-        prepared_manifest=prepared_manifest,
+        input_identity=input_identity,
         parameters=parameters,
         work_items=items,
     )
@@ -1769,68 +1581,6 @@ def _terrain_tags(spec: TerrainSpec, role: str) -> dict[str, Any]:
             agree_buffer_pixels=spec.agree_buffer,
         )
     return result
-
-
-def _terrain_manifest(
-    spec: TerrainSpec,
-    grid: GridSpec,
-    mini_identity: dict[str, Any],
-    mini_index: Path,
-    rasters: dict[str, Path],
-) -> dict[str, Any]:
-    assets: dict[str, Any] = {
-        "mini_index": {
-            "path": mini_index.name,
-            "driver": "Parquet",
-            "role": "dense mini-label index",
-        }
-    }
-    roles = {
-        "mini_ownership": "mini-catchment ownership",
-        "drainage": "matching mini drainage",
-        "hand": "height above matching drainage",
-        "ltnd": "along-route distance to matching drainage",
-        "flow_direction": "canonical clockwise D8 direction",
-    }
-    output_root = mini_index.parent
-    for name, path in rasters.items():
-        with rasterio.open(path) as source:
-            asset = {
-                "path": path.relative_to(output_root).as_posix(),
-                "driver": "COG",
-                "role": roles[name],
-                "dtype": source.dtypes[0],
-                "nodata": "internal-mask",
-                "block_size": BLOCK_SIZE,
-                "overviews": source.overviews(1),
-            }
-        if name == "flow_direction":
-            asset["encoding"] = "canonical-clockwise"
-        assets[name] = asset
-    return {
-        "contract": TERRAIN_CONTRACT,
-        "version": TERRAIN_CONTRACT_VERSION,
-        "producer": _producer_version(),
-        "grid": grid.to_manifest(),
-        "inputs": {
-            "prepared": str(Path(spec.prepared).resolve()),
-            "mini_assets": mini_identity,
-        },
-        "routing": {
-            "source": spec.direction_source,
-            "agree": (
-                {
-                    "sharp": spec.agree_sharp,
-                    "smooth": spec.agree_smooth,
-                    "buffer_pixels": spec.agree_buffer,
-                }
-                if spec.direction_source == "dem"
-                else None
-            ),
-            "ownership_buffer_cells": 0,
-        },
-        "assets": assets,
-    }
 
 
 def _terrain_timings(
@@ -1869,43 +1619,3 @@ def _gdal_cache_bytes(memory_limit_bytes: int, workers: int) -> int:
         64 * 1024 * 1024,
         max(8 * 1024 * 1024, memory_limit_bytes // max(8, workers * 8)),
     )
-
-
-def _file_identity(path: Path) -> dict[str, Any]:
-    try:
-        stat = path.stat()
-    except OSError as exc:
-        raise TerrainProductsError(f"Cannot inspect mini asset: {path}") from exc
-    return {
-        "path": str(path.resolve()),
-        "size": stat.st_size,
-        "mtime_ns": stat.st_mtime_ns,
-    }
-
-
-def _is_missing_id(value: Any) -> bool:
-    try:
-        return bool(pd.isna(value))
-    except (TypeError, ValueError):
-        return False
-
-
-def _mini_id_sort_key(value: Any) -> tuple[str, Any]:
-    """Provide deterministic natural ordering for provider scalar ID types."""
-    if isinstance(value, (int, np.integer)) and not isinstance(value, bool):
-        return ("integer", int(value))
-    if isinstance(value, (float, np.floating)):
-        return ("real", float(value))
-    if isinstance(value, str):
-        return ("text", value)
-    if isinstance(value, bytes):
-        return ("bytes", value)
-    kind = f"{type(value).__module__}.{type(value).__qualname__}"
-    return (kind, repr(value))
-
-
-def _producer_version() -> str:
-    try:
-        return importlib.metadata.version("mgb-vec-hydro")
-    except importlib.metadata.PackageNotFoundError:
-        return "0.1.0"

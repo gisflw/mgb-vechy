@@ -1,11 +1,8 @@
-import json
-
 import numpy as np
 import pandas as pd
 import pytest
 import rasterio
 from affine import Affine
-from pyproj import CRS
 from shapely.geometry import LineString, Polygon
 
 from mgb_vec_hydro.exceptions import TerrainProductsError
@@ -15,7 +12,6 @@ from mgb_vec_hydro.execution.vector import (
 )
 from mgb_vec_hydro.preparation import PreparationSpec, prepare_dataset
 from mgb_vec_hydro.terrain import (
-    TerrainDataset,
     TerrainSpec,
     _agree_condition_dem,
     _validated_d8,
@@ -162,55 +158,32 @@ def _terrain_inputs(tmp_path, *, with_d8=False):
     write_vector_table(segments, minis / "mini_segments.fgb", driver="FlatGeobuf")
     # Stage 4 must not inspect this user-facing provenance file.
     (minis / "source_to_mini.csv").write_text("deliberately,invalid\n")
-    roi = tmp_path / "roi"
-    (roi / "vectors").mkdir(parents=True)
-    write_vector_table(
-        catchments, roi / "vectors" / "roi_catchments.fgb", driver="FlatGeobuf"
-    )
-    (roi / "manifest.json").write_text(
-        json.dumps(
-            {
-                "crs_wkt": CRS.from_epsg(3857).to_wkt(),
-                "assets": {"catchments": {"path": "vectors/roi_catchments.fgb"}},
-            }
-        )
-    )
-    (minis / "manifest.json").write_text(
-        json.dumps(
-            {
-                "contract": "mgb-aggregation-dataset",
-                "version": 2,
-                "roi": str(roi.resolve()),
-                "crs_wkt": CRS.from_epsg(3857).to_wkt(),
-                "assets": {
-                    "catchments": {"path": "mini_catchments.fgb"},
-                    "segments": {"path": "mini_segments.fgb"},
-                },
-            }
-        )
-    )
     prepared = tmp_path / "prepared"
-    prepare_dataset(
+    preparation = prepare_dataset(
         PreparationSpec(
             dem=dem_path,
-            minis=minis,
+            mini_catchments=minis / "mini_catchments.fgb",
+            mini_segments=minis / "mini_segments.fgb",
             output_dir=prepared,
             d8=d8_path,
             d8_encoding="canonical" if with_d8 else None,
             buffer_cells=0,
         )
     )
-    return prepared, minis
+    return preparation, minis
 
 
-def test_terrain_dataset_records_custom_agree_profile_and_strict_domain(tmp_path):
+def test_terrain_outputs_custom_agree_profile_and_strict_domain(tmp_path):
     prepared, _minis = _terrain_inputs(tmp_path)
     output_dir = tmp_path / "out"
     checkpoint_dir = tmp_path / "checkpoints"
 
     report = create_terrain_dataset(
         TerrainSpec(
-            prepared=prepared,
+            dem=prepared.dem,
+            mini_ownership=prepared.mini_ownership,
+            drainage=prepared.drainage,
+            mini_index=prepared.mini_index,
             output_dir=output_dir,
             agree_sharp=12,
             agree_smooth=3,
@@ -220,10 +193,12 @@ def test_terrain_dataset_records_custom_agree_profile_and_strict_domain(tmp_path
         )
     )
 
-    TerrainDataset.open(output_dir).validate()
     assert report.mini_count == 2
     assert report.timings["conditioning"] >= 0
-    with rasterio.open(output_dir / "rasters" / "hand.tif") as result:
+    assert sorted(path.name for path in output_dir.iterdir()) == ["hand.tif", "ltnd.tif"]
+    assert not (output_dir / "manifest.json").exists()
+    assert not any(path.is_dir() for path in output_dir.iterdir())
+    with rasterio.open(output_dir / "hand.tif") as result:
         tags = result.tags()
         mask = result.dataset_mask()
     assert tags["agree_sharp"] == "12"
@@ -231,14 +206,92 @@ def test_terrain_dataset_records_custom_agree_profile_and_strict_domain(tmp_path
     assert tags["agree_buffer_pixels"] == "2"
     assert np.all(mask[:, 3] == 0)
     with (
-        rasterio.open(output_dir / "rasters" / "mini_ownership.tif") as ownership,
-        rasterio.open(output_dir / "rasters" / "drainage.tif") as drainage,
+        rasterio.open(prepared.mini_ownership) as ownership,
+        rasterio.open(prepared.drainage) as drainage,
     ):
         np.testing.assert_array_equal(ownership.dataset_mask(), drainage.dataset_mask())
         assert np.all(drainage.read(1)[ownership.dataset_mask() == 0] == 0)
-    index = pd.read_parquet(output_dir / "mini_index.parquet")
-    assert index.to_dict("list") == {"mini_label": [1, 2], "mini_id": ["a", "b"]}
+    index = pd.read_parquet(prepared.mini_index)
+    assert list(index.columns) == [
+        "mini_label",
+        "mini_id",
+        "minx",
+        "miny",
+        "maxx",
+        "maxy",
+    ]
+    assert index["mini_id"].tolist() == ["a", "b"]
     assert not checkpoint_dir.exists()
+
+
+def test_terrain_validates_direct_grid_and_shared_index_inputs(tmp_path):
+    prepared, _minis = _terrain_inputs(tmp_path)
+    mismatched = tmp_path / "mismatched-ownership.tif"
+    with rasterio.open(prepared.mini_ownership) as source:
+        profile = source.profile.copy()
+        data = source.read(1)
+        mask = source.dataset_mask()
+    profile.update(driver="COG", crs="EPSG:4326")
+    with rasterio.open(mismatched, "w", **profile) as target:
+        target.write(data, 1)
+        target.write_mask(mask)
+
+    grid_output = tmp_path / "grid-error"
+    with pytest.raises(TerrainProductsError, match="canonical DEM grid"):
+        create_terrain_dataset(
+            TerrainSpec(
+                dem=prepared.dem,
+                mini_ownership=mismatched,
+                drainage=prepared.drainage,
+                mini_index=prepared.mini_index,
+                output_dir=grid_output,
+                workers=1,
+            )
+        )
+    assert not grid_output.exists()
+
+    invalid_index = tmp_path / "invalid-index.parquet"
+    index = pd.read_parquet(prepared.mini_index)
+    index.loc[0, "minx"] = index.loc[0, "maxx"] + 1
+    index.to_parquet(invalid_index, index=False)
+    index_output = tmp_path / "index-error"
+    with pytest.raises(TerrainProductsError, match="bounds"):
+        create_terrain_dataset(
+            TerrainSpec(
+                dem=prepared.dem,
+                mini_ownership=prepared.mini_ownership,
+                drainage=prepared.drainage,
+                mini_index=invalid_index,
+                output_dir=index_output,
+                workers=1,
+            )
+        )
+    assert not index_output.exists()
+
+
+def test_terrain_d8_mode_consumes_explicit_d8_and_publishes_only_products(tmp_path):
+    prepared, _minis = _terrain_inputs(tmp_path, with_d8=True)
+    output = tmp_path / "d8-terrain"
+    report = create_terrain_dataset(
+        TerrainSpec(
+            dem=prepared.dem,
+            mini_ownership=prepared.mini_ownership,
+            drainage=prepared.drainage,
+            mini_index=prepared.mini_index,
+            d8=prepared.d8,
+            direction_source="d8",
+            write_flow_direction=True,
+            output_dir=output,
+            workers=1,
+        )
+    )
+    assert report.flow_direction == output / "flow_direction.tif"
+    assert sorted(path.name for path in output.iterdir()) == [
+        "flow_direction.tif",
+        "hand.tif",
+        "ltnd.tif",
+    ]
+    assert not (output / "mini_index.parquet").exists()
 
 def test_d8_validation_terminalizes_drainage_and_rejects_invalid_paths():
     owned = np.ones((1, 3), dtype=bool)

@@ -48,6 +48,31 @@ class AtomicOutputDirectory:
             raise PublicationError(
                 "Staged output is missing expected file(s): " + ", ".join(missing)
             )
+        if safe_expected:
+            expected_files = {candidate for _, candidate in safe_expected}
+            actual_files = {
+                path.resolve()
+                for path in self.staging.rglob("*")
+                if path.is_file()
+            }
+            nested_directories = [
+                path.relative_to(self.staging)
+                for path in self.staging.rglob("*")
+                if path.is_dir()
+            ]
+            extras = sorted(
+                str(path.relative_to(self.staging))
+                for path in actual_files - expected_files
+            )
+            if nested_directories:
+                raise PublicationError(
+                    "Published output must be a flat directory; staged directory(s): "
+                    + ", ".join(str(path) for path in sorted(nested_directories))
+                )
+            if extras:
+                raise PublicationError(
+                    "Staged output contains unexpected file(s): " + ", ".join(extras)
+                )
         if self.target.exists():
             raise PublicationError(f"Output directory already exists: {self.target}")
         try:

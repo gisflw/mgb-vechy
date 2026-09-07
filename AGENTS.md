@@ -82,5 +82,6 @@ RUN_TERRAIN_BENCHMARKS=1 pytest tests/benchmark/test_terrain_scaling.py
 RUN_SAMPLING_BENCHMARKS=1 pytest tests/benchmark/test_sampling_scaling.py
 ```
 
-The full terrain benchmark also requires `BHAE_PREPARED` and `BHAE_MINIS` to
-identify the local Stage 0 and Stage 2 integration datasets.
+The full terrain benchmark requires explicit `BHAE_DEM`,
+`BHAE_MINI_OWNERSHIP`, `BHAE_DRAINAGE`, and `BHAE_MINI_INDEX` paths; set
+`BHAE_D8` as well when exercising an explicit D8 input.

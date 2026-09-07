@@ -7,7 +7,7 @@ from mgb_vec_hydro.execution.vector import (
     read_vector_table,
     write_vector_table,
 )
-from mgb_vec_hydro.roi import ROI_COLUMNS, RoiDataset, RoiSpec, define_roi_dataset
+from mgb_vec_hydro.roi import ROI_COLUMNS, RoiSpec, define_roi_dataset
 
 
 def _inputs(tmp_path, *, orders=(3, 2, 1), downstream=(None, 1, 2)):
@@ -47,13 +47,19 @@ def _inputs(tmp_path, *, orders=(3, 2, 1), downstream=(None, 1, 2)):
     )
 
 
-def test_roi_publishes_versioned_normalized_fgb_and_provider_area(tmp_path):
+def test_roi_publishes_flat_normalized_fgb_and_provider_area(tmp_path):
     report = define_roi_dataset(_inputs(tmp_path))
     assert report.segment_count == 3
-    dataset = RoiDataset.open(report.output_dir)
-    dataset.validate()
-    segment_vector = read_vector_table(dataset.path("segments"))
-    catchment_vector = read_vector_table(dataset.path("catchments"))
+    assert report.catchments == report.output_dir / "roi_catchments.fgb"
+    assert report.segments == report.output_dir / "roi_segments.fgb"
+    assert sorted(path.name for path in report.output_dir.iterdir()) == [
+        "roi_catchments.fgb",
+        "roi_segments.fgb",
+    ]
+    assert not (report.output_dir / "manifest.json").exists()
+    assert not any(path.is_dir() for path in report.output_dir.iterdir())
+    segment_vector = read_vector_table(report.segments)
+    catchment_vector = read_vector_table(report.catchments)
     segments = segment_vector.to_pandas().sort_values("id")
     catchments = catchment_vector.to_pandas().sort_values("id")
     assert list(segments.columns) == ROI_COLUMNS

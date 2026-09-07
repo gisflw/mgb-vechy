@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import pickle
 import shutil
 import time
@@ -11,18 +10,18 @@ from typing import Any
 import numpy as np
 import pandas as pd
 import pyarrow as pa
+import rasterio
 import shapely
-from affine import Affine
 from pyarrow import ipc
 from pyproj import CRS, Transformer
 
-from mgb_vec_hydro.aggregation import (
-    AGGREGATION_CONTRACT,
-    AGGREGATION_CONTRACT_VERSION,
-    INPUT_COLUMNS,
+from mgb_vec_hydro.aggregation import INPUT_COLUMNS
+from mgb_vec_hydro.exceptions import MiniSamplingError, RasterGridError
+from mgb_vec_hydro.execution.checkpoints import (
+    CheckpointStore,
+    execution_fingerprint,
+    file_identity,
 )
-from mgb_vec_hydro.exceptions import MiniSamplingError
-from mgb_vec_hydro.execution.checkpoints import CheckpointStore, execution_fingerprint
 from mgb_vec_hydro.execution.executor import (
     ExecutionConfig,
     ExecutionReport,
@@ -34,20 +33,19 @@ from mgb_vec_hydro.execution.executor import (
 from mgb_vec_hydro.execution.publication import AtomicOutputDirectory
 from mgb_vec_hydro.execution.raster import (
     AlignedRasterReader,
-    PreparedRasterReader,
     RasterBlockPacket,
     RasterUnit,
     packet_raster_units_by_block,
     plan_raster_units,
-    prepared_grid,
+    grid_from_dem,
+    _require_grid,
 )
 from mgb_vec_hydro.execution.vector import (
     geometry_column_name,
     inspect_vector_provider,
     iter_provider_batches,
 )
-from mgb_vec_hydro.preparation import BLOCK_SIZE, GridSpec, PreparedDataset
-from mgb_vec_hydro.terrain import TerrainDataset
+from mgb_vec_hydro.preparation import BLOCK_SIZE, GridSpec
 
 MAX_PACKET_UNITS = 8
 SAMPLING_BYTES_PER_CELL = 64
@@ -56,11 +54,16 @@ TASK_FIXED_BYTES = 8 * 1024 * 1024
 
 @dataclass(frozen=True)
 class MiniSamplingSpec:
-    minis: Path
-    prepared: Path
-    terrain: Path
+    mini_catchments: Path
+    mini_segments: Path
+    mini_index: Path
+    dem: Path
+    mini_ownership: Path
+    drainage: Path
+    hand: Path
+    ltnd: Path
+    hru: Path
     output_dir: Path
-    hru_name: str = "hru"
     workers: int = 4
     memory_limit_mb: int = 512
     io_slots: int = 2
@@ -92,10 +95,8 @@ class _MiniMetadata:
 
 @dataclass(frozen=True)
 class _SamplingPayload:
-    prepared: Path
     grid: GridSpec
-    terrain_assets: dict[str, Path]
-    hru_name: str
+    raster_assets: dict[str, Path]
     packet: RasterBlockPacket
     minis: tuple[_MiniMetadata, ...]
 
@@ -125,13 +126,20 @@ def sample_minibasins(spec: MiniSamplingSpec) -> MiniSamplingReport:
     _validate_spec(spec)
 
     planning_started = time.perf_counter()
-    prepared = PreparedDataset.open(spec.prepared)
-    prepared.validate()
-    terrain = TerrainDataset.open(spec.terrain)
-    terrain.validate()
-    grid = prepared_grid(spec.prepared)
-    _validate_dataset_relationships(spec, prepared, terrain, grid)
-    metadata, units, manifests = _plan_sampling(spec, prepared, terrain, grid)
+    try:
+        grid = grid_from_dem(spec.dem)
+    except RasterGridError as exc:
+        raise MiniSamplingError("Cannot discover the canonical DEM grid") from exc
+    raster_assets = {
+        "dem": Path(spec.dem),
+        "hru": Path(spec.hru),
+        "mini_ownership": Path(spec.mini_ownership),
+        "drainage": Path(spec.drainage),
+        "hand": Path(spec.hand),
+        "ltnd": Path(spec.ltnd),
+    }
+    _validate_sampling_rasters(raster_assets, grid)
+    metadata, units = _plan_sampling(spec, grid)
     memory_bytes = spec.memory_limit_mb * 1024 * 1024
     packets = packet_raster_units_by_block(
         grid,
@@ -142,20 +150,14 @@ def sample_minibasins(spec: MiniSamplingSpec) -> MiniSamplingReport:
         max_units=MAX_PACKET_UNITS,
     )
     metadata_by_key = {f"mini-{value.label:010d}": value for value in metadata.values()}
-    terrain_assets = {
-        name: terrain.path(name)
-        for name in ("mini_ownership", "drainage", "hand", "ltnd")
-    }
     items = [
         WorkItem(
             packet.key,
             ordinal,
             packet.estimated_bytes,
             _SamplingPayload(
-                Path(spec.prepared),
                 grid,
-                terrain_assets,
-                spec.hru_name,
+                raster_assets,
                 packet,
                 tuple(metadata_by_key[unit.key] for unit in packet.units),
             ),
@@ -169,8 +171,15 @@ def sample_minibasins(spec: MiniSamplingSpec) -> MiniSamplingReport:
         fingerprint = execution_fingerprint(
             algorithm="sample-minis",
             version="2",
-            prepared_manifest=manifests,
-            parameters={"hru_name": spec.hru_name},
+            input_identity={
+                name: file_identity(path) for name, path in raster_assets.items()
+            }
+            | {
+                "mini_index": file_identity(Path(spec.mini_index)),
+                "mini_catchments": file_identity(Path(spec.mini_catchments)),
+                "mini_segments": file_identity(Path(spec.mini_segments)),
+            },
+            parameters={},
             work_items=items,
         )
         checkpoint = CheckpointStore(
@@ -274,18 +283,18 @@ def _validate_spec(spec: MiniSamplingSpec) -> None:
     if spec.workers > 4:
         raise MiniSamplingError("workers cannot exceed four")
     for name, path in (
-        ("minis", spec.minis),
-        ("prepared", spec.prepared),
-        ("terrain", spec.terrain),
+        ("mini catchments", spec.mini_catchments),
+        ("mini segments", spec.mini_segments),
+        ("mini index", spec.mini_index),
+        ("DEM", spec.dem),
+        ("mini ownership", spec.mini_ownership),
+        ("drainage", spec.drainage),
+        ("HAND", spec.hand),
+        ("LTND", spec.ltnd),
+        ("HRU", spec.hru),
     ):
-        if not Path(path).is_dir():
-            raise MiniSamplingError(f"{name} input is not a directory: {path}")
-    if (
-        not isinstance(spec.hru_name, str)
-        or not spec.hru_name
-        or spec.hru_name in {"dem", "d8"}
-    ):
-        raise MiniSamplingError("HRU asset name is invalid")
+        if not Path(path).is_file():
+            raise MiniSamplingError(f"{name} input is not a local file: {path}")
     output = Path(spec.output_dir)
     if output.exists():
         raise MiniSamplingError(f"Output directory already exists: {output}")
@@ -301,65 +310,41 @@ def _validate_spec(spec: MiniSamplingSpec) -> None:
             )
 
 
-def _validate_dataset_relationships(
-    spec: MiniSamplingSpec,
-    prepared: PreparedDataset,
-    terrain: TerrainDataset,
-    grid: GridSpec,
+def _validate_sampling_rasters(
+    assets: dict[str, Path], grid: GridSpec
 ) -> None:
-    try:
-        asset = prepared.manifest["assets"]["rasters"][spec.hru_name]
-    except KeyError as exc:
-        raise MiniSamplingError(
-            f"Prepared dataset has no categorical raster: {spec.hru_name}"
-        ) from exc
-    if asset.get("role") != "categorical":
-        raise MiniSamplingError(f"Prepared raster {spec.hru_name} is not categorical")
-    try:
-        dtype = np.dtype(asset["dtype"])
-    except (KeyError, TypeError) as exc:
-        raise MiniSamplingError("Prepared HRU raster dtype is invalid") from exc
-    if not np.issubdtype(dtype, np.integer):
-        raise MiniSamplingError("HRU raster must have an integer data type")
-
-    try:
-        value = terrain.manifest["grid"]
-        terrain_grid = GridSpec(
-            CRS.from_wkt(value["crs_wkt"]),
-            Affine(*value["transform"]),
-            int(value["width"]),
-            int(value["height"]),
-        )
-    except (KeyError, TypeError, ValueError) as exc:
-        raise MiniSamplingError("Terrain canonical grid is invalid") from exc
-    if terrain_grid != grid:
-        raise MiniSamplingError("Prepared and terrain canonical grids do not match")
-
-
-def _aggregation_manifest(root: Path) -> tuple[dict[str, Any], Path, Path]:
-    try:
-        manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
-        if (
-            manifest.get("contract") != AGGREGATION_CONTRACT
-            or manifest.get("version") != AGGREGATION_CONTRACT_VERSION
-        ):
+    expected_dtypes = {
+        "dem": None,
+        "hru": None,
+        "mini_ownership": "int32",
+        "drainage": "uint8",
+        "hand": "float32",
+        "ltnd": "float32",
+    }
+    for name, path in assets.items():
+        try:
+            with rasterio.open(path) as source:
+                _require_grid(source, grid, name)
+                if name == "hru" and not np.issubdtype(
+                    np.dtype(source.dtypes[0]), np.integer
+                ):
+                    raise MiniSamplingError("HRU raster must have an integer data type")
+                expected = expected_dtypes[name]
+                if expected is not None and source.dtypes[0] != expected:
+                    raise MiniSamplingError(
+                        f"{name.upper()} raster has dtype {source.dtypes[0]}, "
+                        f"expected {expected}"
+                    )
+        except MiniSamplingError:
+            raise
+        except RasterGridError as exc:
             raise MiniSamplingError(
-                "Unsupported aggregation dataset contract or version"
-            )
-        assets = manifest["assets"]
-        paths = []
-        for name in ("catchments", "segments"):
-            relative = Path(assets[name]["path"])
-            candidate = (root / relative).resolve()
-            candidate.relative_to(root.resolve())
-            if not candidate.is_file() or assets[name].get("driver") != "FlatGeobuf":
-                raise MiniSamplingError(f"Invalid aggregation asset: {name}")
-            paths.append(candidate)
-    except MiniSamplingError:
-        raise
-    except Exception as exc:
-        raise MiniSamplingError("Cannot read aggregation dataset") from exc
-    return manifest, paths[0], paths[1]
+                f"Explicit {name} raster does not match the canonical DEM grid"
+            ) from exc
+        except (OSError, rasterio.errors.RasterioError, TypeError, ValueError) as exc:
+            raise MiniSamplingError(
+                f"Cannot inspect explicit {name} raster: {path}"
+            ) from exc
 
 
 def _read_index(path: Path, expected_columns: list[str], name: str) -> pd.DataFrame:
@@ -380,32 +365,39 @@ def _read_index(path: Path, expected_columns: list[str], name: str) -> pd.DataFr
         )
     ):
         raise MiniSamplingError(f"{name} mini index values are invalid")
+    if set(expected_columns) == {
+        "mini_label",
+        "mini_id",
+        "minx",
+        "miny",
+        "maxx",
+        "maxy",
+    }:
+        try:
+            bounds = table[["minx", "miny", "maxx", "maxy"]].to_numpy(dtype=float)
+        except (TypeError, ValueError) as exc:
+            raise MiniSamplingError(f"{name} mini index bounds are invalid") from exc
+        if (
+            not np.isfinite(bounds).all()
+            or np.any(bounds[:, 0] > bounds[:, 2])
+            or np.any(bounds[:, 1] > bounds[:, 3])
+        ):
+            raise MiniSamplingError(f"{name} mini index bounds are invalid")
     return table
 
 
 def _plan_sampling(
     spec: MiniSamplingSpec,
-    prepared: PreparedDataset,
-    terrain: TerrainDataset,
     grid: GridSpec,
-) -> tuple[dict[Any, _MiniMetadata], tuple[RasterUnit, ...], dict[str, Any]]:
-    aggregation_manifest, catchments_path, segments_path = _aggregation_manifest(
-        Path(spec.minis)
-    )
-    prepared_index_path = prepared.asset_path(
-        prepared.manifest["assets"]["mini_index"]["path"]
-    )
+) -> tuple[dict[Any, _MiniMetadata], tuple[RasterUnit, ...]]:
+    catchments_path = Path(spec.mini_catchments)
+    segments_path = Path(spec.mini_segments)
+    prepared_index_path = Path(spec.mini_index)
     prepared_index = _read_index(
         prepared_index_path,
         ["mini_label", "mini_id", "minx", "miny", "maxx", "maxy"],
         "prepared",
     )
-    terrain_index = _read_index(
-        terrain.path("mini_index"), ["mini_label", "mini_id"], "terrain"
-    )
-    if not prepared_index[["mini_label", "mini_id"]].equals(terrain_index):
-        raise MiniSamplingError("Prepared and terrain mini indexes do not match")
-
     catchments = _stream_vector_metadata(
         catchments_path, "catchments", grid.crs, spec.batch_size
     )
@@ -449,19 +441,17 @@ def _plan_sampling(
             )
         )
 
-    units = plan_raster_units(
-        grid,
-        unit_bounds,
-        bytes_per_cell=SAMPLING_BYTES_PER_CELL,
-        fixed_bytes=TASK_FIXED_BYTES,
-        block_size=BLOCK_SIZE,
-    )
-    manifests = {
-        "aggregation": aggregation_manifest,
-        "prepared": prepared.manifest,
-        "terrain": terrain.manifest,
-    }
-    return metadata, units, manifests
+    try:
+        units = plan_raster_units(
+            grid,
+            unit_bounds,
+            bytes_per_cell=SAMPLING_BYTES_PER_CELL,
+            fixed_bytes=TASK_FIXED_BYTES,
+            block_size=BLOCK_SIZE,
+        )
+    except RasterGridError as exc:
+        raise MiniSamplingError("Mini index bounds do not overlap the DEM grid") from exc
+    return metadata, units
 
 
 def _stream_vector_metadata(
@@ -567,8 +557,14 @@ def _equal_values(left: Any, right: Any) -> bool:
 def _sampling_worker(
     payload: _SamplingPayload, context: WorkerContext
 ) -> WorkerOutput[_PacketResult]:
-    prepared = PreparedRasterReader(payload.prepared, context)
-    terrain = AlignedRasterReader(payload.grid, payload.terrain_assets, context)
+    rasters = context.resources.get(
+        "sampling-aligned-inputs:"
+        + ":".join(
+            f"{name}={Path(path).resolve()}"
+            for name, path in sorted(payload.raster_assets.items())
+        ),
+        lambda: AlignedRasterReader(payload.grid, payload.raster_assets, context),
+    )
     minis = {value.label: value for value in payload.minis}
     accumulators = {
         label: {
@@ -588,12 +584,12 @@ def _sampling_worker(
     for window in payload.packet.blocks:
         started = time.perf_counter()
         arrays = {
-            "dem": prepared.read("dem", window, masked=True),
-            "hru": prepared.read(payload.hru_name, window, masked=True),
-            "ownership": terrain.read("mini_ownership", window, masked=True),
-            "drainage": terrain.read("drainage", window, masked=True),
-            "hand": terrain.read("hand", window, masked=True),
-            "ltnd": terrain.read("ltnd", window, masked=True),
+            "dem": rasters.read("dem", window, masked=True),
+            "hru": rasters.read("hru", window, masked=True),
+            "ownership": rasters.read("mini_ownership", window, masked=True),
+            "drainage": rasters.read("drainage", window, masked=True),
+            "hand": rasters.read("hand", window, masked=True),
+            "ltnd": rasters.read("ltnd", window, masked=True),
         }
         read_seconds += time.perf_counter() - started
         blocks_read += len(arrays)

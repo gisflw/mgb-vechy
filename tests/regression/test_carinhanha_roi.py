@@ -33,12 +33,8 @@ def test_carinhanha_roi_matches_reference_properties(tmp_path):
             output_dir=tmp_path / "roi",
         )
     )
-    dataset_segments = read_vector_table(
-        report.output_dir / "vectors" / "roi_segments.fgb"
-    )
-    dataset_catchments = read_vector_table(
-        report.output_dir / "vectors" / "roi_catchments.fgb"
-    )
+    dataset_segments = read_vector_table(report.segments)
+    dataset_catchments = read_vector_table(report.catchments)
     segments = dataset_segments.to_pandas()
     catchments = dataset_catchments.to_pandas()
 

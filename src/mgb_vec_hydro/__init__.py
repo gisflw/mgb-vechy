@@ -5,17 +5,15 @@ from mgb_vec_hydro.preparation import (
     NamedRaster,
     PreparationReport,
     PreparationSpec,
-    PreparedDataset,
     prepare_dataset,
 )
-from mgb_vec_hydro.roi import RoiDataset, RoiReport, RoiSpec, define_roi_dataset
+from mgb_vec_hydro.roi import RoiReport, RoiSpec, define_roi_dataset
 from mgb_vec_hydro.sampling import (
     MiniSamplingReport,
     MiniSamplingSpec,
     sample_minibasins,
 )
 from mgb_vec_hydro.terrain import (
-    TerrainDataset,
     TerrainReport,
     TerrainSpec,
     compute_flow_directions,
@@ -32,11 +30,8 @@ __all__ = [
     "NamedRaster",
     "PreparationReport",
     "PreparationSpec",
-    "PreparedDataset",
-    "RoiDataset",
     "RoiReport",
     "RoiSpec",
-    "TerrainDataset",
     "TerrainReport",
     "TerrainSpec",
     "VectorTable",

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import shutil
 import time
 from collections import defaultdict
@@ -30,6 +29,7 @@ from mgb_vec_hydro.exceptions import (
 from mgb_vec_hydro.execution.checkpoints import (
     CheckpointStore,
     execution_fingerprint,
+    file_identity,
 )
 from mgb_vec_hydro.execution.executor import ExecutionConfig, LocalExecutor, WorkItem
 from mgb_vec_hydro.execution.publication import AtomicOutputDirectory
@@ -43,8 +43,6 @@ from mgb_vec_hydro.execution.vector import (
 from mgb_vec_hydro.crs_utils import parse_crs
 
 DEFAULT_STRAHLER_ORDER_COL = "strahler_order"
-ROI_CONTRACT = "mgb-roi-dataset"
-ROI_CONTRACT_VERSION = 2
 ROI_COLUMNS = [
     "id",
     "id_down",
@@ -83,79 +81,11 @@ class RoiSpec:
 @dataclass(frozen=True)
 class RoiReport:
     output_dir: Path
-    manifest: Path
+    catchments: Path
+    segments: Path
     catchment_count: int
     segment_count: int
     timings: dict[str, float]
-
-
-class RoiDataset:
-    """Lightweight reader and validator for the versioned ROI directory."""
-
-    def __init__(self, root: Path, manifest: dict[str, Any]):
-        self.root = root
-        self.manifest = manifest
-
-    @classmethod
-    def open(cls, root: str | Path) -> RoiDataset:
-        root = Path(root)
-        manifest_path = root / "manifest.json"
-        try:
-            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as exc:
-            raise PreparedDataError(
-                f"Cannot read ROI manifest: {manifest_path}"
-            ) from exc
-        return cls(root, manifest)
-
-    def validate(self) -> None:
-        value = self.manifest
-        if (
-            value.get("contract") != ROI_CONTRACT
-            or value.get("version") != ROI_CONTRACT_VERSION
-        ):
-            raise PreparedDataError("Unsupported ROI dataset contract or version")
-        assets = value.get("assets")
-        if not isinstance(assets, dict) or set(assets) != {"catchments", "segments"}:
-            raise PreparedDataError("ROI manifest must define catchments and segments")
-        try:
-            expected_crs = CRS.from_wkt(value["crs_wkt"])
-        except (KeyError, TypeError, ValueError) as exc:
-            raise PreparedDataError("ROI manifest CRS is invalid") from exc
-        for name in ("catchments", "segments"):
-            asset = assets[name]
-            if not isinstance(asset, dict) or asset.get("driver") != "FlatGeobuf":
-                raise PreparedDataError(f"ROI {name} asset must be FlatGeobuf")
-            relative = asset.get("path")
-            if not isinstance(relative, str):
-                raise PreparedDataError(f"ROI {name} asset path is invalid")
-            path = (self.root / relative).resolve()
-            try:
-                path.relative_to(self.root.resolve())
-            except ValueError as exc:
-                raise PreparedDataError(
-                    f"ROI asset escapes dataset: {relative}"
-                ) from exc
-            if not path.is_file():
-                raise PreparedDataError(f"ROI asset is missing: {relative}")
-            info = pyogrio.read_info(path)
-            if list(info["fields"]) != ROI_COLUMNS[:-1] or info[
-                "features"
-            ] != asset.get("feature_count"):
-                raise PreparedDataError(f"ROI {name} asset does not match its manifest")
-            if (
-                info.get("crs") is None
-                or CRS.from_user_input(info["crs"]) != expected_crs
-            ):
-                raise PreparedDataError(f"ROI {name} asset has an incompatible CRS")
-
-    def path(self, name: str, *, validate: bool = True) -> Path:
-        if validate:
-            self.validate()
-        try:
-            return self.root / self.manifest["assets"][name]["path"]
-        except KeyError as exc:
-            raise PreparedDataError(f"Unknown ROI asset: {name}") from exc
 
 
 @dataclass(frozen=True)
@@ -272,10 +202,8 @@ def define_roi_dataset(spec: RoiSpec) -> RoiReport:
         metrics_seconds = time.perf_counter() - phase_started
 
         phase_started = time.perf_counter()
-        vectors = staging / "vectors"
-        vectors.mkdir()
-        catchments_path = vectors / "roi_catchments.fgb"
-        segments_path = vectors / "roi_segments.fgb"
+        catchments_path = staging / "roi_catchments.fgb"
+        segments_path = staging / "roi_segments.fgb"
         _write_cached_outputs(
             packet_dir,
             kinds,
@@ -290,30 +218,21 @@ def define_roi_dataset(spec: RoiSpec) -> RoiReport:
             segments_path=segments_path,
         )
         shutil.rmtree(packet_dir)
-        manifest = {
-            "contract": ROI_CONTRACT,
-            "version": ROI_CONTRACT_VERSION,
-            "crs_wkt": target_crs.to_wkt(version="WKT2_2019", pretty=False),
-            "assets": {
-                "catchments": _asset(catchments_path, staging, len(selected_ids)),
-                "segments": _asset(segments_path, staging, len(selected_ids)),
-            },
-        }
-        manifest_path = staging / "manifest.json"
-        manifest_path.write_text(
-            json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        _validate_roi_outputs(
+            catchments_path,
+            segments_path,
+            target_crs=target_crs,
+            feature_count=len(selected_ids),
         )
-        RoiDataset(staging, manifest).validate()
-        publisher.publish(
-            ("manifest.json", "vectors/roi_catchments.fgb", "vectors/roi_segments.fgb")
-        )
+        publisher.publish((catchments_path.name, segments_path.name))
     output_publication_seconds = time.perf_counter() - phase_started
 
     if checkpoint is not None:
         checkpoint.cleanup()
     return RoiReport(
         output,
-        output / "manifest.json",
+        output / "roi_catchments.fgb",
+        output / "roi_segments.fgb",
         len(selected_ids),
         len(selected_ids),
         {
@@ -331,24 +250,15 @@ def _roi_checkpoint(
 ) -> CheckpointStore[Any] | None:
     if spec.checkpoint_dir is None:
         return None
-    sources = []
-    for path in (spec.catchments, spec.segments):
-        stat = Path(path).stat()
-        sources.append(
-            {
-                "path": str(Path(path).resolve()),
-                "size": stat.st_size,
-                "mtime_ns": stat.st_mtime_ns,
-            }
-        )
     fingerprint = execution_fingerprint(
         algorithm="define-roi",
         version="2",
-        prepared_manifest={
-            "crs_wkt": target_crs.to_wkt(version="WKT2_2019", pretty=False)
+        input_identity={
+            "catchments": file_identity(spec.catchments),
+            "segments": file_identity(spec.segments),
+            "target_crs": target_crs.to_wkt(version="WKT2_2019", pretty=False),
         },
         parameters={
-            "sources": sources,
             "outlets": list(spec.outlet_ids),
             "columns": [spec.id_col, spec.id_down_col, spec.strahler_order_col],
             "layers": [spec.catchments_layer, spec.segments_layer],
@@ -516,6 +426,17 @@ def _validate_spec(spec: RoiSpec) -> None:
     if spec.workers > 4:
         raise InvalidInputSchemaError("workers cannot exceed four")
     parse_crs(spec.crs)
+    if spec.checkpoint_dir is not None:
+        output = Path(spec.output_dir).resolve()
+        checkpoint = Path(spec.checkpoint_dir).resolve()
+        try:
+            checkpoint.relative_to(output)
+        except ValueError:
+            pass
+        else:
+            raise InvalidInputSchemaError(
+                "Checkpoint directory cannot be inside the output directory"
+            )
 
 
 def _provider(
@@ -897,10 +818,27 @@ def _rows_to_vector(
     return VectorTable(pa.table(arrays), crs, "geometry", geometry_type)
 
 
-def _asset(path: Path, root: Path, count: int) -> dict[str, Any]:
-    return {
-        "path": path.relative_to(root).as_posix(),
-        "driver": "FlatGeobuf",
-        "feature_count": count,
-        "fields": ROI_COLUMNS[:-1],
-    }
+def _validate_roi_outputs(
+    catchments: Path,
+    segments: Path,
+    *,
+    target_crs: CRS,
+    feature_count: int,
+) -> None:
+    """Validate explicit normalized ROI files before publication."""
+
+    for name, path in (("catchments", catchments), ("segments", segments)):
+        if not path.is_file():
+            raise PreparedDataError(f"ROI output is missing: {path}")
+        try:
+            info = pyogrio.read_info(path)
+        except Exception as exc:
+            raise PreparedDataError(f"Cannot inspect ROI output: {path}") from exc
+        if info.get("driver") != "FlatGeobuf":
+            raise PreparedDataError(f"ROI {name} output is not FlatGeobuf")
+        if list(info.get("fields", ())) != ROI_COLUMNS[:-1]:
+            raise PreparedDataError(f"ROI {name} output schema is invalid")
+        if info.get("features") != feature_count:
+            raise PreparedDataError(f"ROI {name} output feature count is invalid")
+        if info.get("crs") is None or CRS.from_user_input(info["crs"]) != target_crs:
+            raise PreparedDataError(f"ROI {name} output CRS is invalid")

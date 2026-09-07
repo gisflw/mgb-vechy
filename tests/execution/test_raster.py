@@ -3,6 +3,7 @@ import multiprocessing as mp
 import numpy as np
 import pytest
 import rasterio
+from rasterio.transform import from_origin
 from rasterio.windows import Window
 
 from mgb_vec_hydro.exceptions import (
@@ -14,21 +15,20 @@ from mgb_vec_hydro.execution.executor import WorkerContext
 from mgb_vec_hydro.execution.publication import AtomicOutputDirectory
 from mgb_vec_hydro.execution.raster import (
     AlignedRasterReader,
-    PreparedRasterReader,
     RasterAssembler,
     RasterPatch,
     RasterProductSpec,
     packet_raster_units,
     packet_raster_units_by_block,
     plan_raster_units,
-    prepared_grid,
+    grid_from_dem,
 )
 
 
 def test_raster_units_use_covering_windows_spatial_order_and_bounded_packets(
     prepared_execution_dataset,
 ):
-    grid = prepared_grid(prepared_execution_dataset)
+    grid = grid_from_dem(prepared_execution_dataset / "dem.tif")
     units = plan_raster_units(
         grid,
         [
@@ -51,12 +51,16 @@ def test_raster_units_use_covering_windows_spatial_order_and_bounded_packets(
         packet_raster_units(units, memory_limit_bytes=7)
 
 
-def test_prepared_raster_reader_reuses_handle_and_reads_exact_window(
+def test_aligned_raster_reader_reuses_handle_and_reads_exact_window(
     prepared_execution_dataset,
 ):
     context = WorkerContext(mp.get_context("spawn").BoundedSemaphore(1), 2)
     try:
-        reader = PreparedRasterReader(prepared_execution_dataset, context)
+        reader = AlignedRasterReader(
+            grid_from_dem(prepared_execution_dataset / "dem.tif"),
+            {"dem": prepared_execution_dataset / "dem.tif"},
+            context,
+        )
         assert reader.source("dem") is reader.source("dem")
         values = reader.read("dem", Window(1, 0, 1, 2))
         np.testing.assert_array_equal(values, [[1], [4]])
@@ -66,10 +70,45 @@ def test_prepared_raster_reader_reuses_handle_and_reads_exact_window(
         context.close()
 
 
+def test_direct_raster_paths_reject_missing_and_mismatched_grid_inputs(
+    tmp_path, prepared_execution_dataset
+):
+    dem_path = prepared_execution_dataset / "dem.tif"
+    grid = grid_from_dem(dem_path)
+    mismatched = tmp_path / "mismatched.tif"
+    with rasterio.open(
+        mismatched,
+        "w",
+        driver="COG",
+        width=3,
+        height=2,
+        count=1,
+        dtype="float32",
+        crs="EPSG:4326",
+        transform=from_origin(0, 20, 10, 10),
+    ) as target:
+        target.write(np.ones((2, 3), dtype="float32"), 1)
+        target.write_mask(np.full((2, 3), 255, dtype="uint8"))
+
+    context = WorkerContext(mp.get_context("spawn").BoundedSemaphore(1), 2)
+    try:
+        reader = AlignedRasterReader(
+            grid,
+            {"missing": tmp_path / "missing.tif", "mismatched": mismatched},
+            context,
+        )
+        with pytest.raises(RasterGridError, match="missing"):
+            reader.source("missing")
+        with pytest.raises(RasterGridError, match="canonical grid"):
+            reader.source("mismatched")
+    finally:
+        context.close()
+
+
 def test_raster_assembler_rejects_overlap_and_publishes_cog_atomically(
     tmp_path, prepared_execution_dataset
 ):
-    grid = prepared_grid(prepared_execution_dataset)
+    grid = grid_from_dem(prepared_execution_dataset / "dem.tif")
     publication = AtomicOutputDirectory(tmp_path / "products")
     with publication as staging:
         with RasterAssembler(
@@ -120,7 +159,7 @@ def test_raster_assembler_rejects_overlap_and_publishes_cog_atomically(
 def test_raster_assembler_exclusive_block_write_avoids_reads_and_rejects_reuse(
     tmp_path, prepared_execution_dataset
 ):
-    grid = prepared_grid(prepared_execution_dataset)
+    grid = grid_from_dem(prepared_execution_dataset / "dem.tif")
     with RasterAssembler(
         tmp_path, grid, [RasterProductSpec("labels", "int32")], block_size=128
     ) as assembler:
@@ -150,7 +189,7 @@ def test_raster_assembler_exclusive_block_write_avoids_reads_and_rejects_reuse(
 
 
 def test_block_packets_charge_overlapping_blocks_once(prepared_execution_dataset):
-    grid = prepared_grid(prepared_execution_dataset)
+    grid = grid_from_dem(prepared_execution_dataset / "dem.tif")
     units = plan_raster_units(
         grid,
         [

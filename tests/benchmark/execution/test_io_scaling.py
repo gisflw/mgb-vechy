@@ -4,7 +4,6 @@ Run with ``RUN_EXECUTION_BENCHMARKS=1 pytest
 tests/benchmark/execution/test_io_scaling.py``.
 """
 
-import json
 import multiprocessing
 import os
 import time
@@ -14,14 +13,13 @@ import numpy as np
 import pandas as pd
 import pytest
 import rasterio
-from pyproj import CRS
 from rasterio.shutil import copy as copy_raster
 from rasterio.transform import from_origin
 from rasterio.windows import Window
 from shapely.geometry import LineString
 
 from mgb_vec_hydro.execution.executor import WorkerContext
-from mgb_vec_hydro.execution.raster import PreparedRasterReader
+from mgb_vec_hydro.execution.raster import AlignedRasterReader, grid_from_dem
 from mgb_vec_hydro.execution.vector import (
     VectorTable,
     inspect_vector_provider,
@@ -37,7 +35,7 @@ pytestmark = pytest.mark.skipif(
 
 def _write_prepared(root, feature_count, raster_size):
     (root / "vectors").mkdir(parents=True)
-    (root / "rasters").mkdir()
+    root.mkdir(parents=True, exist_ok=True)
     ids = np.arange(feature_count, dtype="int64")
     vectors = VectorTable.from_pydict(
         {"id": ids, "group": ids % 8},
@@ -50,7 +48,7 @@ def _write_prepared(root, feature_count, raster_size):
             vectors, root / "vectors" / f"{name}.fgb", driver="FlatGeobuf"
         )
 
-    working = root / "rasters" / "dem.working.tif"
+    working = root / "dem.working.tif"
     transform = from_origin(0, raster_size, 1, 1)
     with rasterio.open(
         working,
@@ -71,10 +69,10 @@ def _write_prepared(root, feature_count, raster_size):
             shape = (int(window.height), int(window.width))
             target.write(block[: shape[0], : shape[1]], 1, window=window)
             target.write_mask(np.full(shape, 255, dtype="uint8"), window=window)
-    copy_raster(working, root / "rasters" / "dem.tif", driver="COG", BLOCKSIZE=512)
+    copy_raster(working, root / "dem.tif", driver="COG", BLOCKSIZE=512)
     working.unlink()
     for name, dtype in (("mini_ownership", "int32"), ("drainage", "uint8")):
-        working = root / "rasters" / f"{name}.working.tif"
+        working = root / f"{name}.working.tif"
         with rasterio.open(
             working,
             "w",
@@ -92,7 +90,7 @@ def _write_prepared(root, feature_count, raster_size):
             target.write(np.zeros((raster_size, raster_size), dtype=dtype), 1)
             target.write_mask(np.full((raster_size, raster_size), 255, dtype="uint8"))
         copy_raster(
-            working, root / "rasters" / f"{name}.tif", driver="COG", BLOCKSIZE=512
+            working, root / f"{name}.tif", driver="COG", BLOCKSIZE=512
         )
         working.unlink()
     pd.DataFrame(
@@ -105,33 +103,6 @@ def _write_prepared(root, feature_count, raster_size):
             "maxy": [1.0],
         }
     ).to_parquet(root / "mini_index.parquet", index=False)
-
-    raster_asset = {
-        "path": "rasters/dem.tif",
-        "role": "continuous",
-        "driver": "COG",
-    }
-    manifest = {
-        "contract": "mgb-prepared-dataset",
-        "version": 4,
-        "grid": {
-            "crs_wkt": CRS.from_epsg(3857).to_wkt(),
-            "transform": list(transform)[:6],
-            "extent": [0, 0, raster_size, raster_size],
-            "resolution": 1,
-            "width": raster_size,
-            "height": raster_size,
-            "nodata": "internal-mask",
-        },
-        "sources": {"rasters": {}},
-        "assets": {
-            "rasters": {"dem": raster_asset},
-            "mini_ownership": {"path": "rasters/mini_ownership.tif", "driver": "COG"},
-            "drainage": {"path": "rasters/drainage.tif", "driver": "COG"},
-            "mini_index": {"path": "mini_index.parquet"},
-        },
-    }
-    (root / "manifest.json").write_text(json.dumps(manifest))
 
 
 def _measure_vector(root, result_queue):
@@ -150,14 +121,17 @@ def _measure_raster(root, result_queue):
     started = time.perf_counter()
     cells = 0
     try:
-        reader = PreparedRasterReader(root, worker_context)
-        for row in range(0, reader.grid.height, 256):
-            for col in range(0, reader.grid.width, 256):
+        grid = grid_from_dem(root / "dem.tif")
+        reader = AlignedRasterReader(
+            grid, {"dem": root / "dem.tif"}, worker_context
+        )
+        for row in range(0, grid.height, 256):
+            for col in range(0, grid.width, 256):
                 window = Window(
                     col,
                     row,
-                    min(256, reader.grid.width - col),
-                    min(256, reader.grid.height - row),
+                    min(256, grid.width - col),
+                    min(256, grid.height - row),
                 )
                 cells += reader.read("dem", window).size
     finally:

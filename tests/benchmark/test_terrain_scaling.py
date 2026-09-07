@@ -1,7 +1,8 @@
 """Opt-in timing checks for bounded terrain processing.
 
 Run synthetic scaling checks with ``RUN_TERRAIN_BENCHMARKS=1 pytest
-tests/benchmark``. Set ``BHAE_PREPARED`` and ``BHAE_MINIS`` to exercise the
+tests/benchmark``. Set ``BHAE_DEM``, ``BHAE_MINI_OWNERSHIP``, ``BHAE_DRAINAGE``,
+and ``BHAE_MINI_INDEX`` to exercise the
 complete Stage 4 BHAE pipeline without making its one-minute target a portable
 release gate.
 """
@@ -117,15 +118,23 @@ def test_fixed_size_mini_count_has_bounded_memory_and_linear_work(record_propert
 
 
 def test_full_bhae_performance_target(tmp_path, record_property):
-    prepared = os.environ.get("BHAE_PREPARED")
-    minis = os.environ.get("BHAE_MINIS")
-    if not prepared or not minis:
-        pytest.skip("BHAE_PREPARED and BHAE_MINIS are not configured")
+    names = (
+        "BHAE_DEM",
+        "BHAE_MINI_OWNERSHIP",
+        "BHAE_DRAINAGE",
+        "BHAE_MINI_INDEX",
+    )
+    values = {name: os.environ.get(name) for name in names}
+    if not all(values.values()):
+        pytest.skip("explicit BHAE raster and index inputs are not configured")
 
     report = create_terrain_dataset(
         TerrainSpec(
-            prepared=Path(prepared),
-            minis=Path(minis),
+            dem=Path(values["BHAE_DEM"]),
+            mini_ownership=Path(values["BHAE_MINI_OWNERSHIP"]),
+            drainage=Path(values["BHAE_DRAINAGE"]),
+            mini_index=Path(values["BHAE_MINI_INDEX"]),
+            d8=Path(os.environ["BHAE_D8"]) if os.environ.get("BHAE_D8") else None,
             output_dir=tmp_path / "terrain",
         )
     )
