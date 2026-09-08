@@ -62,14 +62,13 @@ def _write_multiblock_raster(path, values, dtype):
 def _write_multiblock_minis(tmp_path, size):
     attributes = {
         "id": [1],
-        "id_down": [None],
+        "id_down": [-1],
         "sub": [1],
-        "strahler_order": [1],
+        "p_order": [1],
         "unit_length": [1.0],
         "upstream_length": [1.0],
         "unit_area": [1.0],
         "upstream_area": [1.0],
-        "water_course": [1],
     }
     catchments = VectorTable.from_pydict(
         attributes,

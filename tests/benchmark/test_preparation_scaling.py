@@ -118,14 +118,13 @@ def _write_preparation_inputs(root: Path, size: int):
         target.write(np.broadcast_to(rows[:, None], (size, size)), 1)
     attributes = {
         "id": [1],
-        "id_down": [None],
+        "id_down": [-1],
         "sub": [1],
-        "strahler_order": [1],
+        "p_order": [1],
         "unit_length": [1.0],
         "upstream_length": [1.0],
         "unit_area": [1.0],
         "upstream_area": [1.0],
-        "water_course": [1],
     }
     catchments = root / "mini_catchments.fgb"
     segments = root / "mini_segments.fgb"

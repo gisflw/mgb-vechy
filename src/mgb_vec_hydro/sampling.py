@@ -15,7 +15,7 @@ import shapely
 from pyarrow import ipc
 from pyproj import CRS, Transformer
 
-from mgb_vec_hydro.aggregation import INPUT_COLUMNS
+from mgb_vec_hydro.aggregation import AGGREGATION_COLUMNS
 from mgb_vec_hydro.exceptions import MiniSamplingError, RasterGridError
 from mgb_vec_hydro.execution.checkpoints import (
     CheckpointStore,
@@ -35,10 +35,10 @@ from mgb_vec_hydro.execution.raster import (
     AlignedRasterReader,
     RasterBlockPacket,
     RasterUnit,
+    _require_grid,
+    grid_from_dem,
     packet_raster_units_by_block,
     plan_raster_units,
-    grid_from_dem,
-    _require_grid,
 )
 from mgb_vec_hydro.execution.vector import (
     geometry_column_name,
@@ -414,7 +414,7 @@ def _plan_sampling(
         mini_id = row.mini_id
         catchment = catchments[mini_id]
         segment = segments[mini_id]
-        for column in INPUT_COLUMNS[:-1]:
+        for column in AGGREGATION_COLUMNS[:-1]:
             if column == "unit_length":
                 continue
             if not _equal_values(
@@ -459,14 +459,14 @@ def _stream_vector_metadata(
         provider = inspect_vector_provider(path)
         if provider.crs != expected_crs:
             raise MiniSamplingError(f"{name} CRS does not match the canonical grid")
-        if tuple(provider.fields) != tuple(INPUT_COLUMNS[:-1]):
+        if tuple(provider.fields) != tuple(AGGREGATION_COLUMNS[:-1]):
             raise MiniSamplingError(f"{name} must have the exact aggregation schema")
         allowed = {3, 6} if name == "catchments" else {1, 5}
         result: dict[Any, dict[str, Any]] = {}
         transformer = Transformer.from_crs(expected_crs, "EPSG:4326", always_xy=True)
         for batch in iter_provider_batches(
             provider,
-            columns=INPUT_COLUMNS[:-1],
+            columns=AGGREGATION_COLUMNS[:-1],
             batch_size=batch_size,
             read_geometry=True,
         ):
@@ -523,7 +523,7 @@ def _stream_vector_metadata(
 def _validate_metric_columns(row: dict[str, Any], name: str, mini_id: Any) -> None:
     for column in (
         "sub",
-        "strahler_order",
+        "p_order",
         "unit_length",
         "upstream_length",
         "unit_area",
@@ -660,7 +660,7 @@ def _sampling_worker(
         length_km = value.unit_length
         row = {
             column: value.attributes[column]
-            for column in INPUT_COLUMNS
+            for column in AGGREGATION_COLUMNS
             if column != "geometry"
         }
         row.update(
@@ -722,7 +722,7 @@ def _assemble_csv(packet_root: Path, output: Path, classes: tuple[int, ...]) -> 
     first = True
     percentage_columns = [f"hru_{value}_pct" for value in classes]
     output_columns = (
-        [column for column in INPUT_COLUMNS if column != "geometry"]
+        [column for column in AGGREGATION_COLUMNS if column != "geometry"]
         + [
             "longitude",
             "latitude",

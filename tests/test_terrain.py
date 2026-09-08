@@ -124,15 +124,14 @@ def _terrain_inputs(tmp_path, *, with_d8=False):
             target.write(d8, 1)
             target.write_mask(np.full((4, 8), 255, dtype="uint8"))
     values = {
-        "id": ["a", "b"],
-        "id_down": ["b", None],
+        "id": [1, 2],
+        "id_down": [2, -1],
         "sub": [1, 1],
-        "strahler_order": [1, 1],
+        "p_order": [1, 2],
         "unit_length": [1.0, 1.0],
         "upstream_length": [1.0, 2.0],
         "unit_area": [1.0, 1.0],
         "upstream_area": [1.0, 2.0],
-        "water_course": [1, 1],
     }
     catchments = VectorTable.from_pydict(
         values,
@@ -219,7 +218,7 @@ def test_terrain_outputs_custom_agree_profile_and_strict_domain(tmp_path):
         "maxx",
         "maxy",
     ]
-    assert index["mini_id"].tolist() == ["a", "b"]
+    assert index["mini_id"].tolist() == [1, 2]
     assert not checkpoint_dir.exists()
 
 

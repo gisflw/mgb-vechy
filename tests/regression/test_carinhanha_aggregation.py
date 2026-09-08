@@ -1,12 +1,11 @@
-from pathlib import Path
 import time
+from pathlib import Path
 
 import pandas as pd
 import pytest
 
-from mgb_vec_hydro.aggregation import INPUT_COLUMNS, aggregate_minibasins
-from mgb_vec_hydro.execution.vector import read_vector_table
-from mgb_vec_hydro.execution.vector import VectorTable
+from mgb_vec_hydro.aggregation import AGGREGATION_COLUMNS, aggregate_minibasins
+from mgb_vec_hydro.execution.vector import VectorTable, read_vector_table
 
 ROOT = Path(__file__).resolve().parents[2]
 CARINHANHA = ROOT / "tests" / "carinhanha"
@@ -34,8 +33,8 @@ def test_carinhanha_aggregation_regression_properties():
     assert len(result.segments) == 207
     assert len(result.catchments) == 207
     assert len(result.mapping) == len(roi_catchments)
-    assert list(result.segments.columns) == INPUT_COLUMNS
-    assert list(result.catchments.columns) == INPUT_COLUMNS
+    assert list(result.segments.columns) == AGGREGATION_COLUMNS
+    assert list(result.catchments.columns) == AGGREGATION_COLUMNS
     assert list(result.mapping.columns) == [
         "id",
         "mini_id",
@@ -53,18 +52,8 @@ def test_carinhanha_aggregation_regression_properties():
     assert result.mapping["id"].is_unique
     assert (result_segments["upstream_area"] < 30).sum() == 0
     assert (result_segments["unit_length"] < 6).sum() == 0
-    assert list(result_segments["id"].head(10)) == [
-        100864,
-        116794,
-        118204,
-        118705,
-        124656,
-        125562,
-        126455,
-        126873,
-        127420,
-        128532,
-    ]
+    assert list(result_segments["id"].head(10)) == list(range(1, 11))
+    assert set(result_segments["id_down"]).issubset(set(result_segments["id"]) | {-1})
     # The pre-refactor baseline on this fixture was approximately 16.8 seconds.
     assert elapsed < 8.4
 

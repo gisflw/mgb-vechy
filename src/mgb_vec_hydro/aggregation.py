@@ -1,19 +1,20 @@
 from __future__ import annotations
 
+import heapq
+import shutil
+import time
 from collections import defaultdict
 from collections.abc import Hashable
 from dataclasses import dataclass, field
 from pathlib import Path
-import shutil
-import time
 from typing import Any
 
 import numpy as np
 import pandas as pd
 import pyarrow as pa
 import pyogrio
-from pyproj import CRS, Transformer
 import shapely
+from pyproj import CRS, Transformer
 
 from mgb_vec_hydro.exceptions import (
     DuplicateSegmentIdError,
@@ -28,12 +29,15 @@ from mgb_vec_hydro.execution.checkpoints import (
 from mgb_vec_hydro.execution.executor import ExecutionConfig, LocalExecutor, WorkItem
 from mgb_vec_hydro.execution.publication import AtomicOutputDirectory
 from mgb_vec_hydro.execution.vector import (
+    VectorProvider,
     VectorTable,
     VectorTableCheckpointCodec,
-    read_vector_table,
+    conservative_geometry_packet_rows,
+    geometry_column_name,
+    inspect_vector_provider,
+    iter_provider_batches,
     write_vector_table,
 )
-from mgb_vec_hydro.roi import ROI_COLUMNS
 from mgb_vec_hydro.topology import _is_sink_value
 
 INPUT_COLUMNS = [
@@ -46,6 +50,18 @@ INPUT_COLUMNS = [
     "unit_area",
     "upstream_area",
     "water_course",
+    "geometry",
+]
+
+AGGREGATION_COLUMNS = [
+    "id",
+    "id_down",
+    "sub",
+    "p_order",
+    "unit_length",
+    "upstream_length",
+    "unit_area",
+    "upstream_area",
     "geometry",
 ]
 
@@ -91,8 +107,18 @@ class AggregationReport:
 
 @dataclass(frozen=True)
 class _AggregationPacket:
-    vector: VectorTable
+    provider: VectorProvider
+    ids: tuple[Hashable, ...]
+    fids: tuple[int, ...]
     assignment: dict[Hashable, Hashable]
+    kind: str
+
+
+@dataclass(frozen=True)
+class _AggregationPlan:
+    attributes: pd.DataFrame
+    catchment_assignment: dict[Hashable, int]
+    reach_assignment: dict[Hashable, int]
 
 
 def aggregate_minibasins(
@@ -103,19 +129,6 @@ def aggregate_minibasins(
     lmin: float,
 ) -> AggregationResult:
     """Aggregate normalized ROI products using chain-first topology reduction."""
-    return _aggregate_minibasins(
-        roi_catchments, roi_segments, uparea_min=uparea_min, lmin=lmin, dissolve=True
-    )
-
-
-def _aggregate_minibasins(
-    roi_catchments: VectorTable,
-    roi_segments: VectorTable,
-    *,
-    uparea_min: float,
-    lmin: float,
-    dissolve: bool,
-) -> AggregationResult:
     _validate_input_schema(roi_catchments, "roi_catchments")
     _validate_input_schema(roi_segments, "roi_segments")
     if roi_catchments.crs != roi_segments.crs:
@@ -123,79 +136,49 @@ def _aggregate_minibasins(
     if uparea_min < 0 or lmin < 0:
         raise InvalidInputSchemaError("uparea-min and lmin must be non-negative")
 
+    catchments = _attributes(roi_catchments)
+    segments = _attributes(roi_segments)
+    plan = _plan_aggregation(catchments, segments, uparea_min=uparea_min, lmin=lmin)
+
+    # Geometry is deliberately decoded only after topology, ordering, and the
+    # dense ID remap are complete.
     catchment_geometry = roi_catchments.geometries()
     segment_geometry = roi_segments.geometries()
     _validate_geometries(catchment_geometry, "roi_catchments", {3, 6})
     _validate_geometries(segment_geometry, "roi_segments", {1, 5})
-    catchments = _attributes(roi_catchments)
-    segments = _attributes(roi_segments)
-    _validate_unique_ids(catchments, "roi_catchments")
-    _validate_unique_ids(segments, "roi_segments")
-    if set(catchments["id"]) != set(segments["id"]):
-        raise InvalidInputSchemaError("ROI catchment and segment IDs do not match")
-
-    state = _build_aggregation_state(segments, uparea_min, lmin)
-    source_assignment = state["catchment_assignment"]
-    reach_assignment = state["reach_assignment"]
-    groups = _groups_from_assignment(reach_assignment)
-
     catchment_ids = catchments["id"].tolist()
-    catchment_mini = [source_assignment[value] for value in catchment_ids]
     catchment_geometry_by_id = dict(zip(catchment_ids, catchment_geometry, strict=True))
     segment_geometry_by_id = dict(zip(segments["id"], segment_geometry, strict=True))
-    catchment_groups = _groups_from_assignment(source_assignment)
-
-    segment_attributes = _mini_attributes(
-        segments, groups, reach_assignment, state["downstream"]
-    )
-    catchment_metrics = _mini_metric_attributes(
-        catchments,
-        catchment_groups,
-        unit_column="unit_area",
-        upstream_column="upstream_area",
-    )
-    attrs = {
-        mini_id: {**segment_attributes[mini_id], **catchment_metrics[mini_id]}
-        for mini_id in groups
-    }
+    catchment_groups = _groups_from_assignment(plan.catchment_assignment)
+    segment_groups = _groups_from_assignment(plan.reach_assignment)
+    attrs = plan.attributes.set_index("id", drop=False).to_dict("index")
 
     segment_rows: list[dict[str, Any]] = []
     catchment_rows: list[dict[str, Any]] = []
-    for mini_id in sorted(groups, key=_stable_key):
-        members = groups[mini_id]
+    for mini_id in plan.attributes["id"]:
         segment_rows.append(
             {
                 **attrs[mini_id],
-                "geometry": (
-                    shapely.union_all(
-                        [segment_geometry_by_id[value] for value in members]
-                    )
-                    if dissolve
-                    else segment_geometry_by_id[next(iter(members))]
+                "geometry": shapely.union_all(
+                    [segment_geometry_by_id[value] for value in segment_groups[mini_id]]
                 ),
             }
         )
-        source_members = catchment_groups[mini_id]
         catchment_rows.append(
             {
                 **attrs[mini_id],
-                "geometry": (
-                    shapely.union_all(
-                        [catchment_geometry_by_id[value] for value in source_members]
-                    )
-                    if dissolve
-                    else catchment_geometry_by_id[next(iter(source_members))]
+                "geometry": shapely.union_all(
+                    [
+                        catchment_geometry_by_id[value]
+                        for value in catchment_groups[mini_id]
+                    ]
                 ),
             }
         )
 
-    id_type = roi_segments.table["id"].type
-    water_course_type = roi_segments.table["water_course"].type
-    aggregated_segments = _rows_to_vector(
-        segment_rows, id_type, roi_segments.crs, "Unknown", water_course_type
-    )
+    aggregated_segments = _rows_to_vector(segment_rows, roi_segments.crs, "Unknown")
     aggregated_catchments = _rows_to_vector(
-        catchment_rows, id_type, roi_catchments.crs, "Unknown", water_course_type
+        catchment_rows, roi_catchments.crs, "Unknown"
     )
     centroids = shapely.centroid(catchment_geometry)
     transformer = Transformer.from_crs(roi_catchments.crs, "EPSG:4326", always_xy=True)
@@ -203,7 +186,7 @@ def _aggregate_minibasins(
     mapping = pd.DataFrame(
         {
             "id": catchment_ids,
-            "mini_id": catchment_mini,
+            "mini_id": [plan.catchment_assignment[value] for value in catchment_ids],
             "sub": catchments["sub"].to_numpy(),
             "longitude": shapely.get_x(lonlat),
             "latitude": shapely.get_y(lonlat),
@@ -213,9 +196,87 @@ def _aggregate_minibasins(
         aggregated_catchments,
         aggregated_segments,
         mapping,
-        dict(source_assignment),
-        dict(reach_assignment),
+        dict(plan.catchment_assignment),
+        dict(plan.reach_assignment),
     )
+
+
+def _plan_aggregation(
+    catchments: pd.DataFrame,
+    segments: pd.DataFrame,
+    *,
+    uparea_min: float,
+    lmin: float,
+) -> _AggregationPlan:
+    _validate_unique_ids(catchments, "roi_catchments")
+    _validate_unique_ids(segments, "roi_segments")
+    if set(catchments["id"]) != set(segments["id"]):
+        raise InvalidInputSchemaError("ROI catchment and segment IDs do not match")
+
+    state = _build_aggregation_state(segments, uparea_min, lmin)
+    source_assignment = state["catchment_assignment"]
+    reach_assignment = state["reach_assignment"]
+    groups = _groups_from_assignment(reach_assignment)
+    catchment_groups = _groups_from_assignment(source_assignment)
+    segment_attributes = _mini_attributes(
+        segments, groups, reach_assignment, state["downstream"]
+    )
+    catchment_metrics = _mini_metric_attributes(
+        catchments,
+        catchment_groups,
+        unit_column="unit_area",
+        upstream_column="upstream_area",
+    )
+    attributes = {
+        mini_id: {**segment_attributes[mini_id], **catchment_metrics[mini_id]}
+        for mini_id in groups
+    }
+    ordered, dense_id = _order_and_reindex(attributes)
+    return _AggregationPlan(
+        pd.DataFrame(ordered, columns=AGGREGATION_COLUMNS[:-1]),
+        {source: dense_id[mini] for source, mini in source_assignment.items()},
+        {source: dense_id[mini] for source, mini in reach_assignment.items()},
+    )
+
+
+def _order_and_reindex(attributes):
+    ids = set(attributes)
+    downstream = {
+        mini_id: (row["id_down"] if row["id_down"] in ids else None)
+        for mini_id, row in attributes.items()
+    }
+    p_order = dict.fromkeys(ids, 1)
+    for mini_id in _topological_order(ids, downstream):
+        target = downstream[mini_id]
+        if target is not None:
+            p_order[target] = max(p_order[target], p_order[mini_id] + 1)
+    old_ids = sorted(
+        ids,
+        key=lambda value: (
+            attributes[value]["sub"],
+            p_order[value],
+            attributes[value]["upstream_area"],
+            _stable_key(value),
+        ),
+    )
+    dense_id = {old_id: new_id for new_id, old_id in enumerate(old_ids, start=1)}
+    rows = []
+    for old_id in old_ids:
+        row = attributes[old_id]
+        target = downstream[old_id]
+        rows.append(
+            {
+                "id": dense_id[old_id],
+                "id_down": -1 if target is None else dense_id[target],
+                "sub": row["sub"],
+                "p_order": p_order[old_id],
+                "unit_length": row["unit_length"],
+                "upstream_length": row["upstream_length"],
+                "unit_area": row["unit_area"],
+                "upstream_area": row["upstream_area"],
+            }
+        )
+    return rows, dense_id
 
 
 def _build_aggregation_state(
@@ -429,10 +490,8 @@ def _mini_attributes(segments, groups, assignment, downstream):
             "id": mini_id,
             "id_down": downstream_mini,
             "sub": representative["sub"],
-            "strahler_order": representative["strahler_order"],
             "unit_length": float(row_by_id.loc[list(members), "unit_length"].sum()),
             "upstream_length": float(representative["upstream_length"]),
-            "water_course": representative["water_course"],
         }
     return result
 
@@ -448,36 +507,126 @@ def _mini_metric_attributes(source, groups, *, unit_column, upstream_column):
     }
 
 
+def _read_aggregation_attributes(provider, name, batch_size):
+    expected = tuple(INPUT_COLUMNS[:-1])
+    if tuple(provider.fields) != expected:
+        raise InvalidInputSchemaError(
+            f"{name} must have exact input columns in order: " + ", ".join(expected)
+        )
+    batches = []
+    fids = {}
+    for batch in iter_provider_batches(
+        provider,
+        columns=expected,
+        batch_size=batch_size,
+        read_geometry=False,
+        return_fids=True,
+    ):
+        extra = [column for column in batch.schema.names if column not in expected]
+        if len(extra) != 1:
+            raise InvalidInputSchemaError("Cannot identify vector feature IDs")
+        ids = batch["id"].to_pylist()
+        fid_values = batch[extra[0]].to_pylist()
+        for value, fid in zip(ids, fid_values, strict=True):
+            if value in fids:
+                raise DuplicateSegmentIdError(f"Found duplicate ID in {name}: {value}")
+            fids[value] = int(fid)
+        batches.append(batch.select(expected))
+    if not batches:
+        raise InvalidInputSchemaError(f"{name} contains no features")
+    table = pa.Table.from_batches(batches).combine_chunks()
+    _validate_numeric_columns(table, name)
+    if table["id"].null_count:
+        raise InvalidInputSchemaError(f"{name} contains null IDs")
+    return table.to_pandas().reset_index(drop=True), fids
+
+
+def _validate_numeric_columns(table, name):
+    for column in (
+        "sub",
+        "strahler_order",
+        "unit_length",
+        "upstream_length",
+        "unit_area",
+        "upstream_area",
+    ):
+        value = table[column].type
+        if not (
+            pa.types.is_integer(value)
+            or pa.types.is_floating(value)
+            or pa.types.is_decimal(value)
+        ):
+            raise InvalidInputSchemaError(
+                f"{name} has non-numeric metric column(s): {column}"
+            )
+
+
+def _geometry_packet_bytes(provider, row_count):
+    source_bytes = max(1, provider.path.stat().st_size)
+    per_feature = max(4096, int(np.ceil(source_bytes / provider.feature_count)) * 4)
+    return max(1, per_feature * row_count)
+
+
+def _mapping_from_packets(packet_dir, kinds, catchments):
+    codec = VectorTableCheckpointCodec()
+    frames = []
+    for ordinal, kind in kinds.items():
+        if kind != "catchments":
+            continue
+        packet = codec.load(packet_dir / f"{ordinal:012d}.arrow")
+        frames.append(
+            packet.table.select(
+                ["source_id", "mini_id", "longitude", "latitude"]
+            ).to_pandas()
+        )
+    if not frames:
+        raise InvalidInputSchemaError("Aggregation produced no catchment mapping")
+    mapping = pd.concat(frames, ignore_index=True).rename(columns={"source_id": "id"})
+    sub_by_id = catchments.set_index("id")["sub"]
+    mapping.insert(2, "sub", mapping["id"].map(sub_by_id))
+    return mapping.sort_values(
+        "id", key=lambda values: values.astype(str), kind="stable"
+    ).reset_index(drop=True)
+
+
 def aggregate_roi_dataset(spec: AggregationSpec) -> AggregationReport:
     overall_started = time.perf_counter()
     _validate_spec(spec)
     phase_started = time.perf_counter()
-    catchments = read_vector_table(spec.roi_catchments)
-    segments = read_vector_table(spec.roi_segments)
-    expected_crs = catchments.crs
-    if segments.crs != expected_crs:
+    catchment_provider = inspect_vector_provider(spec.roi_catchments)
+    segment_provider = inspect_vector_provider(spec.roi_segments)
+    expected_crs = catchment_provider.crs
+    if segment_provider.crs != expected_crs:
         raise InvalidInputSchemaError("ROI catchment and segment CRS values differ")
+    catchments, catchment_fids = _read_aggregation_attributes(
+        catchment_provider, "roi_catchments", spec.batch_size
+    )
+    segments, segment_fids = _read_aggregation_attributes(
+        segment_provider, "roi_segments", spec.batch_size
+    )
     roi_input_seconds = time.perf_counter() - phase_started
     phase_started = time.perf_counter()
-    result = _aggregate_minibasins(
+    plan = _plan_aggregation(
         catchments,
         segments,
         uparea_min=spec.uparea_min,
         lmin=spec.lmin,
-        dissolve=False,
     )
     aggregation_seconds = time.perf_counter() - phase_started
     items, kinds = _aggregation_work_items(
-        catchments,
-        segments,
-        result,
+        catchment_provider,
+        segment_provider,
+        catchment_fids,
+        segment_fids,
+        plan,
         batch_size=spec.batch_size,
+        memory_limit_bytes=spec.memory_limit_mb * 1024 * 1024,
     )
     checkpoint = None
     if spec.checkpoint_dir is not None:
         fingerprint = execution_fingerprint(
             algorithm="aggregate",
-            version="2",
+            version="3",
             input_identity={
                 "roi_catchments": file_identity(spec.roi_catchments),
                 "roi_segments": file_identity(spec.roi_segments),
@@ -502,7 +651,6 @@ def aggregate_roi_dataset(spec: AggregationSpec) -> AggregationReport:
                 work_result.value,
                 packet_dir / f"{work_result.ordinal:012d}.arrow",
             )
-            return None
 
         execution = LocalExecutor(
             ExecutionConfig(
@@ -523,21 +671,20 @@ def aggregate_roi_dataset(spec: AggregationSpec) -> AggregationReport:
             staging,
             packet_dir,
             kinds,
-            result,
+            plan,
+            expected_crs,
             catchment_path=catchment_path,
             segment_path=segment_path,
         )
-        shutil.rmtree(packet_dir)
-        mapping = result.mapping.sort_values(
-            "id", key=lambda values: values.astype(str), kind="stable"
-        ).reset_index(drop=True)
+        mapping = _mapping_from_packets(packet_dir, kinds, catchments)
         mapping.to_csv(mapping_path, index=False)
+        shutil.rmtree(packet_dir)
         _validate_aggregation_outputs(
             catchment_path,
             segment_path,
             mapping_path,
             expected_crs=expected_crs,
-            source_ids=set(catchments.table["id"].to_pylist()),
+            source_ids=set(catchments["id"]),
         )
         publisher.publish((catchment_path.name, segment_path.name, mapping_path.name))
     output_publication_seconds = time.perf_counter() - phase_started
@@ -548,9 +695,9 @@ def aggregate_roi_dataset(spec: AggregationSpec) -> AggregationReport:
         output / "mini_catchments.fgb",
         output / "mini_segments.fgb",
         output / "source_to_mini.csv",
-        len(result.catchments),
-        len(result.segments),
-        len(result.mapping),
+        len(plan.attributes),
+        len(plan.attributes),
+        len(mapping),
         {
             "roi_input": roi_input_seconds,
             "aggregation": aggregation_seconds,
@@ -562,59 +709,42 @@ def aggregate_roi_dataset(spec: AggregationSpec) -> AggregationReport:
 
 
 def _aggregation_work_items(
-    catchments: VectorTable,
-    segments: VectorTable,
-    result: AggregationResult,
+    catchments,
+    segments,
+    catchment_fids,
+    segment_fids,
+    plan: _AggregationPlan,
     *,
     batch_size: int,
+    memory_limit_bytes: int,
 ) -> tuple[list[WorkItem[_AggregationPacket]], dict[int, str]]:
-    """Plan deterministic packets without splitting a complete water course."""
-    domains: dict[tuple[Any, Any], list[Hashable]] = defaultdict(list)
-    for segment_id, sub, water_course in _attributes(segments)[
-        ["id", "sub", "water_course"]
-    ].itertuples(index=False, name=None):
-        domains[(sub, water_course)].append(segment_id)
-    packets: list[list[Hashable]] = []
-    current: list[Hashable] = []
-    for domain in sorted(domains, key=lambda value: (str(value[0]), str(value[1]))):
-        values = sorted(domains[domain], key=_stable_key)
-        if current and len(current) + len(values) > batch_size:
-            packets.append(current)
-            current = []
-        current.extend(values)
-    if current:
-        packets.append(current)
-
+    """Plan bounded geometry reads after the attribute-only aggregation pass."""
     items: list[WorkItem[_AggregationPacket]] = []
     kinds: dict[int, str] = {}
-    for kind, vector, assignment in (
-        ("catchments", catchments, result._catchment_assignment),
-        ("segments", segments, result._reach_assignment),
+    for kind, provider, fids, assignment in (
+        ("catchments", catchments, catchment_fids, plan.catchment_assignment),
+        ("segments", segments, segment_fids, plan.reach_assignment),
     ):
-        if assignment is None:
-            raise InvalidInputSchemaError("Aggregation assignment metadata is missing")
-        source_ids = vector.table["id"].to_pylist()
-        position_by_id = {value: index for index, value in enumerate(source_ids)}
-        for packet_index, ids in enumerate(packets):
-            selected_ids = [value for value in ids if value in assignment]
-            if not selected_ids:
-                continue
-            positions = pa.array(
-                [position_by_id[value] for value in selected_ids], type=pa.int64()
-            )
-            table = vector.table.take(positions)
-            packet = VectorTable(
-                table, vector.crs, vector.geometry_column, vector.geometry_type
-            )
+        rows = conservative_geometry_packet_rows(
+            provider,
+            memory_limit_bytes=memory_limit_bytes,
+            requested_rows=batch_size,
+        )
+        source_ids = sorted(assignment, key=_stable_key)
+        for packet_index, offset in enumerate(range(0, len(source_ids), rows)):
+            selected_ids = source_ids[offset : offset + rows]
             ordinal = len(items)
             items.append(
                 WorkItem(
                     f"{kind}-{packet_index:012d}",
                     ordinal,
-                    max(1, table.nbytes * 4),
+                    _geometry_packet_bytes(provider, len(selected_ids)),
                     _AggregationPacket(
-                        packet,
+                        provider,
+                        tuple(selected_ids),
+                        tuple(fids[value] for value in selected_ids),
                         {value: assignment[value] for value in selected_ids},
+                        kind,
                     ),
                 )
             )
@@ -622,21 +752,52 @@ def _aggregation_work_items(
     return items, kinds
 
 
-def _prepare_aggregation_packet(payload: _AggregationPacket, _context) -> VectorTable:
-    ids = payload.vector.table["id"].to_pylist()
-    table = pa.table(
-        {
-            "mini_id": pa.array(
-                [payload.assignment[value] for value in ids],
-                type=payload.vector.table["id"].type,
-            ),
-            "geometry": payload.vector.table[
-                payload.vector.geometry_column
-            ].combine_chunks(),
-        }
+def _prepare_aggregation_packet(payload: _AggregationPacket, context) -> VectorTable:
+    batches = list(
+        iter_provider_batches(
+            payload.provider,
+            columns=("id",),
+            batch_size=len(payload.ids),
+            read_geometry=True,
+            fids=payload.fids,
+            context=context,
+        )
     )
+    if not batches:
+        raise InvalidInputSchemaError("Aggregation geometry packet is empty")
+    source = pa.Table.from_batches(batches).combine_chunks()
+    geometry_column = geometry_column_name(source)
+    ids = source["id"].to_pylist()
+    if len(ids) != len(set(ids)) or set(ids) != set(payload.ids):
+        raise InvalidInputSchemaError("Aggregation geometry packet IDs do not match")
+    geometries = shapely.from_wkb(
+        source[geometry_column].to_numpy(zero_copy_only=False), on_invalid="raise"
+    )
+    allowed = {3, 6} if payload.kind == "catchments" else {1, 5}
+    _validate_geometries(geometries, f"roi_{payload.kind}", allowed)
+    columns = {
+        "mini_id": pa.array(
+            [payload.assignment[value] for value in ids], type=pa.int64()
+        )
+    }
+    if payload.kind == "catchments":
+        transformer = Transformer.from_crs(
+            payload.provider.crs, "EPSG:4326", always_xy=True
+        )
+        lonlat = shapely.transform(
+            shapely.centroid(geometries), transformer.transform, interleaved=False
+        )
+        columns.update(
+            source_id=source["id"],
+            longitude=pa.array(shapely.get_x(lonlat), type=pa.float64()),
+            latitude=pa.array(shapely.get_y(lonlat), type=pa.float64()),
+        )
+    columns["geometry"] = source[geometry_column]
     return VectorTable(
-        table, payload.vector.crs, "geometry", payload.vector.geometry_type
+        pa.table(columns),
+        payload.provider.crs,
+        "geometry",
+        payload.provider.geometry_type,
     )
 
 
@@ -644,7 +805,8 @@ def _gdal_dissolve_outputs(
     staging: Path,
     packet_dir: Path,
     kinds: dict[int, str],
-    result: AggregationResult,
+    plan: _AggregationPlan,
+    crs: CRS,
     *,
     catchment_path: Path,
     segment_path: Path,
@@ -652,8 +814,8 @@ def _gdal_dissolve_outputs(
     """Dissolve assigned WKB with GDAL's SQLite engine and stream to FGB."""
     workspace = staging / ".aggregation.gpkg"
     layers = (
-        ("catchment_sources", "catchment_attrs", result.catchments, catchment_path),
-        ("segment_sources", "segment_attrs", result.segments, segment_path),
+        ("catchment_sources", "catchment_attrs", catchment_path),
+        ("segment_sources", "segment_attrs", segment_path),
     )
     try:
         codec = VectorTableCheckpointCodec()
@@ -674,26 +836,22 @@ def _gdal_dissolve_outputs(
                 spatial_index=False,
             )
             first[kind] = False
-        for _, attrs_layer, attributes, _ in layers:
-            attrs = attributes.table.drop([attributes.geometry_column])
+        attrs = pa.Table.from_pandas(plan.attributes, preserve_index=False)
+        for _, attrs_layer, _ in layers:
             pyogrio.write_arrow(attrs, workspace, layer=attrs_layer, driver="GPKG")
 
-        for source_layer, attrs_layer, attributes, output in layers:
+        for source_layer, attrs_layer, output in layers:
             geometry_name = pyogrio.read_info(workspace, layer=source_layer)[
                 "geometry_name"
             ]
-            attribute_names = [
-                name
-                for name in attributes.table.column_names
-                if name != attributes.geometry_column
-            ]
+            attribute_names = list(plan.attributes.columns)
             select = ", ".join(f'a."{name}"' for name in attribute_names)
             group_by = ", ".join(f'a."{name}"' for name in attribute_names)
             sql = (
                 f'SELECT {select}, ST_Union(s."{geometry_name}") AS geometry '
                 f'FROM "{source_layer}" s JOIN "{attrs_layer}" a '
                 f'ON s."mini_id" = a."id" GROUP BY {group_by} '
-                'ORDER BY CAST(a."id" AS TEXT)'
+                'ORDER BY a."id"'
             )
             with pyogrio.open_arrow(
                 workspace, sql=sql, sql_dialect="SQLITE", use_pyarrow=True
@@ -704,8 +862,8 @@ def _gdal_dissolve_outputs(
                     driver="FlatGeobuf",
                     geometry_name=metadata.get("geometry_name") or "geometry",
                     geometry_type="Unknown",
-                    crs=attributes.crs.to_wkt(version="WKT2_2019", pretty=False),
-                    layer_options={"SPATIAL_INDEX": "YES"},
+                    crs=crs.to_wkt(version="WKT2_2019", pretty=False),
+                    layer_options={"SPATIAL_INDEX": "NO"},
                 )
     except InvalidInputSchemaError:
         raise
@@ -748,12 +906,39 @@ def _validate_spec(spec):
 def _validate_aggregation_outputs(
     catchments, segments, mapping, *, expected_crs, source_ids
 ):
+    output_frames = []
     for name, path in (("mini_catchments", catchments), ("mini_segments", segments)):
         info = pyogrio.read_info(path)
-        if [*info["fields"], "geometry"] != ROI_COLUMNS:
+        if [*info["fields"], "geometry"] != AGGREGATION_COLUMNS:
             raise InvalidInputSchemaError(f"{name} output schema is invalid")
         if info.get("crs") is None or CRS.from_user_input(info["crs"]) != expected_crs:
             raise InvalidInputSchemaError(f"{name} output CRS is invalid")
+        _, attributes = pyogrio.read_arrow(
+            path, columns=AGGREGATION_COLUMNS[:-1], read_geometry=False
+        )
+        frame = attributes.to_pandas()
+        if frame["id"].tolist() != list(range(1, len(frame) + 1)):
+            raise InvalidInputSchemaError(f"{name} output order or IDs are invalid")
+        domain = set(frame["id"])
+        if not set(frame["id_down"]).issubset(domain | {-1}):
+            raise InvalidInputSchemaError(f"{name} downstream IDs are invalid")
+        ordered = frame.sort_values(
+            ["sub", "p_order", "upstream_area"], kind="stable"
+        ).index.tolist()
+        if ordered != frame.index.tolist():
+            raise InvalidInputSchemaError(f"{name} output feature order is invalid")
+        expected_p_order = dict.fromkeys(domain, 1)
+        for downstream_id, group in frame.loc[frame["id_down"] != -1].groupby(
+            "id_down"
+        ):
+            expected_p_order[downstream_id] = int(group["p_order"].max()) + 1
+        if frame["p_order"].tolist() != [
+            expected_p_order[value] for value in frame["id"]
+        ]:
+            raise InvalidInputSchemaError(f"{name} processing order is invalid")
+        output_frames.append(frame)
+    if not output_frames[0].equals(output_frames[1]):
+        raise InvalidInputSchemaError("Aggregation vector attributes differ")
     table = pd.read_csv(mapping)
     if list(table.columns) != ["id", "mini_id", "sub", "longitude", "latitude"]:
         raise InvalidInputSchemaError("source_to_mini.csv schema is invalid")
@@ -765,6 +950,8 @@ def _validate_aggregation_outputs(
         raise InvalidInputSchemaError(
             "source_to_mini.csv source IDs do not match the ROI"
         )
+    if not set(table["mini_id"]).issubset(set(output_frames[0]["id"])):
+        raise InvalidInputSchemaError("source_to_mini.csv mini IDs are invalid")
 
 
 def _attributes(vector):
@@ -781,23 +968,7 @@ def _validate_input_schema(vector, name):
             f"{name} must have exact input columns in order: "
             + ", ".join(INPUT_COLUMNS)
         )
-    for column in (
-        "sub",
-        "strahler_order",
-        "unit_length",
-        "upstream_length",
-        "unit_area",
-        "upstream_area",
-    ):
-        value = vector.table[column].type
-        if not (
-            pa.types.is_integer(value)
-            or pa.types.is_floating(value)
-            or pa.types.is_decimal(value)
-        ):
-            raise InvalidInputSchemaError(
-                f"{name} has non-numeric metric column(s): {column}"
-            )
+    _validate_numeric_columns(vector.table, name)
 
 
 def _validate_unique_ids(frame, name):
@@ -834,21 +1005,26 @@ def _topological_order(ids, downstream):
     for target in downstream.values():
         if target in indegree:
             indegree[target] += 1
-    ready = sorted(
-        (value for value, count in indegree.items() if count == 0),
-        key=_stable_key,
-        reverse=True,
-    )
+    serial = 0
+    ready = []
+    for value in ids:
+        if indegree[value] == 0:
+            heapq.heappush(
+                ready, (_stable_key(value), type(value).__name__, serial, value)
+            )
+            serial += 1
     order = []
     while ready:
-        value = ready.pop()
+        _, _, _, value = heapq.heappop(ready)
         order.append(value)
         target = downstream.get(value)
         if target in indegree:
             indegree[target] -= 1
             if indegree[target] == 0:
-                ready.append(target)
-                ready.sort(key=_stable_key, reverse=True)
+                heapq.heappush(
+                    ready, (_stable_key(target), type(target).__name__, serial, target)
+                )
+                serial += 1
     if len(order) != len(ids):
         raise TopologyCycleError("Detected topology cycle while aggregating")
     return order
@@ -872,17 +1048,12 @@ def _representative_id(values, row_by_id):
     )
 
 
-def _rows_to_vector(rows, id_type, crs, geometry_type, water_course_type):
-    def nullable(value):
-        return None if pd.isna(value) else value
-
+def _rows_to_vector(rows, crs, geometry_type):
     columns = {
-        "id": pa.array([row["id"] for row in rows], type=id_type),
-        "id_down": pa.array([nullable(row["id_down"]) for row in rows], type=id_type),
+        "id": pa.array([row["id"] for row in rows], type=pa.int64()),
+        "id_down": pa.array([row["id_down"] for row in rows], type=pa.int64()),
         "sub": pa.array([row["sub"] for row in rows], type=pa.int64()),
-        "strahler_order": pa.array(
-            [row["strahler_order"] for row in rows], type=pa.int64()
-        ),
+        "p_order": pa.array([row["p_order"] for row in rows], type=pa.int64()),
         "unit_length": pa.array(
             [row["unit_length"] for row in rows], type=pa.float64()
         ),
@@ -892,9 +1063,6 @@ def _rows_to_vector(rows, id_type, crs, geometry_type, water_course_type):
         "unit_area": pa.array([row["unit_area"] for row in rows], type=pa.float64()),
         "upstream_area": pa.array(
             [row["upstream_area"] for row in rows], type=pa.float64()
-        ),
-        "water_course": pa.array(
-            [row["water_course"] for row in rows], type=water_course_type
         ),
         "geometry": pa.array(
             shapely.to_wkb([row["geometry"] for row in rows]), type=pa.binary()

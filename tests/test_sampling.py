@@ -44,15 +44,14 @@ def _sampling_inputs(tmp_path):
             target.write_mask(np.full(values.shape, 255, dtype="uint8"))
 
     values = {
-        "id": ["a", "b"],
-        "id_down": ["b", None],
+        "id": [1, 2],
+        "id_down": [2, -1],
         "sub": [1, 1],
-        "strahler_order": [1, 1],
+        "p_order": [1, 2],
         "unit_length": [1.0, 1.0],
         "upstream_length": [1.0, 2.0],
         "unit_area": [1.0, 1.0],
         "upstream_area": [1.0, 2.0],
-        "water_course": [1, 1],
     }
     catchments = VectorTable.from_pydict(
         values,
@@ -78,7 +77,7 @@ def _sampling_inputs(tmp_path):
     write_vector_table(catchments, minis / "mini_catchments.fgb", driver="FlatGeobuf")
     write_vector_table(segments, minis / "mini_segments.fgb", driver="FlatGeobuf")
     (minis / "source_to_mini.csv").write_text(
-        "id,mini_id,sub,longitude,latitude\na,a,1,0,0\nb,b,1,0,0\n"
+        "id,mini_id,sub,longitude,latitude\n1,1,1,0,0\n2,2,1,0,0\n"
     )
     prepared = tmp_path / "prepared"
     preparation = prepare_dataset(
@@ -138,7 +137,7 @@ def test_sampling_pipeline_is_exact_block_reusing_and_atomic(tmp_path):
     )
 
     frame = pd.read_csv(report.sampled_minis)
-    assert frame["id"].tolist() == ["a", "b"]
+    assert frame["id"].tolist() == [1, 2]
     assert report.mini_count == 2
     assert report.hru_class_ids == (1, 2, 3)
     assert list(frame.filter(regex=r"^hru_").columns) == [

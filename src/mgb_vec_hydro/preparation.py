@@ -23,6 +23,7 @@ from rasterio.features import rasterize
 from rasterio.transform import Affine
 from rasterio.windows import Window, from_bounds
 
+from mgb_vec_hydro.aggregation import AGGREGATION_COLUMNS
 from mgb_vec_hydro.exceptions import PreparedDataError
 from mgb_vec_hydro.execution.executor import (
     ExecutionConfig,
@@ -655,23 +656,11 @@ def _read_mini_inputs(catchments: Path, segments: Path):
         segment_vector = read_vector_table(segments)
     except Exception as exc:
         raise PreparedDataError("Cannot read explicit mini-catchment inputs") from exc
-    expected_columns = [
-        "id",
-        "id_down",
-        "sub",
-        "strahler_order",
-        "unit_length",
-        "upstream_length",
-        "unit_area",
-        "upstream_area",
-        "water_course",
-        "geometry",
-    ]
     for name, vector, allowed in (
         ("mini catchments", catchment_vector, {3, 6}),
         ("mini segments", segment_vector, {1, 5}),
     ):
-        if list(vector.columns) != expected_columns:
+        if list(vector.columns) != AGGREGATION_COLUMNS:
             raise PreparedDataError(
                 f"{name} must have the exact aggregated mini schema"
             )

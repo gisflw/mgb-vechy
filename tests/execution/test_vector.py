@@ -8,6 +8,7 @@ from mgb_vec_hydro.execution.vector import (
     iter_provider_batches,
     read_vector_table,
     resolve_provider_field,
+    scan_id_fids,
     write_vector_table,
 )
 
@@ -67,3 +68,31 @@ def test_flatgeobuf_round_trip_preserves_ids_geometry_and_crs(tmp_path):
         "POINT (0 0)",
         "POINT (1 1)",
     }
+
+
+def test_flatgeobuf_arrow_reads_split_large_fid_selections(tmp_path):
+    count = 5_000
+    path = tmp_path / "many-points.fgb"
+    write_vector_table(
+        VectorTable.from_pydict(
+            {"id": range(count)},
+            [Point(value, 0) for value in range(count)],
+            crs="EPSG:3857",
+            geometry_type="Point",
+        ),
+        path,
+        driver="FlatGeobuf",
+    )
+    provider = inspect_vector_provider(path)
+    fids = scan_id_fids(provider, "id")
+
+    batches = iter_provider_batches(
+        provider,
+        columns=("id",),
+        fids=tuple(fids.values()),
+        batch_size=count,
+    )
+    ids = [value for batch in batches for value in batch["id"].to_pylist()]
+
+    assert len(ids) == count
+    assert set(ids) == set(range(count))

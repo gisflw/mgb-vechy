@@ -44,7 +44,8 @@ geometry is validated, transformed, and reduced deterministically.
 
 Stages 2–5 receive explicit paths to the files they consume. They infer CRS
 from the authoritative explicit input for that stage and reject missing or
-mismatched CRS metadata. FlatGeobuf output is spatially indexed and all
+mismatched CRS metadata. Stage 1 FlatGeobuf output is spatially indexed;
+Stage 2 deliberately omits the index to preserve processing order. All
 published vector files are root-level files.
 
 ## Raster access
@@ -81,8 +82,10 @@ direct path; terrain does not copy or republish it.
 ## Stage execution
 
 ROI and aggregation use bounded vector packets and coordinator-side grouped
-geometry publication. Preparation clips aligned sources and rasterizes strict
-ownership/drainage in bounded parallel blocks, with deterministic ordered
+geometry publication. Aggregation first streams attributes without geometry,
+finalizes topology, processing order, and dense IDs, then reads geometry in
+bounded packets for dissolution. Preparation clips aligned sources and
+rasterizes strict ownership/drainage in bounded parallel blocks, with deterministic ordered
 reduction and coordinator-only connectivity correction. Terrain reads
 direct COG windows for complete minis and assembles HAND, LTND, and optional
 flow direction. Sampling derives block-aware packets and reduces exact mini

@@ -40,10 +40,17 @@ and `water_course`. True surviving confluences remain boundaries. `lmin` then
 operates iteratively on the evolving chain lengths with stable ID tie-breaking.
 
 The representative segment with the greatest upstream area, then unit length,
-then string ID supplies the mini ID. That ID is used by both vector outputs,
-the source mapping, and downstream mini references. `source_to_mini.csv`
-contains exactly `id`, `mini_id`, `sub`, `longitude`, and `latitude`; every ROI
-source ID occurs once.
+then string ID supplies a provisional mini identity. Once aggregation is
+complete, processing order (`p_order`) is calculated on the final topology:
+every head mini receives 1 and every downstream mini receives one plus the
+greatest order among its direct upstream minis.
+
+Final minis are sorted by `sub`, `p_order`, and `upstream_area`, all ascending,
+with the provisional identity as a deterministic tie-breaker. `id` is replaced
+with the one-based dense sequence `1..N`; valid `id_down` references are
+remapped and mouths are written as `-1`. `source_to_mini.csv` contains exactly
+`id`, `mini_id`, `sub`, `longitude`, and `latitude`; every ROI source ID occurs
+once and `mini_id` uses the dense identity.
 
 The published directory contains exactly these root-level files:
 
@@ -55,7 +62,12 @@ minis/
 ```
 
 There is no `manifest.json` and no nested output directory. Both FlatGeobuf
-files preserve the normalized ten-column schema and the authoritative CRS.
+files use the ordered schema `id`, `id_down`, `sub`, `p_order`, `unit_length`,
+`upstream_length`, `unit_area`, `upstream_area`, `geometry` and the
+authoritative CRS. `strahler_order` and `water_course` remain Stage 1 inputs
+but are not published because downstream stages do not use them. The mini
+files intentionally omit a spatial index so physical feature order is
+preserved.
 The files are staged privately, validated, and atomically published. Defaults
 are 512 MB, four workers, two I/O operations, and 10,000-row batches. Worker
 counts may be any positive integer.

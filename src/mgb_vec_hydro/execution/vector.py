@@ -10,15 +10,16 @@ from pathlib import Path
 
 import numpy as np
 import pyarrow as pa
-import pyarrow.ipc as ipc
 import pyogrio
-from pyproj import CRS
 import shapely
+from pyarrow import ipc
+from pyproj import CRS
 
 from mgb_vec_hydro.exceptions import InvalidInputSchemaError
 from mgb_vec_hydro.execution.executor import WorkerContext
 
 SUPPORTED_PROVIDER_DRIVERS = {"GPKG", "FlatGeobuf", "OpenFileGDB"}
+MAX_OGRSQL_ARROW_FIDS = 4_997
 
 
 @dataclass(frozen=True)
@@ -89,7 +90,7 @@ class VectorTable:
         crs: str | CRS,
         geometry_type: str = "Unknown",
         geometry_column: str = "geometry",
-    ) -> "VectorTable":
+    ) -> VectorTable:
         """Construct a vector table from attributes and Shapely geometries."""
         arrays = {name: pa.array(values) for name, values in data.items()}
         if "id" in arrays:
@@ -300,23 +301,33 @@ def iter_provider_batches(
         raise InvalidInputSchemaError(
             "Vector provider lacks column(s): " + ", ".join(sorted(unknown))
         )
-    guard = context.io_bound() if context is not None else nullcontext()
+    selected_fids = list(fids) if fids is not None else None
+    fid_chunks = (
+        (None,)
+        if selected_fids is None
+        else (
+            selected_fids[offset : offset + MAX_OGRSQL_ARROW_FIDS]
+            for offset in range(0, len(selected_fids), MAX_OGRSQL_ARROW_FIDS)
+        )
+    )
     try:
-        with (
-            guard,
-            pyogrio.open_arrow(
-                provider.path,
-                layer=provider.layer,
-                columns=list(columns),
-                batch_size=batch_size,
-                read_geometry=read_geometry,
-                where=where,
-                fids=list(fids) if fids is not None else None,
-                return_fids=return_fids,
-                use_pyarrow=True,
-            ) as (_, batches),
-        ):
-            yield from batches
+        for fid_chunk in fid_chunks:
+            guard = context.io_bound() if context is not None else nullcontext()
+            with (
+                guard,
+                pyogrio.open_arrow(
+                    provider.path,
+                    layer=provider.layer,
+                    columns=list(columns),
+                    batch_size=batch_size,
+                    read_geometry=read_geometry,
+                    where=where,
+                    fids=fid_chunk,
+                    return_fids=return_fids,
+                    use_pyarrow=True,
+                ) as (_, batches),
+            ):
+                yield from batches
     except InvalidInputSchemaError:
         raise
     except Exception as exc:

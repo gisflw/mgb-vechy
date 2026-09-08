@@ -62,9 +62,10 @@ sampled/
 └── sampled_minis.csv
 ```
 
-Rows preserve the normalized attributes without geometry. The output includes
-longitude/latitude, reach slope, tributary length and slope, and sorted
-`hru_<id>_pct` columns summing to 100% for every mini. Optional
+Rows preserve the aggregation attributes (`id`, `id_down`, `sub`, `p_order`,
+`unit_length`, `upstream_length`, `unit_area`, and `upstream_area`) without
+geometry. The output includes longitude/latitude, reach slope, tributary length
+and slope, and sorted `hru_<id>_pct` columns summing to 100% for every mini. Optional
 `--checkpoint-dir` is operational scratch outside `--output-dir`; it is
 removed after successful publication. The CLI prints the concrete CSV path.
 Execution defaults are four workers, 512 MB of admitted task memory, two I/O
