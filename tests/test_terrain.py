@@ -167,7 +167,6 @@ def _terrain_inputs(tmp_path, *, with_d8=False):
             output_dir=prepared,
             d8=d8_path,
             d8_encoding="canonical" if with_d8 else None,
-            buffer_cells=0,
         )
     )
     return preparation, minis

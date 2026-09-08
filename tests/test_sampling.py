@@ -88,7 +88,6 @@ def _sampling_inputs(tmp_path):
             mini_segments=minis / "mini_segments.fgb",
             rasters=(NamedRaster("hru", tmp_path / "hru.tif", "categorical"),),
             output_dir=prepared,
-            buffer_cells=0,
         )
     )
     terrain = tmp_path / "terrain"

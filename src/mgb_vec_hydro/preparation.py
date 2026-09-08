@@ -63,7 +63,6 @@ class PreparationSpec:
     workers: int = 4
     memory_limit_mb: int = 512
     io_slots: int = 2
-    buffer_cells: int = 1
 
 
 @dataclass(frozen=True)
@@ -132,7 +131,6 @@ class _PreparationBlockPayload:
     ownership_indices: tuple[int, ...]
     segment_wkb: tuple[bytes, ...]
     segment_labels: tuple[int, ...]
-    buffer_distance: float
     d8_encoding: str
     gdal_cache_bytes: int
 
@@ -191,13 +189,12 @@ def _prepare_dataset(spec: PreparationSpec) -> PreparationReport:
         raise PreparedDataError("Mini-catchment domain is empty")
     with rasterio.open(spec.dem) as dem:
         _require_source_grid(dem, target_crs, "DEM")
-        buffer_distance = spec.buffer_cells * abs(dem.transform.a)
         window = (
             from_bounds(
-                float(domain_bounds[0] - buffer_distance),
-                float(domain_bounds[1] - buffer_distance),
-                float(domain_bounds[2] + buffer_distance),
-                float(domain_bounds[3] + buffer_distance),
+                float(domain_bounds[0]),
+                float(domain_bounds[1]),
+                float(domain_bounds[2]),
+                float(domain_bounds[3]),
                 transform=dem.transform,
             )
             .round_offsets()
@@ -210,7 +207,7 @@ def _prepare_dataset(spec: PreparationSpec) -> PreparationReport:
             or window.row_off + window.height > dem.height
         ):
             raise PreparedDataError(
-                "DEM does not cover the buffered mini-catchment domain"
+                "DEM does not cover the mini-catchment domain"
             )
         grid = GridSpec(
             target_crs,
@@ -231,7 +228,6 @@ def _prepare_dataset(spec: PreparationSpec) -> PreparationReport:
         dense_labels,
         catchment_index,
         segment_index,
-        buffer_distance,
         spec.d8_encoding or "canonical",
         memory_bytes,
         spec.workers,
@@ -404,7 +400,6 @@ def _preparation_work_items(
     dense_labels: np.ndarray,
     catchment_index,
     segment_index,
-    buffer_distance: float,
     d8_encoding: str,
     memory_limit_bytes: int,
     workers: int,
@@ -421,21 +416,8 @@ def _preparation_work_items(
         for ordinal, window in enumerate(plan_raster_blocks(grid)):
             bounds = rasterio.windows.bounds(window, grid.transform)
             block_geometry = shapely.box(*bounds)
-            expanded = shapely.box(
-                bounds[0] - buffer_distance,
-                bounds[1] - buffer_distance,
-                bounds[2] + buffer_distance,
-                bounds[3] + buffer_distance,
-            )
-            catchment_hits = np.sort(catchment_index.query(expanded))
-            ownership_hits = {
-                int(value) for value in catchment_index.query(block_geometry)
-            }
-            ownership_indices = tuple(
-                position
-                for position, index in enumerate(catchment_hits)
-                if int(index) in ownership_hits
-            )
+            catchment_hits = np.sort(catchment_index.query(block_geometry))
+            ownership_indices = tuple(range(len(catchment_hits)))
             segment_hits = np.sort(segment_index.query(block_geometry))
             catchment_wkb = tuple(
                 bytes(value) for value in shapely.to_wkb(catchments[catchment_hits])
@@ -463,7 +445,6 @@ def _preparation_work_items(
                     ownership_indices,
                     segment_wkb,
                     tuple(int(dense_labels[index]) for index in segment_hits),
-                    buffer_distance,
                     d8_encoding,
                     gdal_cache_bytes,
                 ),
@@ -503,13 +484,8 @@ def _prepare_block_worker_with_cache(
 
     started = time.perf_counter()
     if len(catchments):
-        mask_geometries = (
-            shapely.buffer(catchments, payload.buffer_distance, quad_segs=16)
-            if payload.buffer_distance
-            else catchments
-        )
         domain_mask = rasterize(
-            [(geometry, 1) for geometry in mask_geometries],
+            [(geometry, 1) for geometry in catchments],
             out_shape=shape,
             transform=transform,
             fill=0,
@@ -648,8 +624,6 @@ def _validate_spec(spec: PreparationSpec) -> None:
             raise PreparedDataError(f"{name} must be a positive integer")
     if spec.workers > 4:
         raise PreparedDataError("workers cannot exceed four")
-    if spec.buffer_cells < 0:
-        raise PreparedDataError("buffer-cells must be non-negative")
     for name, path in (
         ("mini-catchments", spec.mini_catchments),
         ("mini-segments", spec.mini_segments),
@@ -754,7 +728,7 @@ def _require_source_grid(
             or grid.bounds[2] > source.bounds.right + 1e-7
             or grid.bounds[3] > source.bounds.top + 1e-7
         ):
-            raise PreparedDataError(f"{name} does not cover the buffered ROI domain")
+            raise PreparedDataError(f"{name} does not cover the ROI domain")
 
 
 def _validate_prepared_outputs(
@@ -1089,7 +1063,7 @@ def _label_value_components(values, valid, drainage):
 
 
 def _rasterize_ownership_block(geometries, labels, shape, transform):
-    """Rasterize a catchment union and deterministically assign every union cell."""
+    """Rasterize catchments and deterministically assign every covered cell."""
     if not len(geometries):
         return np.zeros(shape, dtype="int32"), np.zeros(shape, dtype=bool)
     order = np.argsort(labels)[::-1]
@@ -1111,17 +1085,7 @@ def _rasterize_ownership_block(geometries, labels, shape, transform):
         all_touched=False,
         merge_alg=MergeAlg.add,
     )
-    # Aggregated catchments are a non-overlapping coverage. Occupancy is
-    # checked independently below, so this faster union cannot hide conflicts.
-    union = shapely.coverage_union_all(geometries)
-    expected = rasterize(
-        [(union, 1)],
-        out_shape=shape,
-        transform=transform,
-        fill=0,
-        dtype="uint8",
-        all_touched=False,
-    ).astype(bool)
+    expected = occupancy > 0
     ambiguous = np.argwhere((occupancy > 1) | (expected & (ownership == 0)))
     for row, col in ambiguous:
         x, y = rasterio.transform.xy(transform, int(row), int(col), offset="center")
@@ -1145,13 +1109,13 @@ def _rasterize_ownership_block(geometries, labels, shape, transform):
             choices, counts = np.unique(neighbors[neighbors != 0], return_counts=True)
             if not len(choices):
                 raise PreparedDataError(
-                    "Rasterized catchment union contains a cell with no defensible owner"
+                    "Rasterized catchment domain contains a cell with no defensible owner"
                 )
             best = np.max(counts)
             ownership[row, col] = int(np.min(choices[counts == best]))
     valid = expected
     if np.any(valid & (ownership == 0)):
-        raise PreparedDataError("Rasterized catchment union has unlabeled cells")
+        raise PreparedDataError("Rasterized catchment domain has unlabeled cells")
     return ownership, valid
 
 

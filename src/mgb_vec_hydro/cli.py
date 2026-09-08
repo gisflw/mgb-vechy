@@ -70,9 +70,6 @@ def _echo_timings(timings: dict[str, float]) -> None:
 )
 @click.option("--io-slots", type=click.IntRange(min=1), default=2, show_default=True)
 @click.option(
-    "--buffer-cells", type=click.IntRange(min=0), default=1, show_default=True
-)
-@click.option(
     "--output-dir",
     type=click.Path(file_okay=False, path_type=Path),
     required=True,
@@ -88,7 +85,6 @@ def prepare_command(
     memory_limit_mb: int,
     workers: int,
     io_slots: int,
-    buffer_cells: int,
     output_dir: Path,
 ) -> None:
     """Prepare explicit mini vectors and aligned raster files as flat COGs."""
@@ -108,7 +104,6 @@ def prepare_command(
                 workers=workers,
                 memory_limit_mb=memory_limit_mb,
                 io_slots=io_slots,
-                buffer_cells=buffer_cells,
                 output_dir=output_dir,
             )
         )

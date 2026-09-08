@@ -148,7 +148,6 @@ def test_prepare_pipeline_publishes_valid_canonical_dataset(tmp_path):
             rasters=(NamedRaster("land", land, "categorical"),),
             output_dir=tmp_path / "prepared",
             memory_limit_mb=16,
-            buffer_cells=0,
         )
     )
 
@@ -201,7 +200,6 @@ def test_parallel_preparation_matches_serial_across_multiple_blocks(tmp_path):
                 workers=workers,
                 io_slots=2,
                 memory_limit_mb=128,
-                buffer_cells=0,
             )
         )
 
@@ -252,7 +250,6 @@ def test_preparation_rejects_invalid_execution_limits(tmp_path, field, value, me
         "mini_catchments": catchments,
         "mini_segments": segments,
         "output_dir": tmp_path / "prepared",
-        "buffer_cells": 0,
         field: value,
     }
     with pytest.raises(PreparedDataError, match=message):
@@ -269,7 +266,6 @@ def test_preparation_enforces_block_memory_and_cleans_worker_failures(tmp_path):
         "dem": dem,
         "mini_catchments": catchments,
         "mini_segments": segments,
-        "buffer_cells": 0,
         "workers": 1,
     }
     with pytest.raises(WorkMemoryError, match="block-"):

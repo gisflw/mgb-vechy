@@ -164,7 +164,6 @@ def test_preparation_reports_serial_and_parallel_throughput(tmp_path, record_pro
                 workers=workers,
                 memory_limit_mb=256,
                 io_slots=2,
-                buffer_cells=0,
             )
         )
         record_property(f"workers_{workers}_total_seconds", report.timings["total"])
