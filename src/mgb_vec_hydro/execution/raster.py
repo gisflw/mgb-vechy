@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -71,6 +71,29 @@ class RasterProductSpec:
     dtype: str
     overview_resampling: Resampling = Resampling.nearest
     tags: dict[str, Any] = field(default_factory=dict)
+
+
+def plan_raster_blocks(
+    grid: GridSpec, *, block_size: int = BLOCK_SIZE
+) -> Iterator[Window]:
+    """Return complete canonical blocks in deterministic row-major order."""
+
+    if (
+        isinstance(block_size, bool)
+        or not isinstance(block_size, int)
+        or block_size <= 0
+    ):
+        raise RasterGridError("Raster block size must be a positive integer")
+    return (
+        Window(
+            col,
+            row,
+            min(block_size, grid.width - col),
+            min(block_size, grid.height - row),
+        )
+        for row in range(0, grid.height, block_size)
+        for col in range(0, grid.width, block_size)
+    )
 
 
 def grid_from_dem(dem: str | Path) -> GridSpec:
@@ -308,6 +331,54 @@ class AlignedRasterReader:
         _require_integer_window(window, self.grid)
         with self.context.io_bound():
             return source.read(1, window=window, masked=masked)
+
+
+class CoveringRasterReader:
+    """Read aligned rasters whose extent covers a smaller canonical grid."""
+
+    def __init__(
+        self,
+        grid: GridSpec,
+        assets: dict[str, str | Path],
+        context: WorkerContext,
+    ):
+        self.grid = grid
+        self.assets = {name: Path(path).resolve() for name, path in assets.items()}
+        self.context = context
+
+    def source(self, name: str):
+        try:
+            path = self.assets[name]
+        except KeyError as exc:
+            raise RasterGridError(f"Unknown covering raster asset: {name}") from exc
+        if not path.is_file():
+            raise RasterGridError(f"Covering raster input is missing: {path}")
+        key = f"covering-raster:{path}"
+
+        def open_source():
+            source = rasterio.open(path)
+            try:
+                _require_covering_grid(source, self.grid, name)
+            except Exception:
+                source.close()
+                raise
+            return source
+
+        return self.context.resources.get(key, open_source)
+
+    def read(self, name: str, window: Window, *, masked: bool = True) -> np.ndarray:
+        _require_integer_window(window, self.grid)
+        source = self.source(name)
+        bounds = rasterio.windows.bounds(window, self.grid.transform)
+        source_window = from_bounds(*bounds, transform=source.transform)
+        source_window = source_window.round_offsets().round_lengths()
+        expected_shape = (int(window.height), int(window.width))
+        if (int(source_window.height), int(source_window.width)) != expected_shape:
+            raise RasterGridError(
+                f"Covering raster {name} cannot map the requested window exactly"
+            )
+        with self.context.io_bound():
+            return source.read(1, window=source_window, masked=masked)
 
 
 class RasterAssembler:
@@ -573,6 +644,46 @@ def _require_grid(source, grid: GridSpec, name: str) -> None:
     ):
         raise RasterGridError(
             f"Aligned raster {name} does not match the canonical grid"
+        )
+
+
+def _require_covering_grid(source, grid: GridSpec, name: str) -> None:
+    if source.count != 1 or source.crs is None:
+        raise RasterGridError(
+            f"Covering raster {name} must be single-band and declare a CRS"
+        )
+    if CRS.from_user_input(source.crs) != grid.crs:
+        raise RasterGridError(
+            f"Covering raster {name} CRS does not match the canonical grid"
+        )
+    transform = source.transform
+    if transform.b != 0 or transform.d != 0 or transform.a <= 0 or transform.e >= 0:
+        raise RasterGridError(f"Covering raster {name} must be north-up")
+    if not (
+        math.isclose(transform.a, grid.transform.a)
+        and math.isclose(transform.e, grid.transform.e)
+    ):
+        raise RasterGridError(
+            f"Covering raster {name} resolution does not match the canonical grid"
+        )
+    col = (grid.transform.c - transform.c) / transform.a
+    row = (grid.transform.f - transform.f) / transform.e
+    if not (
+        math.isclose(col, round(col), abs_tol=1e-7)
+        and math.isclose(row, round(row), abs_tol=1e-7)
+    ):
+        raise RasterGridError(
+            f"Covering raster {name} origin is not aligned to the canonical grid"
+        )
+    tolerance = 1e-7
+    if (
+        grid.bounds[0] < source.bounds.left - tolerance
+        or grid.bounds[1] < source.bounds.bottom - tolerance
+        or grid.bounds[2] > source.bounds.right + tolerance
+        or grid.bounds[3] > source.bounds.top + tolerance
+    ):
+        raise RasterGridError(
+            f"Covering raster {name} does not cover the canonical grid"
         )
 
 

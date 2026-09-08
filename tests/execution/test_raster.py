@@ -15,14 +15,94 @@ from mgb_vec_hydro.execution.executor import WorkerContext
 from mgb_vec_hydro.execution.publication import AtomicOutputDirectory
 from mgb_vec_hydro.execution.raster import (
     AlignedRasterReader,
+    CoveringRasterReader,
     RasterAssembler,
     RasterPatch,
     RasterProductSpec,
+    grid_from_dem,
     packet_raster_units,
     packet_raster_units_by_block,
+    plan_raster_blocks,
     plan_raster_units,
-    grid_from_dem,
 )
+
+
+def test_raster_blocks_are_row_major_and_include_edge_windows():
+    from mgb_vec_hydro.preparation import GridSpec
+
+    grid = GridSpec(
+        rasterio.crs.CRS.from_epsg(3857),
+        from_origin(0, 5, 1, 1),
+        5,
+        3,
+    )
+    assert tuple(plan_raster_blocks(grid, block_size=2)) == (
+        Window(0, 0, 2, 2),
+        Window(2, 0, 2, 2),
+        Window(4, 0, 1, 2),
+        Window(0, 2, 2, 1),
+        Window(2, 2, 2, 1),
+        Window(4, 2, 1, 1),
+    )
+    with pytest.raises(RasterGridError, match="positive integer"):
+        plan_raster_blocks(grid, block_size=0)
+
+
+def test_covering_raster_reader_maps_target_windows_and_reuses_handle(
+    tmp_path, prepared_execution_dataset
+):
+    grid = grid_from_dem(prepared_execution_dataset / "dem.tif")
+    covering = tmp_path / "covering.tif"
+    values = np.arange(20, dtype="int16").reshape(4, 5)
+    with rasterio.open(
+        covering,
+        "w",
+        driver="GTiff",
+        width=5,
+        height=4,
+        count=1,
+        dtype="int16",
+        crs="EPSG:3857",
+        transform=from_origin(-10, 30, 10, 10),
+    ) as target:
+        target.write(values, 1)
+
+    context = WorkerContext(mp.get_context("spawn").BoundedSemaphore(1), 2)
+    try:
+        reader = CoveringRasterReader(grid, {"source": covering}, context)
+        assert reader.source("source") is reader.source("source")
+        np.testing.assert_array_equal(
+            reader.read("source", Window(1, 0, 2, 2)),
+            values[1:3, 2:4],
+        )
+    finally:
+        context.close()
+
+
+def test_covering_raster_reader_rejects_noncovering_or_misaligned_sources(
+    tmp_path, prepared_execution_dataset
+):
+    grid = grid_from_dem(prepared_execution_dataset / "dem.tif")
+    path = tmp_path / "small.tif"
+    with rasterio.open(
+        path,
+        "w",
+        driver="GTiff",
+        width=2,
+        height=2,
+        count=1,
+        dtype="float32",
+        crs="EPSG:3857",
+        transform=from_origin(0, 20, 10, 10),
+    ) as target:
+        target.write(np.ones((2, 2), dtype="float32"), 1)
+    context = WorkerContext(mp.get_context("spawn").BoundedSemaphore(1), 2)
+    try:
+        reader = CoveringRasterReader(grid, {"small": path}, context)
+        with pytest.raises(RasterGridError, match="does not cover"):
+            reader.source("small")
+    finally:
+        context.close()
 
 
 def test_raster_units_use_covering_windows_spatial_order_and_bounded_packets(

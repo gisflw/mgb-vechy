@@ -7,7 +7,14 @@ def test_public_stage_commands_expose_their_primary_inputs():
     expected = {
         "define-roi": ("--catchments", "--segments", "--outlet-id"),
         "aggregate": ("--roi-catchments", "--roi-segments", "--uparea-min", "--lmin"),
-        "prepare": ("--dem", "--mini-catchments", "--mini-segments", "--output-dir"),
+        "prepare": (
+            "--dem",
+            "--mini-catchments",
+            "--mini-segments",
+            "--workers",
+            "--io-slots",
+            "--output-dir",
+        ),
         "terrain-products": (
             "--dem",
             "--mini-ownership",

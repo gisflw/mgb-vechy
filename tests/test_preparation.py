@@ -2,13 +2,17 @@ import numpy as np
 import pandas as pd
 import pytest
 import rasterio
-from rasterio.transform import from_origin
 from pyproj import CRS
+from rasterio.transform import from_origin
 from shapely.geometry import LineString, Polygon
 
 from mgb_vec_hydro.aggregation import AggregationSpec, aggregate_roi_dataset
+from mgb_vec_hydro.exceptions import (
+    PreparedDataError,
+    WorkerExecutionError,
+    WorkMemoryError,
+)
 from mgb_vec_hydro.execution.vector import VectorTable, write_vector_table
-from mgb_vec_hydro.exceptions import PreparedDataError
 from mgb_vec_hydro.preparation import (
     GridSpec,
     NamedRaster,
@@ -37,6 +41,53 @@ def _write_raster(path, *, dtype="float32", values=None):
         transform=from_origin(0, 20, 10, 10),
     ) as target:
         target.write(values, 1)
+
+
+def _write_multiblock_raster(path, values, dtype):
+    values = np.asarray(values, dtype=dtype)
+    with rasterio.open(
+        path,
+        "w",
+        driver="GTiff",
+        width=values.shape[1],
+        height=values.shape[0],
+        count=1,
+        dtype=dtype,
+        crs="EPSG:3857",
+        transform=from_origin(0, values.shape[0], 1, 1),
+    ) as target:
+        target.write(values, 1)
+
+
+def _write_multiblock_minis(tmp_path, size):
+    attributes = {
+        "id": [1],
+        "id_down": [None],
+        "sub": [1],
+        "strahler_order": [1],
+        "unit_length": [1.0],
+        "upstream_length": [1.0],
+        "unit_area": [1.0],
+        "upstream_area": [1.0],
+        "water_course": [1],
+    }
+    catchments = VectorTable.from_pydict(
+        attributes,
+        [Polygon([(0, 0), (size, 0), (size, size), (0, size)])],
+        crs="EPSG:3857",
+        geometry_type="Polygon",
+    )
+    segments = VectorTable.from_pydict(
+        attributes,
+        [LineString([(0, size / 2), (size, size / 2)])],
+        crs="EPSG:3857",
+        geometry_type="LineString",
+    )
+    catchment_path = tmp_path / "mini_catchments.fgb"
+    segment_path = tmp_path / "mini_segments.fgb"
+    write_vector_table(catchments, catchment_path, driver="FlatGeobuf")
+    write_vector_table(segments, segment_path, driver="FlatGeobuf")
+    return catchment_path, segment_path
 
 
 def test_prepare_pipeline_publishes_valid_canonical_dataset(tmp_path):
@@ -123,6 +174,125 @@ def test_prepare_pipeline_publishes_valid_canonical_dataset(tmp_path):
     for name in ("dem", "land"):
         with rasterio.open(report.output_dir / f"{name}.tif") as source:
             assert source.tags(ns="IMAGE_STRUCTURE")["LAYOUT"] == "COG"
+
+
+def test_parallel_preparation_matches_serial_across_multiple_blocks(tmp_path):
+    size = 1024
+    dem = tmp_path / "large-dem.tif"
+    land = tmp_path / "large-land.tif"
+    d8 = tmp_path / "large-d8.tif"
+    values = np.arange(size * size, dtype="float32").reshape(size, size)
+    _write_multiblock_raster(dem, values, "float32")
+    _write_multiblock_raster(land, (values.astype("int32") % 7) + 1, "int32")
+    _write_multiblock_raster(d8, np.full((size, size), 64, dtype="uint8"), "uint8")
+    catchments, segments = _write_multiblock_minis(tmp_path, size)
+
+    reports = {}
+    for workers in (1, 2):
+        reports[workers] = prepare_dataset(
+            PreparationSpec(
+                dem=dem,
+                mini_catchments=catchments,
+                mini_segments=segments,
+                rasters=(NamedRaster("land", land, "categorical"),),
+                d8=d8,
+                d8_encoding="esri",
+                output_dir=tmp_path / f"prepared-{workers}",
+                workers=workers,
+                io_slots=2,
+                memory_limit_mb=128,
+                buffer_cells=0,
+            )
+        )
+
+    assert reports[2].execution.task_count == 4
+    assert reports[2].execution.submitted == 4
+    assert reports[2].execution.peak_admitted_bytes <= 128 * 1024 * 1024
+    assert (
+        len(
+            {
+                diagnostic["worker_pid"]
+                for diagnostic in reports[2].execution.worker_diagnostics
+            }
+        )
+        == 2
+    )
+    for name in ("dem", "land", "d8", "mini_ownership", "drainage"):
+        with (
+            rasterio.open(reports[1].output_dir / f"{name}.tif") as serial,
+            rasterio.open(reports[2].output_dir / f"{name}.tif") as parallel,
+        ):
+            assert serial.profile == parallel.profile
+            np.testing.assert_array_equal(serial.read(1), parallel.read(1))
+            np.testing.assert_array_equal(
+                serial.dataset_mask(), parallel.dataset_mask()
+            )
+    pd.testing.assert_frame_equal(
+        pd.read_parquet(reports[1].mini_index),
+        pd.read_parquet(reports[2].mini_index),
+    )
+    with rasterio.open(reports[2].d8) as normalized:
+        assert np.all(normalized.read(1, masked=True).compressed() == 1)
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("workers", 0, "workers must be a positive integer"),
+        ("workers", 5, "workers cannot exceed four"),
+        ("io_slots", 0, "I/O slots must be a positive integer"),
+    ],
+)
+def test_preparation_rejects_invalid_execution_limits(tmp_path, field, value, message):
+    dem = tmp_path / "dem.tif"
+    _write_raster(dem)
+    catchments, segments = _write_multiblock_minis(tmp_path, 20)
+    arguments = {
+        "dem": dem,
+        "mini_catchments": catchments,
+        "mini_segments": segments,
+        "output_dir": tmp_path / "prepared",
+        "buffer_cells": 0,
+        field: value,
+    }
+    with pytest.raises(PreparedDataError, match=message):
+        prepare_dataset(PreparationSpec(**arguments))
+
+
+def test_preparation_enforces_block_memory_and_cleans_worker_failures(tmp_path):
+    dem = tmp_path / "dem.tif"
+    invalid = tmp_path / "invalid.tif"
+    _write_raster(dem)
+    _write_raster(invalid, values=[[1.5, 1], [2, 2]])
+    catchments, segments = _write_multiblock_minis(tmp_path, 20)
+    common = {
+        "dem": dem,
+        "mini_catchments": catchments,
+        "mini_segments": segments,
+        "buffer_cells": 0,
+        "workers": 1,
+    }
+    with pytest.raises(WorkMemoryError, match="block-"):
+        prepare_dataset(
+            PreparationSpec(
+                **common,
+                output_dir=tmp_path / "too-small",
+                memory_limit_mb=1,
+            )
+        )
+    assert not (tmp_path / "too-small").exists()
+
+    with pytest.raises(WorkerExecutionError, match="non-integral"):
+        prepare_dataset(
+            PreparationSpec(
+                **common,
+                rasters=(NamedRaster("invalid", invalid, "categorical"),),
+                output_dir=tmp_path / "worker-failed",
+                memory_limit_mb=32,
+            )
+        )
+    assert not (tmp_path / "worker-failed").exists()
+    assert not list(tmp_path.glob(".worker-failed.tmp-*"))
 
 
 def test_joint_ownership_covers_union_and_shared_boundary_is_stable():
@@ -225,24 +395,28 @@ def test_connectivity_selects_by_drainage_then_size_then_first_cell():
     drainage[0, 0] = True
     drainage[2, 0] = True
     drainage[0, 5] = True
-    components, sizes, drain_counts, first = _label_components(owned, drainage)
+    _, sizes, drain_counts, first = _label_components(owned, drainage)
     candidates = np.flatnonzero(drain_counts[1:] > 0) + 1
     selected = min(
         candidates,
         key=lambda value: (
-            -int(drain_counts[value]), -int(sizes[value]), int(first[value])
+            -int(drain_counts[value]),
+            -int(sizes[value]),
+            int(first[value]),
         ),
     )
     assert sizes[selected] == 3
 
     # Equal drainage and size falls back to the row-major first cell.
     owned[2, 0:3] = False
-    components, sizes, drain_counts, first = _label_components(owned, drainage)
+    _, sizes, drain_counts, first = _label_components(owned, drainage)
     candidates = np.flatnonzero(drain_counts[1:] > 0) + 1
     selected = min(
         candidates,
         key=lambda value: (
-            -int(drain_counts[value]), -int(sizes[value]), int(first[value])
+            -int(drain_counts[value]),
+            -int(sizes[value]),
+            int(first[value]),
         ),
     )
     assert first[selected] == 0
@@ -258,7 +432,6 @@ def test_joint_drainage_recovers_matching_line_hidden_by_stable_burn_order():
     drainage = _rasterize_drainage_block(
         segments,
         np.asarray([1, 2], dtype="int32"),
-        np.asarray([1, 0]),
         ownership,
         valid,
         from_origin(0, 1, 1, 1),

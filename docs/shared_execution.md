@@ -53,13 +53,20 @@ published vector files are root-level files.
 `plan_raster_units` maps complete mini bounds to covering grid windows and
 orders them by deterministic Morton block key. `packet_raster_units` and
 `packet_raster_units_by_block` charge conservative memory estimates without
-splitting a mini.
+splitting a mini. `plan_raster_blocks` produces complete canonical blocks in
+row-major order for stages whose deterministic reducer depends on neighboring
+blocks.
 
 `AlignedRasterReader` accepts a direct map of raster names to COG paths. It
 validates each source against the canonical CRS, transform, dimensions, band,
 nodata, COG, and internal-mask contract, then reuses handles in each worker.
-All raster stages use this reader; there is no directory or manifest-backed
-raster reader. Reads require bounded integer windows.
+Downstream raster stages use this reader; there is no directory or
+manifest-backed raster reader. Reads require bounded integer windows.
+
+Preparation uses `CoveringRasterReader` for source rasters that share the
+canonical resolution and pixel origin but cover a larger extent. It maps
+canonical block windows to exact source windows, reuses worker-local handles,
+and participates in the same shared I/O semaphore.
 
 `RasterAssembler` is coordinator-only. It merges valid cells from bounded
 `RasterPatch` values, rejects duplicate ownership, supports exclusive initial
@@ -75,7 +82,8 @@ direct path; terrain does not copy or republish it.
 
 ROI and aggregation use bounded vector packets and coordinator-side grouped
 geometry publication. Preparation clips aligned sources and rasterizes strict
-ownership/drainage with deterministic connectivity correction. Terrain reads
+ownership/drainage in bounded parallel blocks, with deterministic ordered
+reduction and coordinator-only connectivity correction. Terrain reads
 direct COG windows for complete minis and assembles HAND, LTND, and optional
 flow direction. Sampling derives block-aware packets and reduces exact mini
 statistics into the single sampled CSV.

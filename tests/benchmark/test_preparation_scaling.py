@@ -11,9 +11,12 @@ from pathlib import Path
 
 import numpy as np
 import pytest
-from shapely.geometry import LineString, box
+import rasterio
+from rasterio.transform import from_origin
+from shapely.geometry import LineString, Polygon, box
 
 from mgb_vec_hydro.execution.vector import VectorTable, write_vector_table
+from mgb_vec_hydro.preparation import PreparationSpec, prepare_dataset
 from mgb_vec_hydro.roi import RoiSpec, define_roi_dataset
 
 pytestmark = pytest.mark.skipif(
@@ -95,3 +98,84 @@ def test_peak_memory_does_not_scale_with_feature_count(tmp_path, record_property
     record_property("small_peak_rss_kb", small)
     record_property("large_peak_rss_kb", large)
     assert large < small * 2
+
+
+def _write_preparation_inputs(root: Path, size: int):
+    transform = from_origin(0, size, 1, 1)
+    dem = root / "dem.tif"
+    with rasterio.open(
+        dem,
+        "w",
+        driver="GTiff",
+        width=size,
+        height=size,
+        count=1,
+        dtype="float32",
+        crs="EPSG:3857",
+        transform=transform,
+    ) as target:
+        rows = np.arange(size, dtype="float32")
+        target.write(np.broadcast_to(rows[:, None], (size, size)), 1)
+    attributes = {
+        "id": [1],
+        "id_down": [None],
+        "sub": [1],
+        "strahler_order": [1],
+        "unit_length": [1.0],
+        "upstream_length": [1.0],
+        "unit_area": [1.0],
+        "upstream_area": [1.0],
+        "water_course": [1],
+    }
+    catchments = root / "mini_catchments.fgb"
+    segments = root / "mini_segments.fgb"
+    write_vector_table(
+        VectorTable.from_pydict(
+            attributes,
+            [Polygon([(0, 0), (size, 0), (size, size), (0, size)])],
+            crs="EPSG:3857",
+            geometry_type="Polygon",
+        ),
+        catchments,
+        driver="FlatGeobuf",
+    )
+    write_vector_table(
+        VectorTable.from_pydict(
+            attributes,
+            [LineString([(0, size / 2), (size, size / 2)])],
+            crs="EPSG:3857",
+            geometry_type="LineString",
+        ),
+        segments,
+        driver="FlatGeobuf",
+    )
+    return dem, catchments, segments
+
+
+def test_preparation_reports_serial_and_parallel_throughput(tmp_path, record_property):
+    dem, catchments, segments = _write_preparation_inputs(tmp_path, 1536)
+    for workers in (1, 4):
+        report = prepare_dataset(
+            PreparationSpec(
+                dem=dem,
+                mini_catchments=catchments,
+                mini_segments=segments,
+                output_dir=tmp_path / f"prepared-{workers}",
+                workers=workers,
+                memory_limit_mb=256,
+                io_slots=2,
+                buffer_cells=0,
+            )
+        )
+        record_property(f"workers_{workers}_total_seconds", report.timings["total"])
+        record_property(
+            f"workers_{workers}_execution_seconds", report.execution.wall_seconds
+        )
+        record_property(
+            f"workers_{workers}_peak_admitted_bytes",
+            report.execution.peak_admitted_bytes,
+        )
+        record_property(
+            f"workers_{workers}_worker_processes",
+            len({value["worker_pid"] for value in report.execution.worker_diagnostics}),
+        )

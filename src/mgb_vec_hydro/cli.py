@@ -66,6 +66,10 @@ def _echo_timings(timings: dict[str, float]) -> None:
     show_default=True,
 )
 @click.option(
+    "--workers", type=click.IntRange(min=1, max=4), default=4, show_default=True
+)
+@click.option("--io-slots", type=click.IntRange(min=1), default=2, show_default=True)
+@click.option(
     "--buffer-cells", type=click.IntRange(min=0), default=1, show_default=True
 )
 @click.option(
@@ -82,6 +86,8 @@ def prepare_command(
     d8: Path | None,
     d8_encoding: str | None,
     memory_limit_mb: int,
+    workers: int,
+    io_slots: int,
     buffer_cells: int,
     output_dir: Path,
 ) -> None:
@@ -99,7 +105,9 @@ def prepare_command(
                 rasters=rasters,
                 d8=d8,
                 d8_encoding=d8_encoding,
+                workers=workers,
                 memory_limit_mb=memory_limit_mb,
+                io_slots=io_slots,
                 buffer_cells=buffer_cells,
                 output_dir=output_dir,
             )

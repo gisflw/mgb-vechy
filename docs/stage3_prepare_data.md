@@ -19,6 +19,13 @@ band. No implicit reprojection or resampling is performed. Optional D8 input
 requires `--d8-encoding canonical|esri` and is normalized to canonical
 clockwise codes. COGs use 512-pixel tiles and internal validity masks.
 
+Source clipping, domain masking, ownership and drainage rasterization, and
+local connectivity labeling run as bounded 512-pixel block tasks through the
+shared process executor. Results may finish out of order, but the coordinator
+reduces them in row-major order and is the only process that writes working
+rasters. Use `--workers` and `--io-slots` to control CPU and concurrent source
+reads.
+
 Preparation derives its raster domain from the explicit mini-catchment file.
 Catchments and matching segments are jointly rasterized in deterministic
 512-pixel blocks. Ownership exactly covers the center-of-pixel catchment union;
@@ -49,6 +56,7 @@ prepared/
 
 There is no `manifest.json` and no nested output directory. All files are
 validated before the private staging directory is atomically renamed into
-place. Defaults are 512 MB and one native DEM-cell buffer. Existing output
-directories are rejected and staging-only working files are removed before
-publication. The CLI prints every concrete file path written.
+place. Defaults are four workers, 512 MB of admitted block memory, two I/O
+slots, and one native DEM-cell buffer. Existing output directories are rejected
+and staging-only working files are removed before publication. The CLI prints
+every concrete file path written.
