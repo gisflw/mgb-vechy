@@ -186,15 +186,20 @@ def _prepare_dataset(spec: PreparationSpec) -> PreparationReport:
     )
     segments = np.asarray([segments_by_id[value] for value in ordered], dtype=object)
     dense_labels = np.arange(1, len(ordered) + 1, dtype="int32")
-    domain = shapely.union_all(catchments)
-    if domain.is_empty:
+    domain_bounds = shapely.total_bounds(catchments)
+    if not np.all(np.isfinite(domain_bounds)):
         raise PreparedDataError("Mini-catchment domain is empty")
     with rasterio.open(spec.dem) as dem:
         _require_source_grid(dem, target_crs, "DEM")
         buffer_distance = spec.buffer_cells * abs(dem.transform.a)
-        buffered_domain = domain.buffer(buffer_distance)
         window = (
-            from_bounds(*buffered_domain.bounds, transform=dem.transform)
+            from_bounds(
+                float(domain_bounds[0] - buffer_distance),
+                float(domain_bounds[1] - buffer_distance),
+                float(domain_bounds[2] + buffer_distance),
+                float(domain_bounds[3] + buffer_distance),
+                transform=dem.transform,
+            )
             .round_offsets()
             .round_lengths()
         )
