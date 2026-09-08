@@ -13,6 +13,23 @@ mgb-vec-hydro aggregate \
   --output-dir minis
 ```
 
+## Options
+
+| Option | Status | Type/default | Meaning |
+| --- | --- | --- | --- |
+| `--roi-catchments` | Required | Existing FlatGeobuf path | Normalized Stage 1 catchment file used as the authoritative CRS and source-unit input. |
+| `--roi-segments` | Required | Existing FlatGeobuf path | Normalized Stage 1 segment file containing topology and reach attributes. |
+| `--uparea-min` | Required | Non-negative number | Minimum `upstream_area` threshold for a segment to be eligible as a mini-basin reach; uses normalized area units (km²). |
+| `--lmin` | Required | Non-negative number | Minimum evolving mini length used when short chains are iteratively merged; uses normalized length units (km). |
+| `--output-dir` | Required | Directory path | New directory where the mini vectors and `source_to_mini.csv` are published. |
+| `--workers` | Optional | Positive integer; default `4` | Number of worker processes used for bounded vector work. There is no upper limit imposed by the CLI or stage validator. |
+| `--memory-limit-mb` | Optional | Positive integer MB; default `512` | Memory budget used to size bounded processing packets. |
+| `--io-slots` | Optional | Positive integer; default `2` | Maximum number of concurrent vector-I/O operations. |
+| `--batch-size` | Optional | Positive integer rows; default `10000` | Number of rows processed per bounded vector batch. |
+| `--checkpoint-dir` | Optional | Directory path | Scratch location for resumable aggregation work; it must be outside `--output-dir`. |
+
+Click also provides `--help` to display the command’s generated option list.
+
 Segments with `upstream_area >= uparea_min` are eligible reaches. Every source
 catchment remains in processing: below-threshold sources are mapped to an
 eligible mini using the same-water-course rule, then the same-`sub` fallback.
@@ -40,6 +57,7 @@ minis/
 There is no `manifest.json` and no nested output directory. Both FlatGeobuf
 files preserve the normalized ten-column schema and the authoritative CRS.
 The files are staged privately, validated, and atomically published. Defaults
-are 512 MB, four workers, two I/O operations, and 10,000-row batches.
+are 512 MB, four workers, two I/O operations, and 10,000-row batches. Worker
+counts may be any positive integer.
 `--checkpoint-dir` is optional scratch state outside `--output-dir` and is
 removed after successful publication.

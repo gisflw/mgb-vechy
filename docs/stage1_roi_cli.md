@@ -16,6 +16,30 @@ mgb-vec-hydro define-roi \
   --output-dir roi
 ```
 
+## Options
+
+| Option | Status | Type/default | Meaning |
+| --- | --- | --- | --- |
+| `--crs` | Required | CRS text | Target CRS for the published ROI; geographic and projected CRSs are supported. |
+| `--catchments` | Required | Existing vector path | Catchment provider containing the source catchment polygons. |
+| `--catchments-layer` | Optional | Layer name | Selects a layer when the catchment provider contains multiple layers. |
+| `--catchments-source-crs` | Optional | CRS text | Overrides missing or incorrect CRS metadata for the catchment provider. |
+| `--segments` | Required | Existing vector path | Segment provider containing the source network and topology attributes. |
+| `--segments-layer` | Optional | Layer name | Selects a layer when the segment provider contains multiple layers. |
+| `--segments-source-crs` | Optional | CRS text | Overrides missing or incorrect CRS metadata for the segment provider. |
+| `--outlet-id` | Required; repeatable | Text | Segment ID of an outlet; provide one or more outlets whose upstream union defines the ROI. |
+| `--id-col` | Required | Field name | Source field containing the segment/catchment identifier. |
+| `--id-down-col` | Required | Field name | Segment field containing the downstream segment identifier; null values represent sinks. |
+| `--strahler-order-col` | Required | Field name | Segment field containing the Strahler order used during topology filtering. |
+| `--output-dir` | Required | Directory path | New directory where `roi_catchments.fgb` and `roi_segments.fgb` are published. |
+| `--workers` | Optional | Positive integer; default `4` | Number of worker processes used for bounded geometry work. There is no upper limit imposed by the CLI or stage validator. |
+| `--memory-limit-mb` | Optional | Positive integer MB; default `512` | Memory budget used to size bounded processing packets. |
+| `--io-slots` | Optional | Positive integer; default `2` | Maximum number of concurrent source-I/O operations. |
+| `--batch-size` | Optional | Positive integer rows; default `10000` | Number of provider rows inspected per bounded attribute scan. |
+| `--checkpoint-dir` | Optional | Directory path | Scratch location for resumable geometry packets; it must be outside `--output-dir`. |
+
+Click also provides `--help` to display the command’s generated option list.
+
 Use `--catchments-layer` and `--segments-layer` for multi-layer containers.
 `--catchments-source-crs` and `--segments-source-crs` are the only source-CRS
 overrides; they replace missing or incorrect provider metadata. The target
@@ -47,5 +71,6 @@ roi/
 
 There is no `manifest.json` and no nested output directory. The report and
 CLI status identify both concrete paths. Defaults are 512 MB, four workers,
-two concurrent I/O operations, and 10,000-row scans. Checkpoints are scratch
-state outside `--output-dir` and are removed after successful publication.
+two concurrent I/O operations, and 10,000-row scans. Worker counts may be any
+positive integer. Checkpoints are scratch state outside `--output-dir` and are
+removed after successful publication.

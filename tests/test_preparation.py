@@ -237,7 +237,6 @@ def test_parallel_preparation_matches_serial_across_multiple_blocks(tmp_path):
     ("field", "value", "message"),
     [
         ("workers", 0, "workers must be a positive integer"),
-        ("workers", 5, "workers cannot exceed four"),
         ("io_slots", 0, "I/O slots must be a positive integer"),
     ],
 )

@@ -724,8 +724,8 @@ def _validate_spec(spec):
     ):
         if not Path(path).is_file():
             raise InvalidInputSchemaError(f"{name} input is not a local file: {path}")
-    if spec.workers <= 0 or spec.workers > 4:
-        raise InvalidInputSchemaError("workers must be between one and four")
+    if spec.workers <= 0:
+        raise InvalidInputSchemaError("workers must be a positive integer")
     if spec.memory_limit_mb <= 0 or spec.io_slots <= 0 or spec.batch_size <= 0:
         raise InvalidInputSchemaError("execution limits must be positive")
     if spec.uparea_min < 0 or spec.lmin < 0:

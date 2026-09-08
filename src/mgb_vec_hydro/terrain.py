@@ -1170,8 +1170,6 @@ def _validate_terrain_spec(spec: TerrainSpec) -> None:
     ):
         if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
             raise TerrainProductsError(f"{name} must be a positive integer")
-    if spec.workers > 4:
-        raise TerrainProductsError("workers cannot exceed four")
     output = Path(spec.output_dir)
     if output.exists():
         raise TerrainProductsError(f"Output directory already exists: {output}")

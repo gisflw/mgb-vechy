@@ -13,6 +13,24 @@ mgb-vec-hydro prepare \
   --output-dir prepared
 ```
 
+## Options
+
+| Option | Status | Type/default | Meaning |
+| --- | --- | --- | --- |
+| `--dem` | Required | Existing raster path | DEM defining the canonical CRS, resolution, orientation, and raster grid. |
+| `--mini-catchments` | Required | Existing vector path | Aggregated mini-catchment polygons used to define ownership and the prepared domain. |
+| `--mini-segments` | Required | Existing vector path | Aggregated mini-segment lines used to create drainage and validate the mini domain. |
+| `--continuous-raster` | Optional; repeatable | `NAME PATH` | Named single-band continuous raster to clip and publish as `<name>.tif`; names must be valid and non-reserved. |
+| `--categorical-raster` | Optional; repeatable | `NAME PATH` | Named single-band categorical raster to clip and publish as `<name>.tif`; names must be valid and non-reserved. |
+| `--d8` | Optional; conditional | Existing raster path | Optional D8 raster to normalize and publish as `d8.tif`; must be supplied together with `--d8-encoding`. |
+| `--d8-encoding` | Optional; conditional | `canonical` or `esri` | Encoding of `--d8`; must be supplied together with `--d8`. Output is normalized to canonical clockwise codes. |
+| `--memory-limit-mb` | Optional | Positive integer MB; default `512` | Admitted memory budget used to size bounded raster block tasks. |
+| `--workers` | Optional | Positive integer; default `4` | Number of worker processes used for bounded block processing. There is no upper limit imposed by the CLI or stage validator. |
+| `--io-slots` | Optional | Positive integer; default `2` | Maximum number of concurrent source-raster reads. |
+| `--output-dir` | Required | Directory path | New directory where prepared COGs, ownership, drainage, and the shared mini index are published. |
+
+Click also provides `--help` to display the command’s generated option list.
+
 The DEM defines the native resolution and orientation. Source rasters must
 already be aligned, cover the buffered mini-catchment domain, and use a single
 band. No implicit reprojection or resampling is performed. Optional D8 input
@@ -57,6 +75,7 @@ prepared/
 There is no `manifest.json` and no nested output directory. All files are
 validated before the private staging directory is atomically renamed into
 place. Defaults are four workers, 512 MB of admitted block memory, two I/O
-slots, and one native DEM-cell buffer. Existing output directories are rejected
+slots, and one native DEM-cell buffer; worker counts may be any positive integer.
+Existing output directories are rejected
 and staging-only working files are removed before publication. The CLI prints
 every concrete file path written.

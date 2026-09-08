@@ -423,8 +423,6 @@ def _validate_spec(spec: RoiSpec) -> None:
     ):
         if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
             raise InvalidInputSchemaError(f"{name} must be a positive integer")
-    if spec.workers > 4:
-        raise InvalidInputSchemaError("workers cannot exceed four")
     parse_crs(spec.crs)
     if spec.checkpoint_dir is not None:
         output = Path(spec.output_dir).resolve()

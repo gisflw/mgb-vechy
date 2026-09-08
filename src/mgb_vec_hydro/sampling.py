@@ -280,8 +280,6 @@ def _validate_spec(spec: MiniSamplingSpec) -> None:
     ):
         if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
             raise MiniSamplingError(f"{name} must be a positive integer")
-    if spec.workers > 4:
-        raise MiniSamplingError("workers cannot exceed four")
     for name, path in (
         ("mini catchments", spec.mini_catchments),
         ("mini segments", spec.mini_segments),

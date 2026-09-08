@@ -18,6 +18,28 @@ mgb-vec-hydro sample-minis \
   --output-dir sampled
 ```
 
+## Options
+
+| Option | Status | Type/default | Meaning |
+| --- | --- | --- | --- |
+| `--mini-catchments` | Required | Existing vector path | Aggregated mini-catchment polygons and normalized mini attributes. |
+| `--mini-segments` | Required | Existing vector path | Aggregated mini-segment lines and normalized reach attributes. |
+| `--mini-index` | Required | Existing Parquet path | Shared six-column mini index whose IDs and labels must match the mini vectors. |
+| `--dem` | Required | Existing raster path | Prepared DEM and authoritative canonical grid for sampling. |
+| `--mini-ownership` | Required | Existing raster path | Dense ownership labels used to select catchment cells for each mini. |
+| `--drainage` | Required | Existing raster path | Drainage labels used to select reach cells for each mini. |
+| `--hand` | Required | Existing raster path | Terrain height-above-drainage raster used for reach and tributary statistics. |
+| `--ltnd` | Required | Existing raster path | Local terrain-to-drainage distance raster used for tributary statistics. |
+| `--hru` | Required | Existing raster path | Integer categorical HRU raster; sampled classes must be in `1..100`. |
+| `--output-dir` | Required | Directory path | New directory where `sampled_minis.csv` is published. |
+| `--workers` | Optional | Positive integer; default `4` | Number of worker processes used for bounded sampling packets. There is no upper limit imposed by the CLI or stage validator. |
+| `--memory-limit-mb` | Optional | Positive integer MB; default `512` | Memory budget used to size bounded raster sampling packets. |
+| `--io-slots` | Optional | Positive integer; default `2` | Maximum number of concurrent raster reads. |
+| `--batch-size` | Optional | Positive integer rows; default `10000` | Batch size used when reading vector metadata. |
+| `--checkpoint-dir` | Optional | Directory path | Scratch location for resumable sampling packets; it must be outside `--output-dir`. |
+
+Click also provides `--help` to display the command’s generated option list.
+
 The DEM is authoritative for CRS and canonical grid. Both mini vectors must
 declare that CRS, use the exact aggregation schema, and contain the same IDs
 as the six-column `mini_index.parquet`. All six raster inputs must be
@@ -45,3 +67,5 @@ longitude/latitude, reach slope, tributary length and slope, and sorted
 `hru_<id>_pct` columns summing to 100% for every mini. Optional
 `--checkpoint-dir` is operational scratch outside `--output-dir`; it is
 removed after successful publication. The CLI prints the concrete CSV path.
+Execution defaults are four workers, 512 MB of admitted task memory, two I/O
+slots, and 10,000-row batches. Worker counts may be any positive integer.

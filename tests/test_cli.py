@@ -41,6 +41,21 @@ def test_public_stage_commands_expose_their_primary_inputs():
         assert all(option in result.output for option in options)
 
 
+def test_worker_options_have_no_artificial_upper_bound():
+    runner = CliRunner()
+    for command in (
+        "define-roi",
+        "aggregate",
+        "prepare",
+        "terrain-products",
+        "sample-minis",
+    ):
+        result = runner.invoke(main, [command, "--help"])
+        assert result.exit_code == 0
+        assert "x>=1" in result.output
+        assert "x<=4" not in result.output
+
+
 def test_manifest_backed_directory_options_are_removed():
     expected = {
         "prepare": ("--minis",),

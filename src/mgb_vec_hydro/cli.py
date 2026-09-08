@@ -66,7 +66,7 @@ def _echo_timings(timings: dict[str, float]) -> None:
     show_default=True,
 )
 @click.option(
-    "--workers", type=click.IntRange(min=1, max=4), default=4, show_default=True
+    "--workers", type=click.IntRange(min=1), default=4, show_default=True
 )
 @click.option("--io-slots", type=click.IntRange(min=1), default=2, show_default=True)
 @click.option(
@@ -147,7 +147,7 @@ def prepare_command(
     required=True,
 )
 @click.option(
-    "--workers", type=click.IntRange(min=1, max=4), default=4, show_default=True
+    "--workers", type=click.IntRange(min=1), default=4, show_default=True
 )
 @click.option(
     "--memory-limit-mb", type=click.IntRange(min=1), default=512, show_default=True
@@ -228,7 +228,7 @@ def define_roi_command(
     required=True,
 )
 @click.option(
-    "--workers", type=click.IntRange(min=1, max=4), default=4, show_default=True
+    "--workers", type=click.IntRange(min=1), default=4, show_default=True
 )
 @click.option(
     "--memory-limit-mb", type=click.IntRange(min=1), default=512, show_default=True
@@ -336,7 +336,7 @@ def aggregate_command(
     help="AGREE conditioning radius in raster pixels.",
 )
 @click.option(
-    "--workers", type=click.IntRange(min=1, max=4), default=4, show_default=True
+    "--workers", type=click.IntRange(min=1), default=4, show_default=True
 )
 @click.option(
     "--memory-limit-mb", type=click.IntRange(min=1), default=512, show_default=True
@@ -461,7 +461,7 @@ def terrain_products_command(
     "--output-dir", type=click.Path(file_okay=False, path_type=Path), required=True
 )
 @click.option(
-    "--workers", type=click.IntRange(min=1, max=4), default=4, show_default=True
+    "--workers", type=click.IntRange(min=1), default=4, show_default=True
 )
 @click.option(
     "--memory-limit-mb", type=click.IntRange(min=1), default=512, show_default=True
