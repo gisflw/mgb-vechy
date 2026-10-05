@@ -72,20 +72,26 @@ sampled/
 
 Rows preserve the aggregation attributes (`id`, `id_down`, `sub`, `p_order`,
 `unit_length`, `upstream_length`, `unit_area`, and `upstream_area`) without
-geometry. The output includes longitude/latitude, reach slope, tributary length
-and slope, and sorted `hru_<id>_pct` columns summing to 100% for every mini. Optional
+geometry. The output includes longitude/latitude, reach slope and reference
+elevation, tributary length and slope, `flooded_area_<stage>m_km2` columns for
+stages 1 through 100 in stage order before the HRU columns, and sorted
+`hru_<id>_pct` columns summing to 100% for every mini. Optional
 `--checkpoint-dir` is operational scratch outside `--output-dir`; it is
 removed after successful publication. The CLI prints the concrete CSV path.
 Execution defaults are four workers, 512 MB of admitted task memory, two I/O
 slots, and 10,000-row batches. Worker counts may be any positive integer.
 
-Reach slope is the difference between the 85th and 10th percentiles of reach
-DEM elevations (metres), divided by `0.75 * unit_length` (kilometres). Stage 1
-computes `unit_length` geodesically and aggregation preserves those kilometre
-metrics. Tributary length is maximum LTND divided by 1000; tributary slope is
+Reach reference elevation is the median DEM elevation of cells owned by each
+mini and marked as drainage, in metres. Reach slope is the difference between
+the 85th and 10th percentiles of those same reach elevations (metres), divided
+by `0.75 * unit_length` (kilometres). Each flooded-area column is the cumulative
+sum of full owned-cell geodesic areas in km² where HAND is at or below its stage
+in metres; negative HAND is included at every stage. Stage 1 computes
+`unit_length` geodesically and aggregation preserves those kilometre metrics.
+Tributary length is maximum LTND divided by 1000; tributary slope is
 mean HAND at cells tied for that maximum divided by tributary length. These
-formulas, percentile selection, and the six-raster block-read pattern are
-unchanged; elevation normalization and metric LTND supply their correct units.
+formulas and the six-raster block-read pattern are unchanged; elevation
+normalization and metric LTND supply their correct units.
 
 Measured preparation, terrain, and sampling costs and reproduction commands
 are in [the unit-correction performance report](sampling_units_performance.md).

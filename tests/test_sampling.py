@@ -7,12 +7,22 @@ import pytest
 import rasterio
 from affine import Affine
 from pyproj import CRS, Transformer
+from rasterio.shutil import copy as copy_raster
 from shapely.geometry import LineString, Polygon
 
 from mgb_vec_hydro.exceptions import CheckpointError, MiniSamplingError, WorkMemoryError
 from mgb_vec_hydro.execution.vector import VectorTable, write_vector_table
-from mgb_vec_hydro.preparation import NamedRaster, PreparationSpec, prepare_dataset
-from mgb_vec_hydro.sampling import MiniSamplingSpec, sample_minibasins
+from mgb_vec_hydro.preparation import (
+    GridSpec,
+    NamedRaster,
+    PreparationSpec,
+    prepare_dataset,
+)
+from mgb_vec_hydro.sampling import (
+    MiniSamplingSpec,
+    _cell_areas_km2,
+    sample_minibasins,
+)
 from mgb_vec_hydro.terrain import TerrainSpec, create_terrain_dataset
 
 
@@ -166,8 +176,12 @@ def test_sampling_rejects_legacy_units_without_publication(tmp_path, name):
     assert not spec.output_dir.exists()
 
 
-@pytest.mark.parametrize("stage,legacy_version", [("terrain", "1"), ("sampling", "2")])
-def test_metric_stages_reject_legacy_checkpoints(tmp_path, monkeypatch, stage, legacy_version):
+@pytest.mark.parametrize(
+    "stage,legacy_version", [("terrain", "1"), ("sampling", "3")]
+)
+def test_metric_stages_reject_legacy_checkpoints(
+    tmp_path, monkeypatch, stage, legacy_version
+):
     minis, prepared, terrain = _sampling_inputs(tmp_path)
     module = importlib.import_module(f"mgb_vec_hydro.{stage}")
     if stage == "sampling":
@@ -226,6 +240,39 @@ def _sampling_spec(
     )
 
 
+def _rewrite_raster(path, output, edit):
+    with rasterio.open(path) as source:
+        values = source.read(1)
+        mask = source.dataset_mask()
+        profile = source.profile.copy()
+        tags = source.tags()
+    edit(values)
+    profile["driver"] = "GTiff"
+    working = output.with_name(output.stem + "-working.tif")
+    with rasterio.open(working, "w", **profile) as target:
+        target.write(values, 1)
+        target.write_mask(mask)
+        target.update_tags(**tags)
+    copy_raster(working, output, driver="COG")
+    return output
+
+
+def _direct_cell_areas_km2(crs, transform, rows, cols):
+    source_crs = CRS.from_user_input(crs)
+    geodetic = source_crs.geodetic_crs
+    transformer = Transformer.from_crs(source_crs, geodetic, always_xy=True)
+    geod = source_crs.get_geod()
+    areas = []
+    for row, col in zip(rows, cols, strict=True):
+        x0 = transform.c + col * transform.a
+        x1 = x0 + transform.a
+        y1 = transform.f + row * transform.e
+        y0 = y1 + transform.e
+        lon, lat = transformer.transform([x0, x1, x1, x0], [y0, y0, y1, y1])
+        areas.append(abs(geod.polygon_area_perimeter(lon, lat)[0]) / 1e6)
+    return np.asarray(areas)
+
+
 def test_sampling_pipeline_is_exact_block_reusing_and_atomic(tmp_path):
     minis, prepared, terrain = _sampling_inputs(tmp_path)
     output = tmp_path / "sampled"
@@ -272,6 +319,7 @@ def test_sampling_pipeline_is_exact_block_reusing_and_atomic(tmp_path):
             expected_reach_slope = (
                 np.percentile(dem_values, 85) - np.percentile(dem_values, 10)
             ) / 0.75
+            assert row.reach_reference_elevation == np.percentile(dem_values, 50)
             expected_tributary_slope = hand_values[
                 np.isclose(ltnd_values, maximum)
             ].mean() / (maximum / 1000)
@@ -283,6 +331,102 @@ def test_sampling_pipeline_is_exact_block_reusing_and_atomic(tmp_path):
     expected = [transformer.transform(15, 20), transformer.transform(55, 20)]
     np.testing.assert_allclose(frame["longitude"], [value[0] for value in expected])
     np.testing.assert_allclose(frame["latitude"], [value[1] for value in expected])
+
+
+def test_sampling_flooded_areas_use_hand_thresholds_and_cell_areas(tmp_path):
+    minis, prepared, terrain = _sampling_inputs(tmp_path)
+    with rasterio.open(prepared.mini_ownership) as source:
+        labels = source.read(1)
+    with rasterio.open(prepared.drainage) as source:
+        drainage = source.read(1)
+    reach_cells = np.argwhere((labels == 1) & (drainage != 0))
+    custom_hand = np.array(
+        [-2, 0, 1, 1.01, 2, 99.5, 100, 100.01, 200, 3, 0.5, 10.2],
+        dtype=np.float32,
+    )
+    assert custom_hand.size == np.count_nonzero(labels == 1)
+
+    def remove_reach_cell(values):
+        values[tuple(reach_cells[0])] = 0
+
+    def set_hand_values(values):
+        values[labels == 1] = custom_hand
+
+    drainage_path = _rewrite_raster(
+        prepared.drainage, tmp_path / "drainage-odd-reach.tif", remove_reach_cell
+    )
+    hand_path = _rewrite_raster(
+        terrain.hand, tmp_path / "hand-thresholds.tif", set_hand_values
+    )
+    spec = replace(
+        _sampling_spec(minis, prepared, terrain, tmp_path / "sampled"),
+        drainage=drainage_path,
+        hand=hand_path,
+    )
+    report = sample_minibasins(spec)
+    frame = pd.read_csv(report.sampled_minis)
+    area_columns = [f"flooded_area_{stage}m_km2" for stage in range(1, 101)]
+    assert list(
+        frame.columns[
+            frame.columns.get_loc(area_columns[0]) : frame.columns.get_loc("hru_1_pct")
+        ]
+    ) == area_columns
+    assert np.all(np.diff(frame[area_columns].to_numpy(), axis=1) >= 0)
+
+    with (
+        rasterio.open(spec.dem) as dem,
+        rasterio.open(spec.mini_ownership) as ownership,
+        rasterio.open(spec.drainage) as drain,
+        rasterio.open(spec.hand) as hand,
+    ):
+        dem_values = dem.read(1)
+        labels = ownership.read(1)
+        drainage = drain.read(1) != 0
+        hand_values = hand.read(1)
+        assert report.reach_cells == 7  # Three cells for mini 1, four for mini 2.
+        assert np.count_nonzero((labels == 1) & drainage) == 3
+        assert np.count_nonzero((labels == 2) & drainage) == 4
+        for label, row in enumerate(frame.itertuples(index=False), start=1):
+            reach = (labels == label) & drainage
+            values = dem_values[reach]
+            p10, p50, p85 = np.percentile(values, (10, 50, 85))
+            assert row.reach_reference_elevation == p50
+            assert row.reach_slope_m_per_km == (p85 - p10) / 0.75
+
+            catchment = labels == label
+            cell_rows, cell_cols = np.nonzero(catchment)
+            areas = _direct_cell_areas_km2(
+                dem.crs, dem.transform, cell_rows, cell_cols
+            )
+            catchment_hand = hand_values[catchment]
+            expected = [
+                areas[catchment_hand <= stage].sum() for stage in range(1, 101)
+            ]
+            np.testing.assert_allclose(
+                frame.loc[label - 1, area_columns].to_numpy(dtype=float), expected
+            )
+
+
+def test_cell_area_calculation_handles_geographic_rows_and_projected_cells():
+    cases = (
+        ("EPSG:4326", Affine(0.01, 0, -45, 0, -0.01, -10)),
+        ("EPSG:3857", Affine(1000, 0, 0, 0, -1000, 1_000_000)),
+    )
+    for crs, transform in cases:
+        grid = GridSpec(CRS.from_user_input(crs), transform, 2, 2)
+        selected = np.ones((2, 2), dtype=bool)
+        actual = _cell_areas_km2(grid, rasterio.windows.Window(0, 0, 2, 2), selected)
+        expected = _direct_cell_areas_km2(
+            grid.crs,
+            transform,
+            np.array([0, 0, 1, 1]),
+            np.array([0, 1, 0, 1]),
+        )
+        np.testing.assert_allclose(actual, expected)
+        if crs == "EPSG:4326":
+            assert actual[0] > actual[2]
+        else:
+            assert actual[0] != actual[2]
 
 
 def test_sampling_serial_runs_are_byte_deterministic(tmp_path, monkeypatch):

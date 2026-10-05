@@ -16,7 +16,7 @@ from pyarrow import ipc
 from pyproj import CRS, Transformer
 
 from mgb_vec_hydro.aggregation import AGGREGATION_COLUMNS
-from mgb_vec_hydro.crs_utils import CrsError, require_metre_units
+from mgb_vec_hydro.crs_utils import CrsError, geodetic_tools, require_metre_units
 from mgb_vec_hydro.exceptions import MiniSamplingError, RasterGridError
 from mgb_vec_hydro.execution.checkpoints import (
     CheckpointStore,
@@ -49,7 +49,7 @@ from mgb_vec_hydro.execution.vector import (
 from mgb_vec_hydro.preparation import BLOCK_SIZE, GridSpec
 
 MAX_PACKET_UNITS = 8
-SAMPLING_BYTES_PER_CELL = 64
+SAMPLING_BYTES_PER_CELL = 96
 TASK_FIXED_BYTES = 8 * 1024 * 1024
 
 
@@ -171,7 +171,7 @@ def sample_minibasins(spec: MiniSamplingSpec) -> MiniSamplingReport:
     if spec.checkpoint_dir is not None:
         fingerprint = execution_fingerprint(
             algorithm="sample-minis",
-            version="3",
+            version="4",
             input_identity={
                 name: file_identity(path) for name, path in raster_assets.items()
             }
@@ -574,6 +574,7 @@ def _sampling_worker(
             "dem": [],
             "hand": [],
             "ltnd": [],
+            "flooded_area": np.zeros(101, dtype=np.float64),
             "hru": np.zeros(101, dtype=np.int64),
             "catchment_cells": 0,
             "reach_cells": 0,
@@ -625,6 +626,20 @@ def _sampling_worker(
                 raise MiniSamplingError(
                     f"Mini {minis[label].mini_id} contains invalid sampled values"
                 )
+            flooded = hand_values <= 100
+            areas = _cell_areas_km2(
+                payload.grid,
+                window,
+                selected & (np.asarray(arrays["hand"].data) <= 100),
+            )
+            if not np.isfinite(areas).all() or np.any(areas <= 0):
+                raise MiniSamplingError(
+                    f"Mini {minis[label].mini_id} has invalid geodesic cell areas"
+                )
+            bins = np.searchsorted(np.arange(1, 101), hand_values[flooded], side="left")
+            acc["flooded_area"] += np.bincount(
+                bins, weights=areas, minlength=101
+            )
             drainage = np.asarray(arrays["drainage"].data) != 0
             reach = selected & drainage
             _require_valid(arrays["dem"], reach, label, "DEM")
@@ -668,11 +683,13 @@ def _sampling_worker(
             for column in AGGREGATION_COLUMNS
             if column != "geometry"
         }
+        reach_percentiles = np.percentile(dem, (10, 50, 85))
         row.update(
             longitude=value.longitude,
             latitude=value.latitude,
+            reach_reference_elevation=float(reach_percentiles[1]),
             reach_slope_m_per_km=float(
-                (np.percentile(dem, 85) - np.percentile(dem, 10)) / (0.75 * length_km)
+                (reach_percentiles[2] - reach_percentiles[0]) / (0.75 * length_km)
             ),
             tributary_length_km=maximum_ltnd / 1000.0,
             tributary_slope_m_per_km=float(
@@ -680,6 +697,14 @@ def _sampling_worker(
             ),
             _catchment_cells=int(acc["catchment_cells"]),
             _reach_cells=int(acc["reach_cells"]),
+        )
+        row.update(
+            {
+                f"flooded_area_{stage}m_km2": float(area)
+                for stage, area in enumerate(
+                    np.cumsum(acc["flooded_area"])[:100], start=1
+                )
+            }
         )
         for class_id in range(1, 101):
             count = int(acc["hru"][class_id])
@@ -699,6 +724,60 @@ def _sampling_worker(
             "reach_cells": sum(row["_reach_cells"] for row in rows),
         },
     )
+
+
+def _cell_areas_km2(grid: GridSpec, window, selected: np.ndarray) -> np.ndarray:
+    """Measure selected raster cells on the grid CRS ellipsoid in km²."""
+    rows, cols = np.nonzero(selected)
+    if not rows.size:
+        return np.empty(0, dtype=np.float64)
+    transform = grid.transform
+    try:
+        transformer, geod = geodetic_tools(grid.crs.to_wkt())
+        if grid.crs.is_geographic:
+            # Ellipsoidal cell area is longitude-invariant, so one area per row suffices.
+            unique_rows, inverse = np.unique(rows, return_inverse=True)
+            x0 = transform.c + window.col_off * transform.a
+            x1 = x0 + transform.a
+            y1 = transform.f + (window.row_off + unique_rows) * transform.e
+            y0 = y1 + transform.e
+            xs = np.column_stack(
+                (
+                    np.full(len(unique_rows), x0),
+                    np.full(len(unique_rows), x1),
+                    np.full(len(unique_rows), x1),
+                    np.full(len(unique_rows), x0),
+                )
+            )
+            ys = np.column_stack((y0, y0, y1, y1))
+            lon, lat = transformer.transform(xs, ys)
+            row_areas = np.array(
+                [
+                    abs(geod.polygon_area_perimeter(cell_lon, cell_lat)[0]) / 1e6
+                    for cell_lon, cell_lat in zip(lon, lat, strict=True)
+                ]
+            )
+            return np.asarray(row_areas[inverse], dtype=np.float64)
+
+        areas = np.empty(rows.size, dtype=np.float64)
+        for start in range(0, rows.size, 4096):
+            stop = min(start + 4096, rows.size)
+            cell_rows = rows[start:stop] + window.row_off
+            cell_cols = cols[start:stop] + window.col_off
+            x0 = transform.c + cell_cols * transform.a
+            x1 = x0 + transform.a
+            y1 = transform.f + cell_rows * transform.e
+            y0 = y1 + transform.e
+            xs = np.column_stack((x0, x1, x1, x0))
+            ys = np.column_stack((y0, y0, y1, y1))
+            lon, lat = transformer.transform(xs, ys)
+            areas[start:stop] = [
+                abs(geod.polygon_area_perimeter(cell_lon, cell_lat)[0]) / 1e6
+                for cell_lon, cell_lat in zip(lon, lat, strict=True)
+            ]
+        return areas
+    except Exception as exc:
+        raise MiniSamplingError("Cannot measure raster cell areas geodesically") from exc
 
 
 def _require_valid(
@@ -732,9 +811,11 @@ def _assemble_csv(packet_root: Path, output: Path, classes: tuple[int, ...]) -> 
             "longitude",
             "latitude",
             "reach_slope_m_per_km",
+            "reach_reference_elevation",
             "tributary_length_km",
             "tributary_slope_m_per_km",
         ]
+        + [f"flooded_area_{stage}m_km2" for stage in range(1, 101)]
         + percentage_columns
     )
     paths = sorted(packet_root.glob("*.arrow"))
