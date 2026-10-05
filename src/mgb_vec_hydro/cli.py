@@ -31,6 +31,10 @@ def _echo_timings(timings: dict[str, float]) -> None:
 
 @main.command("prepare")
 @click.option(
+    "--dem-scale", type=float, default=1.0, show_default=True,
+    help="Multiply stored DEM values by this factor to convert elevations to metres.",
+)
+@click.option(
     "--dem",
     type=click.Path(exists=True, dir_okay=False, path_type=Path),
     required=True,
@@ -76,6 +80,7 @@ def _echo_timings(timings: dict[str, float]) -> None:
 )
 def prepare_command(
     dem: Path,
+    dem_scale: float,
     mini_catchments: Path,
     mini_segments: Path,
     continuous_raster: tuple[tuple[str, Path], ...],
@@ -96,6 +101,7 @@ def prepare_command(
         report = prepare_dataset(
             PreparationSpec(
                 dem=dem,
+                dem_scale=dem_scale,
                 mini_catchments=mini_catchments,
                 mini_segments=mini_segments,
                 rasters=rasters,

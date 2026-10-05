@@ -20,11 +20,15 @@ import pandas as pd
 import rasterio
 from affine import Affine
 from numba import njit
+from pyproj import CRS
 from rasterio.enums import Resampling
 from rasterio.env import get_gdal_config, set_gdal_config
 from rasterio.windows import Window
 
 from mgb_vec_hydro.exceptions import RasterGridError, TerrainProductsError
+from mgb_vec_hydro.crs_utils import (
+    CrsError, geodetic_tools, require_metre_units,
+)
 from mgb_vec_hydro.execution.checkpoints import (
     CheckpointStore,
     execution_fingerprint,
@@ -74,6 +78,14 @@ MAX_PACKET_UNITS = 8
 DOMAIN_BYTES_PER_CELL = 16
 DEM_BYTES_PER_CELL = 128
 D8_BYTES_PER_CELL = 80
+# Projected distances retain one float64 edge length per cell. Coordinate
+# transformations are capped at 4096 edges, fitting the task's fixed allowance.
+METRIC_BYTES_PER_CELL = 8
+GEODESIC_BATCH_CELLS = 4096
+# EPSG methods: pseudo-Mercator, Mercator A/B, cylindrical equal-area
+# spherical/ellipsoidal. Their inverse longitude is linear in x and latitude
+# depends only on y, so row tables are exact on a north-up raster grid.
+_SEPARABLE_PROJECTION_METHODS = {"1024", "9804", "9805", "9834", "9835"}
 TASK_FIXED_BYTES = 8 * 1024 * 1024
 
 
@@ -822,8 +834,10 @@ def compute_ltnd(
     direction: np.ndarray,
     transform: Affine,
     rank: np.ndarray | None = None,
+    *,
+    crs: str | CRS | None = None,
 ) -> np.ndarray:
-    """Accumulate floating-point parent-chain distance in raster CRS units."""
+    """Accumulate route distance in metres with CRS, or native units without it."""
 
     direction = np.asarray(direction)
     if direction.ndim != 2:
@@ -833,7 +847,129 @@ def compute_ltnd(
         raise TerrainProductsError("Rank and direction must have equal shapes")
     width, height = _pixel_sizes(transform)
     order = _rank_order(rank)
+    if crs is not None:
+        return _metric_ltnd(direction, order, transform, crs)
     return _ltnd_kernel(direction, order, width, height)
+
+
+def _uses_row_steps(crs: CRS) -> bool:
+    operation = crs.coordinate_operation
+    return crs.is_geographic or (
+        crs.is_projected
+        and operation is not None
+        and operation.method_code in _SEPARABLE_PROJECTION_METHODS
+    )
+
+
+def _metric_ltnd(direction, order, transform, crs):
+    """Measure routed edges on the native ellipsoid without raster reprojection."""
+    if not isinstance(transform, Affine):
+        transform = Affine(*transform)
+    _pixel_sizes(transform)
+    try:
+        source = CRS.from_user_input(crs)
+        if not (source.is_geographic or source.is_projected):
+            raise TerrainProductsError("LTND requires a geographic or projected raster CRS")
+        transformer, geod = geodetic_tools(source.to_wkt())
+        if _uses_row_steps(source):
+            # Geographic and separable cylindrical grids have the same edge
+            # lengths at every column. Measure three kinds of edge per row
+            # and reuse symmetry for all eight route directions.
+            steps = np.zeros((direction.shape[0], 8), dtype=np.float64)
+            x = np.full(direction.shape[0], transform.c + 0.5 * transform.a)
+            y = transform.f + (np.arange(direction.shape[0]) + 0.5) * transform.e
+            lon, lat = transformer.transform(x, y)
+            elon, elat = transformer.transform(x + transform.a, y)
+            horizontal = geod.inv(lon, lat, elon, elat)[2]
+            _require_metric_distances(horizontal)
+            steps[:, 2] = horizontal
+            steps[:, 6] = horizontal
+            if direction.shape[0] > 1:
+                vertical = geod.inv(lon[:-1], lat[:-1], lon[1:], lat[1:])[2]
+                diagonal = geod.inv(lon[:-1], lat[:-1], elon[1:], elat[1:])[2]
+                _require_metric_distances(vertical)
+                _require_metric_distances(diagonal)
+                steps[:-1, 4] = vertical
+                steps[1:, 0] = vertical
+                steps[:-1, 3] = diagonal
+                steps[:-1, 5] = diagonal
+                steps[1:, 1] = diagonal
+                steps[1:, 7] = diagonal
+            return _ltnd_row_steps_kernel(direction, order, steps)
+
+        # Transform only actual route edges, in batches with bounded temporaries.
+        flat = direction.ravel()
+        edges = np.zeros(direction.shape, dtype=np.float64)
+        output = edges.ravel()
+        for start in range(0, flat.size, GEODESIC_BATCH_CELLS):
+            codes = flat[start : start + GEODESIC_BATCH_CELLS]
+            cells = np.flatnonzero(codes > 0) + start
+            if not cells.size:
+                continue
+            rows, cols = np.divmod(cells, direction.shape[1])
+            indices = flat[cells] - 1
+            x = transform.c + (cols + 0.5) * transform.a
+            y = transform.f + (rows + 0.5) * transform.e
+            px = x + _DC[indices] * transform.a
+            py = y + _DR[indices] * transform.e
+            # These float64 buffers are local to the batch and no longer need
+            # native coordinates. Reuse them for lon/lat and inverse results.
+            lon, lat = transformer.transform(x, y, inplace=True)
+            plon, plat = transformer.transform(px, py, inplace=True)
+            distances = geod.inv(
+                lon, lat, plon, plat, inplace=True, return_back_azimuth=False
+            )[2]
+            _require_metric_distances(distances)
+            output[cells] = distances
+        return _ltnd_edge_steps_kernel(direction, order, edges)
+    except TerrainProductsError:
+        raise
+    except Exception as exc:
+        raise TerrainProductsError("Cannot measure LTND in metres for the raster CRS") from exc
+
+
+def _require_metric_distances(distances):
+    if not np.all(np.isfinite(distances)) or np.any(np.asarray(distances) <= 0):
+        raise TerrainProductsError("Raster CRS produced non-positive or non-finite metric steps")
+
+
+@njit(cache=True)
+def _ltnd_row_steps_kernel(direction, order, steps):
+    result = np.full(direction.size, np.nan)
+    dirs = direction.ravel()
+    cols = direction.shape[1]
+    for oi in range(order.size):
+        cell = order[oi]
+        code = dirs[cell]
+        if code < 0:
+            continue
+        if code == 0:
+            result[cell] = 0.0
+        else:
+            r, c = cell // cols, cell % cols
+            parent = (r + _DR[code - 1]) * cols + c + _DC[code - 1]
+            result[cell] = result[parent] + steps[r, code - 1]
+    return result.reshape(direction.shape)
+
+
+@njit(cache=True)
+def _ltnd_edge_steps_kernel(direction, order, edges):
+    result = np.full(direction.size, np.nan)
+    dirs = direction.ravel()
+    lengths = edges.ravel()
+    cols = direction.shape[1]
+    for oi in range(order.size):
+        cell = order[oi]
+        code = dirs[cell]
+        if code < 0:
+            continue
+        if code == 0:
+            result[cell] = 0.0
+        else:
+            r, c = cell // cols, cell % cols
+            parent = (r + _DR[code - 1]) * cols + c + _DC[code - 1]
+            result[cell] = result[parent] + lengths[cell]
+    return result.reshape(direction.shape)
 
 
 @njit(cache=True)
@@ -1197,6 +1333,8 @@ def _validate_terrain_inputs(assets: dict[str, Path], grid: GridSpec) -> None:
         try:
             with rasterio.open(path) as source:
                 _require_grid(source, grid, name)
+                if name == "dem":
+                    require_metre_units(source, "DEM")
                 expected = expected_dtypes[name]
                 if expected is not None and source.dtypes[0] != expected:
                     raise TerrainProductsError(
@@ -1205,6 +1343,8 @@ def _validate_terrain_inputs(assets: dict[str, Path], grid: GridSpec) -> None:
                     )
         except TerrainProductsError:
             raise
+        except CrsError as exc:
+            raise TerrainProductsError(str(exc)) from exc
         except RasterGridError as exc:
             raise TerrainProductsError(
                 f"Explicit {name} raster does not match the canonical DEM grid"
@@ -1301,7 +1441,7 @@ def _plan_minis(
 
 
 def _reestimated_units(
-    units: tuple[_MiniUnit, ...], bytes_per_cell: int
+    units: tuple[_MiniUnit, ...], bytes_per_cell: int, row_step_bytes: int = 0
 ) -> tuple[RasterUnit, ...]:
     return tuple(
         RasterUnit(
@@ -1309,6 +1449,7 @@ def _reestimated_units(
             unit.raster.bounds,
             unit.raster.window,
             int(unit.raster.window.width * unit.raster.window.height) * bytes_per_cell
+            + int(unit.raster.window.height) * row_step_bytes
             + TASK_FIXED_BYTES,
             unit.raster.spatial_key,
         )
@@ -1320,9 +1461,10 @@ def _packet_units(
     units: tuple[_MiniUnit, ...],
     bytes_per_cell: int,
     memory_limit_bytes: int,
+    row_step_bytes: int = 0,
 ) -> tuple[tuple[RasterPacket, tuple[_MiniUnit, ...]], ...]:
     packets = packet_raster_units(
-        _reestimated_units(units, bytes_per_cell),
+        _reestimated_units(units, bytes_per_cell, row_step_bytes),
         memory_limit_bytes=memory_limit_bytes,
         max_units=MAX_PACKET_UNITS,
     )
@@ -1343,9 +1485,14 @@ def _terrain_work_items(
     bytes_per_cell = (
         DEM_BYTES_PER_CELL if spec.direction_source == "dem" else D8_BYTES_PER_CELL
     )
+    # Row tables plus their temporary lon/lat arrays scale with rows,
+    # not raster area; avoid charging 192 bytes for every cell in wide minis.
+    row_step_bytes = 192 if _uses_row_steps(grid.crs) else 0
+    if not row_step_bytes:
+        bytes_per_cell += METRIC_BYTES_PER_CELL
     result = []
     for ordinal, (packet, packet_units) in enumerate(
-        _packet_units(units, bytes_per_cell, memory_limit_bytes)
+        _packet_units(units, bytes_per_cell, memory_limit_bytes, row_step_bytes)
     ):
         result.append(
             WorkItem(
@@ -1383,7 +1530,10 @@ def _terrain_worker_with_cache(
     payload: _TerrainPayload, context: WorkerContext
 ) -> WorkerOutput[_PacketValue]:
     jit_started = time.perf_counter()
-    context.resources.get("terrain-numba-kernels-v1", _warm_worker_kernels)
+    context.resources.get(
+        "terrain-numba-kernels-v2",
+        lambda: _warm_worker_kernels(_uses_row_steps(payload.grid.crs)),
+    )
     jit_seconds = time.perf_counter() - jit_started
     aligned_reader = context.resources.get(
         "terrain-aligned-inputs:"
@@ -1466,7 +1616,9 @@ def _terrain_worker_with_cache(
             del d8
             timings["d8_validation"] += time.perf_counter() - validation_started
         product_started = time.perf_counter()
-        hand, ltnd = _terrain_products_float32(elevation, direction, rank, transform)
+        hand, ltnd = _terrain_products_float32(
+            elevation, direction, rank, transform, crs=payload.grid.crs
+        )
         del elevation, labels, rank
         timings["products"] += time.perf_counter() - product_started
         negatives = hand[owned & (hand < 0)]
@@ -1498,8 +1650,14 @@ def _terrain_worker_with_cache(
     )
 
 
-def _warm_worker_kernels() -> bool:
+def _warm_worker_kernels(row_steps: bool = True) -> bool:
     _warm_routing_kernels()
+    direction = np.array([[3, 0]], dtype="int8")
+    order = np.array([1, 0], dtype="int64")
+    if row_steps:
+        _ltnd_row_steps_kernel(direction, order, np.ones((1, 8), dtype=np.float64))
+    else:
+        _ltnd_edge_steps_kernel(direction, order, np.ones((1, 2), dtype=np.float64))
     return True
 
 
@@ -1539,11 +1697,12 @@ def _terrain_products_float32(
     direction: np.ndarray,
     rank: np.ndarray,
     transform: Affine,
+    *,
+    crs: str | CRS,
 ) -> tuple[np.ndarray, np.ndarray]:
     order = _rank_order(rank)
     hand = _hand_kernel(elevation, direction, order).astype("float32")
-    width, height = _pixel_sizes(transform)
-    ltnd = _ltnd_kernel(direction, order, width, height).astype("float32")
+    ltnd = _metric_ltnd(direction, order, transform, crs).astype("float32")
     return hand, ltnd
 
 
@@ -1558,7 +1717,7 @@ def _checkpoint(
         return None
     fingerprint = execution_fingerprint(
         algorithm=algorithm,
-        version="1",
+        version="2",
         input_identity=input_identity,
         parameters=parameters,
         work_items=items,
@@ -1572,6 +1731,10 @@ def _terrain_tags(spec: TerrainSpec, role: str) -> dict[str, Any]:
         "routing_source": spec.direction_source,
         "ownership": "strict aggregated mini catchments; no buffer",
     }
+    if role in {"height above matching drainage", "along-route distance to matching drainage"}:
+        result["units"] = "m"
+    if role == "along-route distance to matching drainage":
+        result["distance_method"] = "geodesic"
     if spec.direction_source == "dem":
         result.update(
             agree_sharp=spec.agree_sharp,

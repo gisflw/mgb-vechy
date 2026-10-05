@@ -47,6 +47,14 @@ single-band COGs with the exact DEM grid, matching CRS, and internal masks.
 The HRU raster must be integer-valued; sampled class IDs must be in `1..100`.
 Missing or mismatched files, CRS, grid, masks, schemas, or IDs are rejected.
 
+DEM, HAND, and LTND must declare `units=m` for their stored values. Legacy
+unitless products are rejected with instructions to regenerate preparation
+and terrain. In particular, degree-valued LTND cannot be accurately converted
+with one scale factor after route directions have been discarded. For a DEM
+stored in centimetres, run preparation with `--dem-scale 0.01`, then regenerate
+terrain and sampling into new directories. Old sampling checkpoints cannot
+resume under the corrected unit contract.
+
 Sampling uses dense ownership labels rather than polygon masks. Catchment
 statistics use cells owned by each mini; reach elevation uses matching
 drainage cells. Exact percentiles and deterministic accumulators are reduced
@@ -70,3 +78,14 @@ and slope, and sorted `hru_<id>_pct` columns summing to 100% for every mini. Opt
 removed after successful publication. The CLI prints the concrete CSV path.
 Execution defaults are four workers, 512 MB of admitted task memory, two I/O
 slots, and 10,000-row batches. Worker counts may be any positive integer.
+
+Reach slope is the difference between the 85th and 10th percentiles of reach
+DEM elevations (metres), divided by `0.75 * unit_length` (kilometres). Stage 1
+computes `unit_length` geodesically and aggregation preserves those kilometre
+metrics. Tributary length is maximum LTND divided by 1000; tributary slope is
+mean HAND at cells tied for that maximum divided by tributary length. These
+formulas, percentile selection, and the six-raster block-read pattern are
+unchanged; elevation normalization and metric LTND supply their correct units.
+
+Measured preparation, terrain, and sampling costs and reproduction commands
+are in [the unit-correction performance report](sampling_units_performance.md).

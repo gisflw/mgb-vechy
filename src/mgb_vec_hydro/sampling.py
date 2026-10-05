@@ -16,6 +16,7 @@ from pyarrow import ipc
 from pyproj import CRS, Transformer
 
 from mgb_vec_hydro.aggregation import AGGREGATION_COLUMNS
+from mgb_vec_hydro.crs_utils import CrsError, require_metre_units
 from mgb_vec_hydro.exceptions import MiniSamplingError, RasterGridError
 from mgb_vec_hydro.execution.checkpoints import (
     CheckpointStore,
@@ -170,7 +171,7 @@ def sample_minibasins(spec: MiniSamplingSpec) -> MiniSamplingReport:
     if spec.checkpoint_dir is not None:
         fingerprint = execution_fingerprint(
             algorithm="sample-minis",
-            version="2",
+            version="3",
             input_identity={
                 name: file_identity(path) for name, path in raster_assets.items()
             }
@@ -323,6 +324,8 @@ def _validate_sampling_rasters(
         try:
             with rasterio.open(path) as source:
                 _require_grid(source, grid, name)
+                if name in {"dem", "hand", "ltnd"}:
+                    require_metre_units(source, name.upper())
                 if name == "hru" and not np.issubdtype(
                     np.dtype(source.dtypes[0]), np.integer
                 ):
@@ -335,6 +338,8 @@ def _validate_sampling_rasters(
                     )
         except MiniSamplingError:
             raise
+        except CrsError as exc:
+            raise MiniSamplingError(str(exc)) from exc
         except RasterGridError as exc:
             raise MiniSamplingError(
                 f"Explicit {name} raster does not match the canonical DEM grid"

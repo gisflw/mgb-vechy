@@ -89,6 +89,66 @@ def _write_multiblock_minis(tmp_path, size):
     return catchment_path, segment_path
 
 
+@pytest.mark.parametrize("dem_scale", [1.0, 0.01])
+def test_prepare_scales_only_dem_and_preserves_grid_and_masks(tmp_path, dem_scale):
+    catchments, segments = _write_multiblock_minis(tmp_path, 2)
+    dem = tmp_path / "dem.tif"
+    land = tmp_path / "land.tif"
+    values = np.array([[1200, -9999], [3400, 5600]], dtype="float32")
+    _write_multiblock_raster(dem, values, "float32")
+    _write_multiblock_raster(land, [[1, 2], [3, 4]], "int16")
+    with rasterio.open(dem, "r+") as source:
+        source.write_mask(np.array([[255, 0], [255, 255]], dtype="uint8"))
+    report = prepare_dataset(PreparationSpec(
+        dem=dem, mini_catchments=catchments, mini_segments=segments,
+        output_dir=tmp_path / "prepared", workers=1,
+        dem_scale=dem_scale, rasters=(
+            NamedRaster("land", land, "categorical"),
+            NamedRaster("other", dem, "continuous"),
+        ),
+    ))
+    with rasterio.open(dem) as source, rasterio.open(report.dem) as output:
+        valid = source.dataset_mask() != 0
+        np.testing.assert_allclose(output.read(1)[valid], values[valid] * dem_scale)
+        np.testing.assert_array_equal(output.dataset_mask(), source.dataset_mask())
+        assert output.transform == source.transform
+        assert output.crs == source.crs
+        assert output.tags()["units"] == "m"
+        assert output.units == ("m",)
+        assert float(output.tags()["dem_scale"]) == dem_scale
+    with rasterio.open(report.rasters["land"]) as output:
+        np.testing.assert_array_equal(output.read(1), [[1, 2], [3, 4]])
+    with rasterio.open(report.rasters["other"]) as output:
+        np.testing.assert_array_equal(output.read(1)[valid], values[valid])
+
+
+@pytest.mark.parametrize("dem_scale", [0, -1, float("nan"), float("inf"), True, "0.01"])
+def test_prepare_rejects_invalid_dem_scale_before_publication(tmp_path, dem_scale):
+    dem = tmp_path / "dem.tif"
+    _write_raster(dem)
+    output = tmp_path / "prepared"
+    with pytest.raises(PreparedDataError, match="DEM scale"):
+        prepare_dataset(PreparationSpec(
+            dem=dem, mini_catchments=tmp_path / "catchments",
+            mini_segments=tmp_path / "segments", output_dir=output,
+            dem_scale=dem_scale,
+        ))
+    assert not output.exists()
+
+
+@pytest.mark.parametrize("value,scale", [(1e40, 1e-5), (1e35, 1e-45)])
+def test_prepare_scales_before_float32_range_conversion(tmp_path, value, scale):
+    catchments, segments = _write_multiblock_minis(tmp_path, 2)
+    dem = tmp_path / "dem.tif"
+    _write_multiblock_raster(dem, np.full((2, 2), value), "float64")
+    report = prepare_dataset(PreparationSpec(
+        dem=dem, dem_scale=scale, mini_catchments=catchments,
+        mini_segments=segments, output_dir=tmp_path / "prepared", workers=1,
+    ))
+    with rasterio.open(report.dem) as source:
+        np.testing.assert_allclose(source.read(1), value * scale, rtol=1e-6)
+
+
 def test_prepare_pipeline_publishes_valid_canonical_dataset(tmp_path):
     dem = tmp_path / "dem.tif"
     land = tmp_path / "land.tif"

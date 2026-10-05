@@ -18,6 +18,7 @@ mgb-vec-hydro prepare \
 | Option | Status | Type/default | Meaning |
 | --- | --- | --- | --- |
 | `--dem` | Required | Existing raster path | DEM defining the canonical CRS, resolution, orientation, and raster grid. |
+| `--dem-scale` | Optional | Finite positive number; default `1.0` | Multiply stored DEM elevations by this factor to normalize them to metres. Use `0.01` for centimetres. |
 | `--mini-catchments` | Required | Existing vector path | Aggregated mini-catchment polygons used to define ownership and the prepared domain. |
 | `--mini-segments` | Required | Existing vector path | Aggregated mini-segment lines used to create drainage and validate the mini domain. |
 | `--continuous-raster` | Optional; repeatable | `NAME PATH` | Named single-band continuous raster to clip and publish as `<name>.tif`; names must be valid and non-reserved. |
@@ -36,6 +37,20 @@ already be aligned, cover the buffered mini-catchment domain, and use a single
 band. No implicit reprojection or resampling is performed. Optional D8 input
 requires `--d8-encoding canonical|esri` and is normalized to canonical
 clockwise codes. COGs use 512-pixel tiles and internal validity masks.
+
+The canonical DEM stores elevations in **metres**. `--dem-scale` applies only
+to valid DEM cells during the existing block processing; it does not change
+the grid, masks, or named continuous/categorical rasters. The default assumes
+stored source values are already metres. No units are inferred from elevation
+magnitude, and raster scale/offset metadata is not applied implicitly: the
+factor multiplies the stored source values. Prepared DEM metadata records
+`units=m` and `dem_scale`; its values already include that conversion.
+
+For a centimetre DEM, add `--dem-scale 0.01` to the command above. Library
+callers use `PreparationSpec(dem_scale=0.01, ...)`. Regenerate preparation,
+terrain products, and sampling into new output directories when migrating
+existing centimetre-based datasets; downstream stages do not scale a second
+time. Existing unitless products are rejected with regeneration instructions.
 
 Source clipping, domain masking, ownership and drainage rasterization, and
 local connectivity labeling run as bounded 512-pixel block tasks through the

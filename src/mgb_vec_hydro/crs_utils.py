@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import lru_cache
 import math
 
 import pyarrow as pa
-from pyproj import CRS
+from pyproj import CRS, Geod
 import rasterio
 from rasterio.enums import Resampling
 from rasterio.vrt import WarpedVRT
@@ -22,6 +23,31 @@ DEFAULT_CRS = "EPSG:6933"
 
 class CrsError(MgbVecHydroError):
     """Raised when spatial reference metadata cannot be resolved safely."""
+
+
+@lru_cache(maxsize=16)
+def geodetic_tools(crs_text: str) -> tuple[Transformer, Geod]:
+    """Cache a source-to-degree lon/lat transformer and its native ellipsoid."""
+    crs = parse_crs(crs_text)
+    geodetic = crs.geodetic_crs
+    if geodetic is None or crs.ellipsoid.semi_major_metre is None:
+        raise CrsError("Source CRS has no usable geodetic ellipsoid")
+    # Geod consumes degrees, including when the source geographic CRS uses grads.
+    geographic = geodetic.to_2d().to_json_dict()
+    for axis in geographic["coordinate_system"]["axis"]:
+        axis["unit"] = "degree"
+    target = CRS.from_json_dict(geographic)
+    return Transformer.from_crs(crs, target, always_xy=True), crs.get_geod()
+
+
+def require_metre_units(dataset, name: str) -> None:
+    """Reject legacy products whose stored values lack the canonical unit tag."""
+    if dataset.tags().get("units") != "m":
+        raise CrsError(
+            f"{name} must declare stored values in metres (units=m); "
+            "regenerate preparation with --dem-scale for the source elevation "
+            "units, then regenerate terrain products and sampling"
+        )
 
 
 def parse_metric_crs(value: str | CRS = DEFAULT_CRS) -> CRS:

@@ -64,6 +64,7 @@ class PreparationSpec:
     workers: int = 4
     memory_limit_mb: int = 512
     io_slots: int = 2
+    dem_scale: float = 1.0
 
 
 @dataclass(frozen=True)
@@ -134,6 +135,7 @@ class _PreparationBlockPayload:
     segment_labels: tuple[int, ...]
     d8_encoding: str
     gdal_cache_bytes: int
+    dem_scale: float = 1.0
 
 
 @dataclass(frozen=True)
@@ -232,6 +234,7 @@ def _prepare_dataset(spec: PreparationSpec) -> PreparationReport:
         spec.d8_encoding or "canonical",
         memory_bytes,
         spec.workers,
+        dem_scale=spec.dem_scale,
     )
     planning_seconds = time.perf_counter() - phase_started
 
@@ -256,6 +259,8 @@ def _prepare_dataset(spec: PreparationSpec) -> PreparationReport:
                     Resampling.bilinear
                     if item.kind == "continuous"
                     else Resampling.nearest,
+                    {"units": "m", "dem_scale": spec.dem_scale}
+                    if item.name == "dem" else {},
                 )
                 for item in rasters
             ] + [
@@ -404,6 +409,8 @@ def _preparation_work_items(
     d8_encoding: str,
     memory_limit_bytes: int,
     workers: int,
+    *,
+    dem_scale: float = 1.0,
 ):
     from mgb_vec_hydro.execution.raster import plan_raster_blocks
 
@@ -448,6 +455,7 @@ def _preparation_work_items(
                     tuple(int(dense_labels[index]) for index in segment_hits),
                     d8_encoding,
                     gdal_cache_bytes,
+                    dem_scale,
                 ),
             )
 
@@ -511,7 +519,22 @@ def _prepare_block_worker_with_cache(
             raw = values.filled(0)
             if item.kind == "continuous":
                 valid &= np.isfinite(raw)
-                data = np.where(valid, raw, 0).astype("float32")
+                if item.name == "dem" and payload.dem_scale != 1.0:
+                    # Scale before converting wide source values to float32.
+                    # Keep the common float32 path in-place; use float64 when
+                    # the source or conversion factor requires that range.
+                    limits = np.finfo(np.float32)
+                    dtype = np.result_type(raw.dtype, np.float32)
+                    if not limits.tiny <= payload.dem_scale <= limits.max:
+                        dtype = np.dtype("float64")
+                    data = np.where(valid, raw, 0).astype(dtype, copy=False)
+                    with np.errstate(over="ignore", invalid="ignore"):
+                        np.multiply(data, payload.dem_scale, out=data)
+                        data = data.astype("float32", copy=False)
+                    if not np.isfinite(data[valid]).all():
+                        raise PreparedDataError("Scaled DEM exceeds finite float32 values")
+                else:
+                    data = np.where(valid, raw, 0).astype("float32")
             elif item.kind == "categorical":
                 source_values = raw[valid]
                 if source_values.size and (
@@ -616,6 +639,13 @@ def _gdal_cache_bytes(memory_limit_bytes: int, workers: int) -> int:
 def _validate_spec(spec: PreparationSpec) -> None:
     if not Path(spec.dem).is_file():
         raise PreparedDataError(f"DEM input is not a local file: {spec.dem}")
+    if (
+        isinstance(spec.dem_scale, bool)
+        or not isinstance(spec.dem_scale, (int, float, np.integer, np.floating))
+        or not math.isfinite(spec.dem_scale)
+        or spec.dem_scale <= 0
+    ):
+        raise PreparedDataError("DEM scale must be a finite positive number")
     for name, value in (
         ("workers", spec.workers),
         ("memory limit", spec.memory_limit_mb),

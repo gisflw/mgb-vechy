@@ -7,7 +7,6 @@ import time
 from collections import defaultdict
 from collections.abc import Hashable, Iterable
 from dataclasses import dataclass
-from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -16,7 +15,7 @@ import pandas as pd
 import pyarrow as pa
 import pyarrow.compute as pc
 import pyogrio
-from pyproj import CRS, Geod, Transformer
+from pyproj import CRS, Transformer
 import shapely
 
 from mgb_vec_hydro.exceptions import (
@@ -40,7 +39,7 @@ from mgb_vec_hydro.execution.vector import (
     vector_table_from_arrow,
     write_vector_table,
 )
-from mgb_vec_hydro.crs_utils import parse_crs
+from mgb_vec_hydro.crs_utils import CrsError, geodetic_tools, parse_crs
 
 DEFAULT_STRAHLER_ORDER_COL = "strahler_order"
 ROI_COLUMNS = [
@@ -660,22 +659,11 @@ def _scan_fids(provider: _Provider, batch_size: int) -> dict[Hashable, int]:
     return result
 
 
-@lru_cache(maxsize=16)
-def _geodetic_tools(crs_text: str) -> tuple[Transformer, Geod]:
-    crs = CRS.from_wkt(crs_text)
-    geodetic = crs.geodetic_crs
-    if geodetic is None or crs.ellipsoid.semi_major_metre is None:
-        raise InvalidInputSchemaError("Source CRS has no usable geodetic ellipsoid")
-    ellipsoid = crs.ellipsoid
-    if ellipsoid.inverse_flattening == 0:
-        geod = Geod(a=ellipsoid.semi_major_metre, b=ellipsoid.semi_minor_metre)
-    else:
-        geod = Geod(a=ellipsoid.semi_major_metre, rf=ellipsoid.inverse_flattening)
-    return Transformer.from_crs(crs, geodetic, always_xy=True), geod
-
-
 def _geometry_metric(geometry, provider: _Provider, kind: str) -> float:
-    transformer, geod = _geodetic_tools(provider.crs.to_wkt())
+    try:
+        transformer, geod = geodetic_tools(provider.crs.to_wkt())
+    except CrsError as exc:
+        raise InvalidInputSchemaError(str(exc)) from exc
     geographic = shapely.transform(geometry, transformer.transform, interleaved=False)
     if kind == "segments":
         value = geod.geometry_length(geographic) / 1000.0

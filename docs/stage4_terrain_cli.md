@@ -77,3 +77,27 @@ with codes 0 for drainage and 1–8 for N, NE, E, SE, S, SW, W, and NW. The
 report and CLI status identify the concrete paths written and include planning,
 raster-read, conditioning/D8-validation, routing, compression, checkpoint, and
 cell-count diagnostics.
+
+The prepared DEM must declare `units=m`. HAND stores metre elevation
+differences from that DEM. LTND stores **metres**, regardless of whether the
+canonical grid uses geographic degrees or projected coordinates (including
+feet). Its distances are sums of geodesic cell-centre-to-parent steps on the
+source CRS's ellipsoid, using the same ellipsoid handling as Stage 1. Neither
+product requires raster reprojection. HAND and LTND declare `units=m`; LTND
+also declares `distance_method=geodesic`.
+
+North-up geographic, Mercator, and cylindrical equal-area grids reuse exact
+latitude-dependent step tables. Other projected grids transform actual route
+edges in bounded vectorized batches. Memory estimates account for those tables
+and buffers. Routing and deterministic
+tie-breaking are unchanged.
+
+AGREE defaults remain **80.0** for sharp incision, **8.0** for smooth depth,
+and **4** buffer pixels. The two depth parameters operate in normalized DEM
+units (metres); they are not automatically rescaled by `--dem-scale`.
+
+For the low-level library API, `compute_ltnd(..., crs=...)` returns metres;
+omitting `crs` retains the legacy raster-coordinate-unit calculation. The
+production stage always supplies CRS. Regenerate legacy terrain products
+after normalizing the source DEM; old terrain checkpoints are incompatible
+with the corrected distance contract.

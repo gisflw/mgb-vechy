@@ -573,6 +573,8 @@ class RasterAssembler:
         for name, source in self._sources.items():
             if self.specs[name].tags:
                 source.update_tags(**self.specs[name].tags)
+                if units := self.specs[name].tags.get("units"):
+                    source.set_band_unit(1, units)
             working[name] = Path(source.name)
             source.close()
         self._sources.clear()

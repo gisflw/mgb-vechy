@@ -2,6 +2,7 @@ import numpy as np
 import pandas as pd
 import pytest
 import rasterio
+from pyproj import CRS, Transformer
 from affine import Affine
 from shapely.geometry import LineString, Polygon
 
@@ -401,3 +402,52 @@ def test_hand_and_ltnd_follow_selected_tree_with_rectangular_pixels():
     assert ltnd[0, 0] == pytest.approx(5)
     assert ltnd[0, 1] == pytest.approx(4)
     assert ltnd[1, 0] == pytest.approx(3)
+
+
+@pytest.mark.parametrize(
+    "crs,transform",
+    [
+        ("EPSG:4326", Affine(0.001, 0, -45, 0, -0.002, -13)),
+        ("EPSG:4326", Affine(0.001, 0, 10, 0, -0.002, 60)),
+        ("EPSG:4807", Affine(0.001, 0, 0, 0, -0.002, 54)),
+        ("EPSG:3857", Affine(100, 0, 1000, 0, -200, 8399737)),
+        ("EPSG:3395", Affine(100, 0, 1000, 0, -200, 8399737)),
+        ("EPSG:6933", Affine(100, 0, 1000, 0, -200, 6000000)),
+        ("EPSG:2263", Affine(100, 0, 980000, 0, -200, 200000)),
+    ],
+)
+@pytest.mark.parametrize(
+    "direction",
+    [
+        np.array([[4, 5, 6], [3, 0, 7], [2, 1, 8]], dtype="int8"),
+        np.array([[4, 5, 6], [3, 4, 5], [2, 3, 0]], dtype="int8"),
+    ],
+)
+def test_ltnd_with_crs_matches_geodesic_route_sums(crs, transform, direction):
+    source = CRS.from_user_input(crs)
+    # Geod takes degrees, while EPSG:4807 stores grads. This independent
+    # reference converts the geodetic coordinates using their declared units.
+    transformer = Transformer.from_crs(source, source.geodetic_crs, always_xy=True)
+    angular_factor = source.geodetic_crs.axis_info[0].unit_conversion_factor * 180 / np.pi
+    geod = source.get_geod()
+    expected = np.zeros(direction.shape)
+    for start in np.ndindex(direction.shape):
+        route = _route(direction, start)
+        for cell, parent in zip(route, route[1:]):
+            x, y = rasterio.transform.xy(transform, *cell)
+            px, py = rasterio.transform.xy(transform, *parent)
+            lon, lat = transformer.transform(x, y)
+            plon, plat = transformer.transform(px, py)
+            lon, lat, plon, plat = (v * angular_factor for v in (lon, lat, plon, plat))
+            expected[start] += geod.inv(lon, lat, plon, plat)[2]
+    actual = compute_ltnd(direction, transform, crs=source)
+    np.testing.assert_allclose(actual, expected, rtol=1e-10, atol=1e-7)
+
+
+def test_agree_defaults_are_unchanged(tmp_path):
+    spec = TerrainSpec(
+        dem=tmp_path / "dem", mini_ownership=tmp_path / "ownership",
+        drainage=tmp_path / "drainage", mini_index=tmp_path / "index",
+        output_dir=tmp_path / "output",
+    )
+    assert (spec.agree_sharp, spec.agree_smooth, spec.agree_buffer) == (80.0, 8.0, 4)
