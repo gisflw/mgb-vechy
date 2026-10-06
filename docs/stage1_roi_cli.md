@@ -36,7 +36,6 @@ mgb-vec-hydro define-roi \
 | `--memory-limit-mb` | Optional | Positive integer MB; default `512` | Memory budget used to size bounded processing packets. |
 | `--io-slots` | Optional | Positive integer; default `2` | Maximum number of concurrent source-I/O operations. |
 | `--batch-size` | Optional | Positive integer rows; default `10000` | Number of provider rows inspected per bounded attribute scan. |
-| `--checkpoint-dir` | Optional | Directory path | Scratch location for resumable geometry packets; it must be outside `--output-dir`. |
 
 Click also provides `--help` to display the command’s generated option list.
 
@@ -58,8 +57,8 @@ The normalized output schema is:
 
 `unit_length` is geodesic length in km and `unit_area` is geodesic area in
 km². Upstream metrics are deterministic topology reductions. Selected
-geometry is processed in bounded worker packets, checkpointed when requested,
-and written to spatially indexed FlatGeobuf files.
+geometry is processed in bounded worker packets and written to spatially
+indexed FlatGeobuf files.
 
 The published directory contains exactly these root-level files:
 
@@ -72,5 +71,4 @@ roi/
 There is no `manifest.json` and no nested output directory. The report and
 CLI status identify both concrete paths. Defaults are 512 MB, four workers,
 two concurrent I/O operations, and 10,000-row scans. Worker counts may be any
-positive integer. Checkpoints are scratch state outside `--output-dir` and are
-removed after successful publication.
+positive integer.

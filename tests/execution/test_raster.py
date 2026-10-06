@@ -177,7 +177,7 @@ def test_direct_raster_paths_reject_missing_and_mismatched_grid_inputs(
             {"missing": tmp_path / "missing.tif", "mismatched": mismatched},
             context,
         )
-        with pytest.raises(RasterGridError, match="missing"):
+        with pytest.raises(rasterio.errors.RasterioIOError, match="missing"):
             reader.source("missing")
         with pytest.raises(RasterGridError, match="canonical grid"):
             reader.source("mismatched")

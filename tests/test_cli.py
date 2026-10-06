@@ -23,13 +23,11 @@ def test_public_stage_commands_expose_their_primary_inputs():
             "--dem",
             "--cells",
             "--drainage",
-            "--mini-index",
             "--direction-source",
         ),
         "sample-minis": (
             "--mini-catchments",
             "--mini-segments",
-            "--mini-index",
             "--dem",
             "--cells",
             "--drainage",
@@ -43,6 +41,8 @@ def test_public_stage_commands_expose_their_primary_inputs():
         result = runner.invoke(main, [command, "--help"])
         assert result.exit_code == 0
         assert all(option in result.output for option in options)
+        assert "--mini-index" not in result.output
+        assert "--checkpoint-dir" not in result.output
 
 
 def test_worker_options_have_no_artificial_upper_bound():

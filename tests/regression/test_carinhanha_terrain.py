@@ -71,7 +71,7 @@ def test_terrain_routing_matches_reference_statistics_on_representative_catchmen
         elevation, labels, drainage, metric_transform
     )
     hand = compute_hand(elevation, direction, rank)
-    ltnd_km = compute_ltnd(direction, metric_transform, rank) / 1_000
+    ltnd_km = compute_ltnd(direction, geographic_transform, rank, crs="EPSG:4326") / 1_000
     compared = (
         (labels == 0)
         & np.isfinite(hand)

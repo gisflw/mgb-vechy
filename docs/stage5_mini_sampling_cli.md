@@ -1,14 +1,13 @@
 # Stage 5: sample mini-basin attributes
 
-`mgb-vec-hydro sample-minis` consumes explicit mini vectors, the shared mini
-index, prepared domain rasters, terrain products, the prepared DEM, and the
+`mgb-vec-hydro sample-minis` consumes explicit mini vectors, prepared domain
+rasters with embedded mini bounds, terrain products, the prepared DEM, and the
 categorical HRU raster.
 
 ```bash
 mgb-vec-hydro sample-minis \
   --mini-catchments minis/mini_catchments.fgb \
   --mini-segments minis/mini_segments.fgb \
-  --mini-index prepared/mini_index.csv \
   --dem prepared/dem.tif \
   --cells prepared/cells.tif \
   --drainage prepared/drainage.tif \
@@ -24,10 +23,9 @@ mgb-vec-hydro sample-minis \
 | --- | --- | --- | --- |
 | `--mini-catchments` | Required | Existing vector path | Aggregated mini-catchment polygons and normalized mini attributes. |
 | `--mini-segments` | Required | Existing vector path | Aggregated mini-segment lines and normalized reach attributes. |
-| `--mini-index` | Required | Existing CSV path | Shared six-column mini index whose IDs and labels must match the mini vectors. |
 | `--dem` | Required | Existing raster path | Prepared DEM and authoritative canonical grid for sampling. |
-| `--cells` | Required | Existing raster path | Dense mini labels used to select catchment cells for each mini. |
-| `--drainage` | Required | Existing raster path | Drainage labels used to select reach cells for each mini. |
+| `--cells` | Required | Existing raster path | Dense integer mini IDs and embedded bounds used to select catchment cells. |
+| `--drainage` | Required | Existing raster path | Drainage mask used to select reach cells within each mini. |
 | `--hand` | Required | Existing raster path | Terrain height-above-drainage raster used for reach and tributary statistics. |
 | `--ltnd` | Required | Existing raster path | Local terrain-to-drainage distance raster used for tributary statistics. |
 | `--hru` | Required | Existing raster path | Integer categorical HRU raster; sampled classes must be in `1..100`. |
@@ -36,32 +34,29 @@ mgb-vec-hydro sample-minis \
 | `--memory-limit-mb` | Optional | Positive integer MB; default `512` | Memory budget used to size bounded raster sampling packets. |
 | `--io-slots` | Optional | Positive integer; default `2` | Maximum number of concurrent raster reads. |
 | `--batch-size` | Optional | Positive integer rows; default `10000` | Batch size used when reading vector metadata. |
-| `--checkpoint-dir` | Optional | Directory path | Scratch location for resumable sampling packets; it must be outside `--output-dir`. |
 
 Click also provides `--help` to display the command’s generated option list.
 
 The DEM is authoritative for CRS and canonical grid. Both mini vectors must
 declare that CRS, use the exact aggregation schema, and contain the same IDs
-as the six-column `mini_index.csv`. All six raster inputs must be
+as the mini IDs stored in `cells.tif`. All six raster inputs must be
 single-band COGs with the exact DEM grid, matching CRS, and internal masks.
 The HRU raster must be integer-valued; sampled class IDs must be in `1..100`.
-Missing or mismatched files, CRS, grid, masks, schemas, or IDs are rejected.
+CRS, grid, masks, and mini IDs must match. Missing fields and unreadable
+inputs fail directly in the underlying libraries.
 
-DEM, HAND, and LTND must declare `units=m` for their stored values. Legacy
-unitless products are rejected with instructions to regenerate preparation
-and terrain. In particular, degree-valued LTND cannot be accurately converted
+DEM, HAND, and LTND must declare `units=m` for their stored values.
+In particular, degree-valued LTND cannot be accurately converted
 with one scale factor after route directions have been discarded. For a DEM
 stored in centimetres, run preparation with `--dem-scale 0.01`, then regenerate
-terrain and sampling into new directories. Old sampling checkpoints cannot
-resume under the corrected unit contract.
+terrain and sampling into new directories.
 
-Sampling uses dense cell labels rather than polygon masks. Catchment
-statistics use cells labeled for each mini; reach elevation uses matching
+Sampling uses mini IDs in cells rather than polygon masks. Catchment
+statistics use cells owned by each mini; reach elevation uses matching
 drainage cells. Longitude and latitude use a representative point on each mini
 segment. Exact percentiles and deterministic accumulators are reduced
 over complete mini packets, while each distinct canonical COG block is read
-once per raster in a packet. No raster is reprojected and no terrain or index
-file is republished.
+once per raster in a packet. No raster is reprojected or republished.
 
 The output directory is staged privately and contains exactly one root-level
 file:
@@ -78,8 +73,7 @@ geometry. The output includes longitude/latitude, `reach_slope`,
 percentage columns summing to 100%; and `flooded_area_<stage>` columns for
 stages 1 through 100, in that order. Column names omit units; lengths and
 elevations are metres, slopes are metres per kilometre, and areas are km².
-Optional `--checkpoint-dir` is operational scratch outside `--output-dir`; it is
-removed after successful publication. The CLI prints the concrete CSV path.
+The CLI prints the concrete CSV path.
 Execution defaults are four workers, 512 MB of admitted task memory, two I/O
 slots, and 10,000-row batches. Worker counts may be any positive integer.
 

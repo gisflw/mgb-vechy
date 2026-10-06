@@ -26,8 +26,7 @@ python -m pip install -e .
 
 Run the stages in this order: define an ROI, aggregate mini-basins, prepare
 the raster/mini domain, generate terrain products, then sample the mini-basins.
-`--output-dir` is the publication destination. Optional `--checkpoint-dir`
-locations are operational scratch space and must be outside that destination.
+`--output-dir` is the publication destination.
 
 ### Prepare canonical inputs
 
@@ -86,7 +85,6 @@ mgb-vec-hydro terrain-products \
   --dem prepared/dem.tif \
   --cells prepared/cells.tif \
   --drainage prepared/drainage.tif \
-  --mini-index prepared/mini_index.csv \
   --direction-source dem \
   --output-dir output/terrain
 ```
@@ -100,7 +98,6 @@ categorical HRU raster into a geometry-free CSV:
 mgb-vec-hydro sample-minis \
   --mini-catchments output/minis/mini_catchments.fgb \
   --mini-segments output/minis/mini_segments.fgb \
-  --mini-index prepared/mini_index.csv \
   --dem prepared/dem.tif \
   --cells prepared/cells.tif \
   --drainage prepared/drainage.tif \

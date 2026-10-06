@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import pickle
 import shutil
 import time
 from dataclasses import dataclass
@@ -16,13 +15,8 @@ from pyarrow import ipc
 from pyproj import CRS, Transformer
 
 from mgb_vec_hydro.aggregation import AGGREGATION_COLUMNS
-from mgb_vec_hydro.crs_utils import CrsError, geodetic_tools, require_metre_units
-from mgb_vec_hydro.exceptions import MiniSamplingError, RasterGridError
-from mgb_vec_hydro.execution.checkpoints import (
-    CheckpointStore,
-    execution_fingerprint,
-    file_identity,
-)
+from mgb_vec_hydro.crs_utils import geodetic_tools, require_metre_units
+from mgb_vec_hydro.exceptions import MiniSamplingError
 from mgb_vec_hydro.execution.executor import (
     ExecutionConfig,
     ExecutionReport,
@@ -46,7 +40,7 @@ from mgb_vec_hydro.execution.vector import (
     inspect_vector_provider,
     iter_provider_batches,
 )
-from mgb_vec_hydro.preparation import BLOCK_SIZE, GridSpec
+from mgb_vec_hydro.preparation import BLOCK_SIZE, GridSpec, read_mini_index
 
 MAX_PACKET_UNITS = 8
 SAMPLING_BYTES_PER_CELL = 96
@@ -57,7 +51,6 @@ TASK_FIXED_BYTES = 8 * 1024 * 1024
 class MiniSamplingSpec:
     mini_catchments: Path
     mini_segments: Path
-    mini_index: Path
     dem: Path
     mini_ownership: Path
     drainage: Path
@@ -69,7 +62,6 @@ class MiniSamplingSpec:
     memory_limit_mb: int = 512
     io_slots: int = 2
     batch_size: int = 10_000
-    checkpoint_dir: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -86,8 +78,7 @@ class MiniSamplingReport:
 
 @dataclass(frozen=True)
 class _MiniMetadata:
-    label: int
-    mini_id: Any
+    mini_id: int
     attributes: dict[str, Any]
     longitude: float
     latitude: float
@@ -108,29 +99,13 @@ class _PacketResult:
     classes: tuple[int, ...]
 
 
-class _PickleCheckpointCodec:
-    suffix = ".pkl"
-
-    def dump(self, value: _PacketResult, path: Path) -> None:
-        with path.open("wb") as stream:
-            pickle.dump(value, stream, protocol=pickle.HIGHEST_PROTOCOL)
-
-    def load(self, path: Path) -> _PacketResult:
-        with path.open("rb") as stream:
-            return pickle.load(stream)
-
-
 def sample_minibasins(spec: MiniSamplingSpec) -> MiniSamplingReport:
     """Sample canonical terrain and categorical cells with bounded block reuse."""
 
     overall_started = time.perf_counter()
-    _validate_spec(spec)
 
     planning_started = time.perf_counter()
-    try:
-        grid = grid_from_dem(spec.dem)
-    except RasterGridError as exc:
-        raise MiniSamplingError("Cannot discover the canonical DEM grid") from exc
+    grid = grid_from_dem(spec.dem)
     raster_assets = {
         "dem": Path(spec.dem),
         "hru": Path(spec.hru),
@@ -150,7 +125,7 @@ def sample_minibasins(spec: MiniSamplingSpec) -> MiniSamplingReport:
         fixed_bytes=TASK_FIXED_BYTES,
         max_units=MAX_PACKET_UNITS,
     )
-    metadata_by_key = {f"mini-{value.label:010d}": value for value in metadata.values()}
+    metadata_by_key = {f"mini-{value.mini_id:010d}": value for value in metadata.values()}
     items = [
         WorkItem(
             packet.key,
@@ -167,25 +142,6 @@ def sample_minibasins(spec: MiniSamplingSpec) -> MiniSamplingReport:
     ]
     planning_seconds = time.perf_counter() - planning_started
 
-    checkpoint = None
-    if spec.checkpoint_dir is not None:
-        fingerprint = execution_fingerprint(
-            algorithm="sample-minis",
-            version="5",
-            input_identity={
-                name: file_identity(path) for name, path in raster_assets.items()
-            }
-            | {
-                "mini_index": file_identity(Path(spec.mini_index)),
-                "mini_catchments": file_identity(Path(spec.mini_catchments)),
-                "mini_segments": file_identity(Path(spec.mini_segments)),
-            },
-            parameters={},
-            work_items=items,
-        )
-        checkpoint = CheckpointStore(
-            spec.checkpoint_dir, fingerprint, _PickleCheckpointCodec()
-        )
 
     config = ExecutionConfig(
         workers=spec.workers,
@@ -224,7 +180,6 @@ def sample_minibasins(spec: MiniSamplingSpec) -> MiniSamplingReport:
             items,
             _sampling_worker,
             reduce_packet,
-            checkpoint=checkpoint,
         )
 
         csv_started = time.perf_counter()
@@ -240,20 +195,12 @@ def sample_minibasins(spec: MiniSamplingSpec) -> MiniSamplingReport:
     publication_seconds = (
         time.perf_counter() - publication_started - execution.wall_seconds - csv_seconds
     )
-    if checkpoint is not None:
-        checkpoint.cleanup()
-    if spec.checkpoint_dir is not None:
-        try:
-            Path(spec.checkpoint_dir).rmdir()
-        except OSError:
-            pass
 
     timings = {
         "planning": planning_seconds,
         "raster_reads": float(execution.timings.get("raster_reads", 0.0)),
         "computation": float(execution.timings.get("computation", 0.0)),
         "coordination": float(execution.timings.get("coordination", 0.0)),
-        "checkpointing": float(execution.timings.get("checkpoint_write", 0.0)),
         "packet_staging": float(execution.timings.get("packet_staging", 0.0)),
         "csv_assembly": csv_seconds,
         "publication": max(0.0, publication_seconds),
@@ -272,43 +219,6 @@ def sample_minibasins(spec: MiniSamplingSpec) -> MiniSamplingReport:
     )
 
 
-def _validate_spec(spec: MiniSamplingSpec) -> None:
-    for name, value in (
-        ("workers", spec.workers),
-        ("memory limit", spec.memory_limit_mb),
-        ("I/O slots", spec.io_slots),
-        ("batch size", spec.batch_size),
-    ):
-        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
-            raise MiniSamplingError(f"{name} must be a positive integer")
-    for name, path in (
-        ("mini catchments", spec.mini_catchments),
-        ("mini segments", spec.mini_segments),
-        ("mini index", spec.mini_index),
-        ("DEM", spec.dem),
-        ("cells", spec.mini_ownership),
-        ("drainage", spec.drainage),
-        ("HAND", spec.hand),
-        ("LTND", spec.ltnd),
-        ("HRU", spec.hru),
-    ):
-        if not Path(path).is_file():
-            raise MiniSamplingError(f"{name} input is not a local file: {path}")
-    output = Path(spec.output_dir)
-    if output.exists():
-        raise MiniSamplingError(f"Output directory already exists: {output}")
-    if spec.checkpoint_dir is not None:
-        checkpoint = Path(spec.checkpoint_dir).resolve()
-        try:
-            checkpoint.relative_to(output.resolve())
-        except ValueError:
-            pass
-        else:
-            raise MiniSamplingError(
-                "Checkpoint directory cannot be inside the output directory"
-            )
-
-
 def _validate_sampling_rasters(
     assets: dict[str, Path], grid: GridSpec
 ) -> None:
@@ -321,107 +231,44 @@ def _validate_sampling_rasters(
         "ltnd": "float32",
     }
     for name, path in assets.items():
-        try:
-            with rasterio.open(path) as source:
-                _require_grid(source, grid, name)
-                if name in {"dem", "hand", "ltnd"}:
-                    require_metre_units(source, name.upper())
-                if name == "hru" and not np.issubdtype(
-                    np.dtype(source.dtypes[0]), np.integer
-                ):
-                    raise MiniSamplingError("HRU raster must have an integer data type")
-                expected = expected_dtypes[name]
-                if expected is not None and source.dtypes[0] != expected:
-                    raise MiniSamplingError(
-                        f"{name.upper()} raster has dtype {source.dtypes[0]}, "
-                        f"expected {expected}"
-                    )
-        except MiniSamplingError:
-            raise
-        except CrsError as exc:
-            raise MiniSamplingError(str(exc)) from exc
-        except RasterGridError as exc:
-            raise MiniSamplingError(
-                f"Explicit {name} raster does not match the canonical DEM grid"
-            ) from exc
-        except (OSError, rasterio.errors.RasterioError, TypeError, ValueError) as exc:
-            raise MiniSamplingError(
-                f"Cannot inspect explicit {name} raster: {path}"
-            ) from exc
-
-
-def _read_index(path: Path, expected_columns: list[str], name: str) -> pd.DataFrame:
-    try:
-        table = pd.read_csv(
-            path,
-            dtype={"mini_label": "int32", "mini_id": "string"},
-            keep_default_na=False,
-        )
-    except Exception as exc:
-        raise MiniSamplingError(f"Cannot read {name} mini index") from exc
-    if list(table.columns) != expected_columns or table.empty:
-        raise MiniSamplingError(f"{name} mini index schema is invalid")
-    if (
-        table["mini_label"].dtype != np.dtype("int32")
-        or table["mini_label"].duplicated().any()
-        or table["mini_id"].isna().any()
-        or table["mini_id"].eq("").any()
-        or table["mini_id"].duplicated().any()
-        or not np.array_equal(
-            table["mini_label"].to_numpy(),
-            np.arange(1, len(table) + 1, dtype="int32"),
-        )
-    ):
-        raise MiniSamplingError(f"{name} mini index values are invalid")
-    if set(expected_columns) == {
-        "mini_label",
-        "mini_id",
-        "minx",
-        "miny",
-        "maxx",
-        "maxy",
-    }:
-        try:
-            bounds = table[["minx", "miny", "maxx", "maxy"]].to_numpy(dtype=float)
-        except (TypeError, ValueError) as exc:
-            raise MiniSamplingError(f"{name} mini index bounds are invalid") from exc
-        if (
-            not np.isfinite(bounds).all()
-            or np.any(bounds[:, 0] > bounds[:, 2])
-            or np.any(bounds[:, 1] > bounds[:, 3])
-        ):
-            raise MiniSamplingError(f"{name} mini index bounds are invalid")
-    return table
+        with rasterio.open(path) as source:
+            _require_grid(source, grid, name)
+            if name in {"dem", "hand", "ltnd"}:
+                require_metre_units(source, name.upper())
+            if name == "hru" and not np.issubdtype(
+                np.dtype(source.dtypes[0]), np.integer
+            ):
+                raise MiniSamplingError("HRU raster must have an integer data type")
+            expected = expected_dtypes[name]
+            if expected is not None and source.dtypes[0] != expected:
+                raise MiniSamplingError(
+                    f"{name.upper()} raster has dtype {source.dtypes[0]}, "
+                    f"expected {expected}"
+                )
 
 
 def _plan_sampling(
     spec: MiniSamplingSpec,
     grid: GridSpec,
-) -> tuple[dict[Any, _MiniMetadata], tuple[RasterUnit, ...]]:
+) -> tuple[dict[int, _MiniMetadata], tuple[RasterUnit, ...]]:
     catchments_path = Path(spec.mini_catchments)
     segments_path = Path(spec.mini_segments)
-    prepared_index_path = Path(spec.mini_index)
-    prepared_index = _read_index(
-        prepared_index_path,
-        ["mini_label", "mini_id", "minx", "miny", "maxx", "maxy"],
-        "prepared",
-    )
+    prepared_index = read_mini_index(spec.mini_ownership)
     catchments = _stream_vector_metadata(
         catchments_path, "catchments", grid.crs, spec.batch_size
     )
     segments = _stream_vector_metadata(
         segments_path, "segments", grid.crs, spec.batch_size
     )
-    expected_ids = set(prepared_index["mini_id"].tolist())
+    expected_ids = {mini_id for mini_id, *_ in prepared_index}
     if set(catchments) != expected_ids or set(segments) != expected_ids:
         raise MiniSamplingError(
             "Aggregation vectors and raster mini indexes do not contain the same IDs"
         )
 
-    metadata: dict[Any, _MiniMetadata] = {}
+    metadata: dict[int, _MiniMetadata] = {}
     unit_bounds = []
-    for row in prepared_index.itertuples(index=False):
-        mini_id = row.mini_id
+    for mini_id, *bounds in prepared_index:
         catchment = catchments[mini_id]
         segment = segments[mini_id]
         for column in AGGREGATION_COLUMNS[:-1]:
@@ -433,9 +280,7 @@ def _plan_sampling(
                 raise MiniSamplingError(
                     f"Mini {mini_id} catchment and segment attributes do not match"
                 )
-        label = int(row.mini_label)
         metadata[mini_id] = _MiniMetadata(
-            label,
             mini_id,
             catchment["attributes"],
             float(segment["longitude"]),
@@ -444,90 +289,79 @@ def _plan_sampling(
         )
         unit_bounds.append(
             (
-                f"mini-{label:010d}",
-                (float(row.minx), float(row.miny), float(row.maxx), float(row.maxy)),
+                f"mini-{mini_id:010d}",
+                tuple(bounds),
             )
         )
 
-    try:
-        units = plan_raster_units(
-            grid,
-            unit_bounds,
-            bytes_per_cell=SAMPLING_BYTES_PER_CELL,
-            fixed_bytes=TASK_FIXED_BYTES,
-            block_size=BLOCK_SIZE,
-        )
-    except RasterGridError as exc:
-        raise MiniSamplingError("Mini index bounds do not overlap the DEM grid") from exc
+    units = plan_raster_units(
+        grid,
+        unit_bounds,
+        bytes_per_cell=SAMPLING_BYTES_PER_CELL,
+        fixed_bytes=TASK_FIXED_BYTES,
+        block_size=BLOCK_SIZE,
+    )
     return metadata, units
 
 
 def _stream_vector_metadata(
     path: Path, name: str, expected_crs: CRS, batch_size: int
-) -> dict[Any, dict[str, Any]]:
-    try:
-        provider = inspect_vector_provider(path)
-        if provider.crs != expected_crs:
-            raise MiniSamplingError(f"{name} CRS does not match the canonical grid")
-        if tuple(provider.fields) != tuple(AGGREGATION_COLUMNS[:-1]):
-            raise MiniSamplingError(f"{name} must have the exact aggregation schema")
-        allowed = {3, 6} if name == "catchments" else {1, 5}
-        result: dict[Any, dict[str, Any]] = {}
-        transformer = Transformer.from_crs(expected_crs, "EPSG:4326", always_xy=True)
-        for batch in iter_provider_batches(
-            provider,
-            columns=AGGREGATION_COLUMNS[:-1],
-            batch_size=batch_size,
-            read_geometry=True,
+) -> dict[int, dict[str, Any]]:
+    provider = inspect_vector_provider(path)
+    if provider.crs != expected_crs:
+        raise MiniSamplingError(f"{name} CRS does not match the canonical grid")
+    allowed = {3, 6} if name == "catchments" else {1, 5}
+    result: dict[int, dict[str, Any]] = {}
+    transformer = Transformer.from_crs(expected_crs, "EPSG:4326", always_xy=True)
+    for batch in iter_provider_batches(
+        provider,
+        columns=AGGREGATION_COLUMNS[:-1],
+        batch_size=batch_size,
+        read_geometry=True,
+    ):
+        table = pa.Table.from_batches([batch])
+        geometry_column = geometry_column_name(table)
+        geometries = shapely.from_wkb(
+            table[geometry_column].combine_chunks().to_numpy(zero_copy_only=False),
+            on_invalid="raise",
+        )
+        if (
+            np.any(shapely.is_empty(geometries))
+            or np.any(shapely.is_missing(geometries))
+            or not set(shapely.get_type_id(geometries).tolist()).issubset(allowed)
         ):
-            table = pa.Table.from_batches([batch])
-            geometry_column = geometry_column_name(table)
-            geometries = shapely.from_wkb(
-                table[geometry_column].combine_chunks().to_numpy(zero_copy_only=False),
-                on_invalid="raise",
+            raise MiniSamplingError(f"{name} contains invalid geometry")
+        frame = table.drop([geometry_column]).to_pandas()
+        if name == "segments":
+            points = shapely.point_on_surface(geometries)
+            lonlat = shapely.transform(
+                points, transformer.transform, interleaved=False
             )
-            if (
-                np.any(shapely.is_empty(geometries))
-                or np.any(shapely.is_missing(geometries))
-                or not set(shapely.get_type_id(geometries).tolist()).issubset(allowed)
-            ):
-                raise MiniSamplingError(f"{name} contains invalid geometry")
-            frame = table.drop([geometry_column]).to_pandas()
-            if name == "segments":
-                points = shapely.point_on_surface(geometries)
-                lonlat = shapely.transform(
-                    points, transformer.transform, interleaved=False
+        for position, row in enumerate(frame.to_dict("records")):
+            row = {
+                key: (None if pd.isna(value) else value)
+                for key, value in row.items()
+            }
+            mini_id = row["id"]
+            if pd.isna(mini_id) or mini_id in result:
+                raise MiniSamplingError(
+                    f"{name} contains missing or duplicate mini IDs"
                 )
-            for position, row in enumerate(frame.to_dict("records")):
-                row = {
-                    key: (None if _is_scalar_missing(value) else value)
-                    for key, value in row.items()
-                }
-                mini_id = row["id"]
-                mini_key = str(mini_id)
-                if pd.isna(mini_id) or mini_key in result:
+            _validate_metric_columns(row, name, mini_id)
+            entry: dict[str, Any] = {"attributes": row}
+            if name == "segments":
+                entry["longitude"] = float(shapely.get_x(lonlat[position]))
+                entry["latitude"] = float(shapely.get_y(lonlat[position]))
+                length = float(row["unit_length"])
+                if length <= 0 or float(shapely.length(geometries[position])) <= 0:
                     raise MiniSamplingError(
-                        f"{name} contains missing or duplicate mini IDs"
+                        f"Mini {mini_id} has a zero or invalid reach length"
                     )
-                _validate_metric_columns(row, name, mini_id)
-                entry: dict[str, Any] = {"attributes": row}
-                if name == "segments":
-                    entry["longitude"] = float(shapely.get_x(lonlat[position]))
-                    entry["latitude"] = float(shapely.get_y(lonlat[position]))
-                    length = float(row["unit_length"])
-                    if length <= 0 or float(shapely.length(geometries[position])) <= 0:
-                        raise MiniSamplingError(
-                            f"Mini {mini_id} has a zero or invalid reach length"
-                        )
-                    entry["unit_length"] = length
-                result[mini_key] = entry
-        if not result:
-            raise MiniSamplingError(f"{name} is empty")
-        return result
-    except MiniSamplingError:
-        raise
-    except Exception as exc:
-        raise MiniSamplingError(f"Cannot stream aggregation {name}") from exc
+                entry["unit_length"] = length
+            result[mini_id] = entry
+    if not result:
+        raise MiniSamplingError(f"{name} is empty")
+    return result
 
 
 def _validate_metric_columns(row: dict[str, Any], name: str, mini_id: Any) -> None:
@@ -540,20 +374,10 @@ def _validate_metric_columns(row: dict[str, Any], name: str, mini_id: Any) -> No
         "upstream_area",
     ):
         value = row[column]
-        if isinstance(value, bool) or not isinstance(value, (int, float, np.number)):
-            raise MiniSamplingError(f"{name} has non-numeric metric column {column}")
         if not np.isfinite(float(value)):
             raise MiniSamplingError(
                 f"Mini {mini_id} contains non-finite aggregation attributes"
             )
-
-
-def _is_scalar_missing(value: Any) -> bool:
-    try:
-        result = pd.isna(value)
-    except (TypeError, ValueError):
-        return False
-    return bool(result) if isinstance(result, (bool, np.bool_)) else False
 
 
 def _equal_values(left: Any, right: Any) -> bool:
@@ -573,7 +397,7 @@ def _sampling_worker(
         ),
         lambda: AlignedRasterReader(payload.grid, payload.raster_assets, context),
     )
-    minis = {value.label: value for value in payload.minis}
+    minis = {value.mini_id: value for value in payload.minis}
     accumulators = {
         label: {
             "dem": [],
@@ -665,7 +489,7 @@ def _sampling_worker(
     rows = []
     classes: set[int] = set()
     for value in payload.minis:
-        acc = accumulators[value.label]
+        acc = accumulators[value.mini_id]
         if not acc["hand"]:
             raise MiniSamplingError(
                 f"Mini {value.mini_id} has no sampled catchment raster cells"
@@ -737,52 +561,49 @@ def _cell_areas_km2(grid: GridSpec, window, selected: np.ndarray) -> np.ndarray:
     if not rows.size:
         return np.empty(0, dtype=np.float64)
     transform = grid.transform
-    try:
-        transformer, geod = geodetic_tools(grid.crs.to_wkt())
-        if grid.crs.is_geographic:
-            # Ellipsoidal cell area is longitude-invariant, so one area per row suffices.
-            unique_rows, inverse = np.unique(rows, return_inverse=True)
-            x0 = transform.c + window.col_off * transform.a
-            x1 = x0 + transform.a
-            y1 = transform.f + (window.row_off + unique_rows) * transform.e
-            y0 = y1 + transform.e
-            xs = np.column_stack(
-                (
-                    np.full(len(unique_rows), x0),
-                    np.full(len(unique_rows), x1),
-                    np.full(len(unique_rows), x1),
-                    np.full(len(unique_rows), x0),
-                )
+    transformer, geod = geodetic_tools(grid.crs.to_wkt())
+    if grid.crs.is_geographic:
+        # Ellipsoidal cell area is longitude-invariant, so one area per row suffices.
+        unique_rows, inverse = np.unique(rows, return_inverse=True)
+        x0 = transform.c + window.col_off * transform.a
+        x1 = x0 + transform.a
+        y1 = transform.f + (window.row_off + unique_rows) * transform.e
+        y0 = y1 + transform.e
+        xs = np.column_stack(
+            (
+                np.full(len(unique_rows), x0),
+                np.full(len(unique_rows), x1),
+                np.full(len(unique_rows), x1),
+                np.full(len(unique_rows), x0),
             )
-            ys = np.column_stack((y0, y0, y1, y1))
-            lon, lat = transformer.transform(xs, ys)
-            row_areas = np.array(
-                [
-                    abs(geod.polygon_area_perimeter(cell_lon, cell_lat)[0]) / 1e6
-                    for cell_lon, cell_lat in zip(lon, lat, strict=True)
-                ]
-            )
-            return np.asarray(row_areas[inverse], dtype=np.float64)
-
-        areas = np.empty(rows.size, dtype=np.float64)
-        for start in range(0, rows.size, 4096):
-            stop = min(start + 4096, rows.size)
-            cell_rows = rows[start:stop] + window.row_off
-            cell_cols = cols[start:stop] + window.col_off
-            x0 = transform.c + cell_cols * transform.a
-            x1 = x0 + transform.a
-            y1 = transform.f + cell_rows * transform.e
-            y0 = y1 + transform.e
-            xs = np.column_stack((x0, x1, x1, x0))
-            ys = np.column_stack((y0, y0, y1, y1))
-            lon, lat = transformer.transform(xs, ys)
-            areas[start:stop] = [
+        )
+        ys = np.column_stack((y0, y0, y1, y1))
+        lon, lat = transformer.transform(xs, ys)
+        row_areas = np.array(
+            [
                 abs(geod.polygon_area_perimeter(cell_lon, cell_lat)[0]) / 1e6
                 for cell_lon, cell_lat in zip(lon, lat, strict=True)
             ]
-        return areas
-    except Exception as exc:
-        raise MiniSamplingError("Cannot measure raster cell areas geodesically") from exc
+        )
+        return np.asarray(row_areas[inverse], dtype=np.float64)
+
+    areas = np.empty(rows.size, dtype=np.float64)
+    for start in range(0, rows.size, 4096):
+        stop = min(start + 4096, rows.size)
+        cell_rows = rows[start:stop] + window.row_off
+        cell_cols = cols[start:stop] + window.col_off
+        x0 = transform.c + cell_cols * transform.a
+        x1 = x0 + transform.a
+        y1 = transform.f + cell_rows * transform.e
+        y0 = y1 + transform.e
+        xs = np.column_stack((x0, x1, x1, x0))
+        ys = np.column_stack((y0, y0, y1, y1))
+        lon, lat = transformer.transform(xs, ys)
+        areas[start:stop] = [
+            abs(geod.polygon_area_perimeter(cell_lon, cell_lat)[0]) / 1e6
+            for cell_lon, cell_lat in zip(lon, lat, strict=True)
+        ]
+    return areas
 
 
 def _require_valid(
@@ -792,7 +613,7 @@ def _require_valid(
     name: str,
 ) -> None:
     if np.ma.getmaskarray(array)[selected].any():
-        raise MiniSamplingError(f"Mini label {label} contains {name} nodata")
+        raise MiniSamplingError(f"Mini {label} contains {name} nodata")
 
 
 def _validate_row(row: dict[str, Any]) -> None:

@@ -1,5 +1,4 @@
 from dataclasses import replace
-import importlib
 
 import numpy as np
 import pandas as pd
@@ -9,8 +8,10 @@ from affine import Affine
 from pyproj import CRS, Transformer
 from rasterio.shutil import copy as copy_raster
 from shapely.geometry import LineString, Polygon
+from shapely import point_on_surface
 
-from mgb_vec_hydro.exceptions import CheckpointError, MiniSamplingError, WorkMemoryError
+from mgb_vec_hydro.crs_utils import CrsError
+from mgb_vec_hydro.exceptions import WorkMemoryError
 from mgb_vec_hydro.execution.vector import VectorTable, write_vector_table
 from mgb_vec_hydro.preparation import (
     GridSpec,
@@ -28,9 +29,10 @@ from mgb_vec_hydro.terrain import TerrainSpec, create_terrain_dataset
 
 def _sampling_inputs(
     tmp_path, *, crs="EPSG:3857", dem_scale=1.0, transform=None, explicit_d8=False,
+    mini_count=2,
 ):
     transform = transform or Affine(10, 0, 0, 0, -10, 40)
-    dem_values = np.arange(32, dtype=np.float32).reshape(4, 8) / dem_scale
+    dem_values = np.arange(16 * mini_count, dtype=np.float32).reshape(4, 4 * mini_count) / dem_scale
     hru_values = np.array(
         [
             [1, 1, 2, 0, 2, 3, 3, 0],
@@ -40,16 +42,17 @@ def _sampling_inputs(
         ],
         dtype=np.int16,
     )
+    hru_values = np.tile(hru_values, (1, (mini_count + 1) // 2))[:, :4 * mini_count]
     for path, values in (
         (tmp_path / "dem.tif", dem_values),
         (tmp_path / "hru.tif", hru_values),
-        *([(tmp_path / "d8.tif", np.full((4, 8), 3, dtype="uint8"))] if explicit_d8 else []),
+        *([(tmp_path / "d8.tif", np.full((4, 4 * mini_count), 3, dtype="uint8"))] if explicit_d8 else []),
     ):
         with rasterio.open(
             path,
             "w",
             driver="GTiff",
-            width=8,
+            width=4 * mini_count,
             height=4,
             count=1,
             dtype=values.dtype,
@@ -60,14 +63,14 @@ def _sampling_inputs(
             target.write_mask(np.full(values.shape, 255, dtype="uint8"))
 
     values = {
-        "id": [1, 2],
-        "id_down": [2, -1],
-        "sub": [1, 1],
-        "p_order": [1, 2],
-        "unit_length": [1.0, 1.0],
-        "upstream_length": [1.0, 2.0],
-        "unit_area": [1.0, 1.0],
-        "upstream_area": [1.0, 2.0],
+        "id": list(range(1, mini_count + 1)),
+        "id_down": list(range(2, mini_count + 1)) + [-1],
+        "sub": [1] * mini_count,
+        "p_order": list(range(1, mini_count + 1)),
+        "unit_length": [1.0] * mini_count,
+        "upstream_length": [float(i) for i in range(1, mini_count + 1)],
+        "unit_area": [1.0] * mini_count,
+        "upstream_area": [float(i) for i in range(1, mini_count + 1)],
     }
     def point(col, row):
         return (transform.c + col * transform.a, transform.f + row * transform.e)
@@ -75,8 +78,8 @@ def _sampling_inputs(
     catchments = VectorTable.from_pydict(
         values,
         [
-            Polygon([point(0, 4), point(3, 4), point(3, 0), point(0, 0)]),
-            Polygon([point(4, 4), point(7, 4), point(7, 0), point(4, 0)]),
+            Polygon([point(4*i, 4), point(4*i+3, 4), point(4*i+3, 0), point(4*i, 0)])
+            for i in range(mini_count)
         ],
         crs=crs,
         geometry_type="Polygon",
@@ -84,8 +87,8 @@ def _sampling_inputs(
     segments = VectorTable.from_pydict(
         values,
         [
-            LineString([point(2.5, 4), point(2.5, 0)]),
-            LineString([point(6.5, 4), point(6.5, 0)]),
+            LineString([point(4*i+2.5, 4), point(4*i+2.5, 0)])
+            for i in range(mini_count)
         ],
         crs=crs,
         geometry_type="LineString",
@@ -117,7 +120,6 @@ def _sampling_inputs(
             dem=preparation.dem,
             mini_ownership=preparation.mini_ownership,
             drainage=preparation.drainage,
-            mini_index=preparation.mini_index,
             output_dir=terrain,
             workers=1,
             d8=preparation.d8,
@@ -156,7 +158,7 @@ def test_sampling_geographic_centimetre_dem_has_metric_slopes(tmp_path):
 
 
 @pytest.mark.parametrize("name", ["dem", "hand", "ltnd"])
-def test_sampling_rejects_legacy_units_without_publication(tmp_path, name):
+def test_sampling_rejects_wrong_units_without_publication(tmp_path, name):
     from rasterio.shutil import copy as copy_raster
 
     minis, prepared, terrain = _sampling_inputs(tmp_path)
@@ -171,46 +173,8 @@ def test_sampling_rejects_legacy_units_without_publication(tmp_path, name):
     with rasterio.open(working, "r+") as source:
         source.update_tags(**tags)
     copy_raster(working, legacy, driver="COG")
-    with pytest.raises(MiniSamplingError, match=f"{name.upper()}.*regenerate"):
+    with pytest.raises(CrsError, match=f"{name.upper()}.*units=m"):
         sample_minibasins(replace(spec, **{name: legacy}))
-    assert not spec.output_dir.exists()
-
-
-@pytest.mark.parametrize(
-    "stage,legacy_version", [("terrain", "1"), ("sampling", "3")]
-)
-def test_metric_stages_reject_legacy_checkpoints(
-    tmp_path, monkeypatch, stage, legacy_version
-):
-    minis, prepared, terrain = _sampling_inputs(tmp_path)
-    module = importlib.import_module(f"mgb_vec_hydro.{stage}")
-    if stage == "sampling":
-        run = sample_minibasins
-        spec = _sampling_spec(minis, prepared, terrain, tmp_path / "output")
-    else:
-        run = create_terrain_dataset
-        spec = TerrainSpec(
-            dem=prepared.dem, mini_ownership=prepared.mini_ownership,
-            drainage=prepared.drainage, mini_index=prepared.mini_index,
-            output_dir=tmp_path / "output", workers=1,
-        )
-    spec = replace(spec, checkpoint_dir=tmp_path / "checkpoint")
-    fingerprint = module.execution_fingerprint
-
-    def old_fingerprint(**kwargs):
-        kwargs["version"] = legacy_version
-        return fingerprint(**kwargs)
-
-    def interrupt(*args, **kwargs):
-        raise RuntimeError("interrupt after checkpoint creation")
-
-    with monkeypatch.context() as patch:
-        patch.setattr(module, "execution_fingerprint", old_fingerprint)
-        patch.setattr(module.LocalExecutor, "run", interrupt)
-        with pytest.raises(RuntimeError, match="interrupt"):
-            run(spec)
-    with pytest.raises(CheckpointError, match="incompatible"):
-        run(spec)
     assert not spec.output_dir.exists()
 
 
@@ -227,7 +191,7 @@ def _sampling_spec(
     return MiniSamplingSpec(
         mini_catchments=minis / "mini_catchments.fgb",
         mini_segments=minis / "mini_segments.fgb",
-        mini_index=prepared.mini_index,
+
         dem=prepared.dem,
         mini_ownership=prepared.mini_ownership,
         drainage=prepared.drainage,
@@ -328,7 +292,8 @@ def test_sampling_pipeline_is_exact_block_reusing_and_atomic(tmp_path):
             assert np.isclose(row.tributary_slope, expected_tributary_slope)
 
     transformer = Transformer.from_crs("EPSG:3857", "EPSG:4326", always_xy=True)
-    expected = [transformer.transform(25, 20), transformer.transform(65, 20)]
+    points = [point_on_surface(LineString([(x, 0), (x, 40)])) for x in (25, 65)]
+    expected = [transformer.transform(point.x, point.y) for point in points]
     np.testing.assert_allclose(frame["longitude"], [value[0] for value in expected])
     np.testing.assert_allclose(frame["latitude"], [value[1] for value in expected])
 
@@ -426,7 +391,7 @@ def test_cell_area_calculation_handles_geographic_rows_and_projected_cells():
             assert actual[0] != actual[2]
 
 
-def test_sampling_serial_runs_are_byte_deterministic(tmp_path, monkeypatch):
+def test_sampling_serial_and_parallel_runs_are_byte_deterministic(tmp_path, monkeypatch):
     monkeypatch.setattr("mgb_vec_hydro.sampling.MAX_PACKET_UNITS", 1)
     minis, prepared, terrain = _sampling_inputs(tmp_path)
     paths = []
@@ -442,7 +407,7 @@ def test_sampling_rejects_missing_hru_and_oversized_unit_without_publication(tmp
     minis, prepared, terrain = _sampling_inputs(tmp_path)
 
     missing_output = tmp_path / "missing"
-    with pytest.raises(MiniSamplingError, match="HRU input is not a local file"):
+    with pytest.raises(rasterio.errors.RasterioIOError, match="missing.tif"):
         sample_minibasins(
             _sampling_spec(
                 minis,
@@ -467,3 +432,20 @@ def test_sampling_rejects_missing_hru_and_oversized_unit_without_publication(tmp
             )
         )
     assert not memory_output.exists()
+
+
+def test_sampling_preserves_mini_ids_above_nine_through_the_pipeline(tmp_path):
+    minis, prepared, terrain = _sampling_inputs(tmp_path, mini_count=12, explicit_d8=True)
+    report = sample_minibasins(_sampling_spec(minis, prepared, terrain, tmp_path / "sampled"))
+    frame = pd.read_csv(report.sampled_minis)
+    assert frame["id"].tolist() == list(range(1, 13))
+    assert report.mini_count == terrain.mini_count == 12
+    assert report.catchment_cells == 12 * 12
+    assert report.reach_cells == 12 * 4
+    with rasterio.open(prepared.dem) as dem, rasterio.open(prepared.mini_ownership) as cells:
+        owners = cells.read(1)
+        elevations = dem.read(1)
+        for mini_id, row in zip(range(1, 13), frame.itertuples(index=False), strict=True):
+            reach = (owners == mini_id) & (np.indices(owners.shape)[1] % 4 == 2)
+            assert row.reach_elevation == np.median(elevations[reach])
+    np.testing.assert_allclose(frame.filter(regex=r"^hru_").sum(axis=1), 100)

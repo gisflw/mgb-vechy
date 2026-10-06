@@ -8,7 +8,6 @@ import math
 
 import pyarrow as pa
 from pyproj import CRS, Geod
-import rasterio
 from rasterio.enums import Resampling
 from rasterio.vrt import WarpedVRT
 from rasterio.warp import calculate_default_transform
@@ -41,21 +40,16 @@ def geodetic_tools(crs_text: str) -> tuple[Transformer, Geod]:
 
 
 def require_metre_units(dataset, name: str) -> None:
-    """Reject legacy products whose stored values lack the canonical unit tag."""
+    """Require elevations and route distances stored in metres."""
     if dataset.tags().get("units") != "m":
         raise CrsError(
-            f"{name} must declare stored values in metres (units=m); "
-            "regenerate preparation with --dem-scale for the source elevation "
-            "units, then regenerate terrain products and sampling"
+            f"{name} must declare stored values in metres (units=m)"
         )
 
 
 def parse_metric_crs(value: str | CRS = DEFAULT_CRS) -> CRS:
     """Return a projected CRS whose horizontal unit is exactly one metre."""
-    try:
-        crs = CRS.from_user_input(value)
-    except Exception as exc:
-        raise CrsError(f"Invalid target CRS: {value!r}") from exc
+    crs = CRS.from_user_input(value)
     if not crs.is_projected:
         raise CrsError("Target CRS must be projected")
     axes = crs.axis_info
@@ -70,10 +64,7 @@ def parse_metric_crs(value: str | CRS = DEFAULT_CRS) -> CRS:
 
 def parse_crs(value: str | CRS) -> CRS:
     """Parse any valid CRS without imposing projected metric units."""
-    try:
-        return CRS.from_user_input(value)
-    except Exception as exc:
-        raise CrsError(f"Invalid target CRS: {value!r}") from exc
+    return CRS.from_user_input(value)
 
 
 def transform_vector(
@@ -93,17 +84,14 @@ def transform_vector(
         return VectorTable(
             frame.table, target, frame.geometry_column, frame.geometry_type
         )
-    try:
-        transformer = Transformer.from_crs(source, target, always_xy=True)
-        geometries = shapely.transform(
-            frame.geometries(), transformer.transform, interleaved=False
-        )
-        wkb = pa.array(shapely.to_wkb(geometries), type=pa.binary())
-        index = frame.table.schema.get_field_index(frame.geometry_column)
-        table = frame.table.set_column(index, frame.geometry_column, wkb)
-        return VectorTable(table, target, frame.geometry_column, frame.geometry_type)
-    except Exception as exc:
-        raise CrsError(f"Cannot transform {name} to the target CRS") from exc
+    transformer = Transformer.from_crs(source, target, always_xy=True)
+    geometries = shapely.transform(
+        frame.geometries(), transformer.transform, interleaved=False
+    )
+    wkb = pa.array(shapely.to_wkb(geometries), type=pa.binary())
+    index = frame.table.schema.get_field_index(frame.geometry_column)
+    table = frame.table.set_column(index, frame.geometry_column, wkb)
+    return VectorTable(table, target, frame.geometry_column, frame.geometry_type)
 
 
 @dataclass(frozen=True)

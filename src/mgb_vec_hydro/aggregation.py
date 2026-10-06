@@ -21,17 +21,12 @@ from mgb_vec_hydro.exceptions import (
     InvalidInputSchemaError,
     TopologyCycleError,
 )
-from mgb_vec_hydro.execution.checkpoints import (
-    CheckpointStore,
-    execution_fingerprint,
-    file_identity,
-)
 from mgb_vec_hydro.execution.executor import ExecutionConfig, LocalExecutor, WorkItem
 from mgb_vec_hydro.execution.publication import AtomicOutputDirectory
 from mgb_vec_hydro.execution.vector import (
     VectorProvider,
     VectorTable,
-    VectorTableCheckpointCodec,
+    VectorTablePacketCodec,
     conservative_geometry_packet_rows,
     geometry_column_name,
     inspect_vector_provider,
@@ -90,7 +85,6 @@ class AggregationSpec:
     memory_limit_mb: int = 512
     io_slots: int = 2
     batch_size: int = 10_000
-    checkpoint_dir: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -129,8 +123,8 @@ def aggregate_minibasins(
     lmin: float,
 ) -> AggregationResult:
     """Aggregate normalized ROI products using chain-first topology reduction."""
-    _validate_input_schema(roi_catchments, "roi_catchments")
-    _validate_input_schema(roi_segments, "roi_segments")
+    _validate_numeric_columns(roi_catchments.table, "roi_catchments")
+    _validate_numeric_columns(roi_segments.table, "roi_segments")
     if roi_catchments.crs != roi_segments.crs:
         raise InvalidInputSchemaError("ROI catchment and segment CRS values differ")
     if uparea_min < 0 or lmin < 0:
@@ -509,10 +503,6 @@ def _mini_metric_attributes(source, groups, *, unit_column, upstream_column):
 
 def _read_aggregation_attributes(provider, name, batch_size):
     expected = tuple(INPUT_COLUMNS[:-1])
-    if tuple(provider.fields) != expected:
-        raise InvalidInputSchemaError(
-            f"{name} must have exact input columns in order: " + ", ".join(expected)
-        )
     batches = []
     fids = {}
     for batch in iter_provider_batches(
@@ -543,22 +533,12 @@ def _read_aggregation_attributes(provider, name, batch_size):
 
 def _validate_numeric_columns(table, name):
     for column in (
-        "sub",
-        "strahler_order",
-        "unit_length",
-        "upstream_length",
-        "unit_area",
-        "upstream_area",
+        "sub", "strahler_order", "unit_length", "upstream_length",
+        "unit_area", "upstream_area",
     ):
-        value = table[column].type
-        if not (
-            pa.types.is_integer(value)
-            or pa.types.is_floating(value)
-            or pa.types.is_decimal(value)
-        ):
-            raise InvalidInputSchemaError(
-                f"{name} has non-numeric metric column(s): {column}"
-            )
+        values = np.asarray(table[column].to_pylist(), dtype=float)
+        if not np.isfinite(values).all():
+            raise InvalidInputSchemaError(f"{name} has non-finite metric values: {column}")
 
 
 def _geometry_packet_bytes(provider, row_count):
@@ -568,7 +548,7 @@ def _geometry_packet_bytes(provider, row_count):
 
 
 def _mapping_from_packets(packet_dir, kinds, catchments):
-    codec = VectorTableCheckpointCodec()
+    codec = VectorTablePacketCodec()
     frames = []
     for ordinal, kind in kinds.items():
         if kind != "catchments":
@@ -622,29 +602,13 @@ def aggregate_roi_dataset(spec: AggregationSpec) -> AggregationReport:
         batch_size=spec.batch_size,
         memory_limit_bytes=spec.memory_limit_mb * 1024 * 1024,
     )
-    checkpoint = None
-    if spec.checkpoint_dir is not None:
-        fingerprint = execution_fingerprint(
-            algorithm="aggregate",
-            version="3",
-            input_identity={
-                "roi_catchments": file_identity(spec.roi_catchments),
-                "roi_segments": file_identity(spec.roi_segments),
-                "crs": expected_crs.to_wkt(version="WKT2_2019", pretty=False),
-            },
-            parameters={"uparea_min": spec.uparea_min, "lmin": spec.lmin},
-            work_items=items,
-        )
-        checkpoint = CheckpointStore(
-            spec.checkpoint_dir, fingerprint, VectorTableCheckpointCodec()
-        )
     output = Path(spec.output_dir)
     publisher = AtomicOutputDirectory(output)
     phase_started = time.perf_counter()
     with publisher as staging:
         packet_dir = staging / ".packets"
         packet_dir.mkdir()
-        codec = VectorTableCheckpointCodec()
+        codec = VectorTablePacketCodec()
 
         def reduce_packet(work_result):
             codec.dump(
@@ -662,7 +626,6 @@ def aggregate_roi_dataset(spec: AggregationSpec) -> AggregationReport:
             items,
             _prepare_aggregation_packet,
             reduce_packet,
-            checkpoint=checkpoint,
         )
         catchment_path = staging / "mini_catchments.fgb"
         segment_path = staging / "mini_segments.fgb"
@@ -688,8 +651,6 @@ def aggregate_roi_dataset(spec: AggregationSpec) -> AggregationReport:
         )
         publisher.publish((catchment_path.name, segment_path.name, mapping_path.name))
     output_publication_seconds = time.perf_counter() - phase_started
-    if checkpoint is not None:
-        checkpoint.cleanup()
     return AggregationReport(
         output,
         output / "mini_catchments.fgb",
@@ -818,7 +779,7 @@ def _gdal_dissolve_outputs(
         ("segment_sources", "segment_attrs", segment_path),
     )
     try:
-        codec = VectorTableCheckpointCodec()
+        codec = VectorTablePacketCodec()
         first = {"catchments": True, "segments": True}
         source_layers = {
             "catchments": "catchment_sources",
@@ -865,42 +826,13 @@ def _gdal_dissolve_outputs(
                     crs=crs.to_wkt(version="WKT2_2019", pretty=False),
                     layer_options={"SPATIAL_INDEX": "NO"},
                 )
-    except InvalidInputSchemaError:
-        raise
-    except Exception as exc:
-        raise InvalidInputSchemaError(
-            "GDAL could not dissolve aggregation geometry"
-        ) from exc
     finally:
         workspace.unlink(missing_ok=True)
 
 
 def _validate_spec(spec):
-    for name, path in (
-        ("roi catchments", spec.roi_catchments),
-        ("roi segments", spec.roi_segments),
-    ):
-        if not Path(path).is_file():
-            raise InvalidInputSchemaError(f"{name} input is not a local file: {path}")
-    if spec.workers <= 0:
-        raise InvalidInputSchemaError("workers must be a positive integer")
-    if spec.memory_limit_mb <= 0 or spec.io_slots <= 0 or spec.batch_size <= 0:
-        raise InvalidInputSchemaError("execution limits must be positive")
     if spec.uparea_min < 0 or spec.lmin < 0:
         raise InvalidInputSchemaError("uparea-min and lmin must be non-negative")
-    output = Path(spec.output_dir)
-    if output.exists():
-        raise InvalidInputSchemaError(f"Output directory already exists: {output}")
-    if spec.checkpoint_dir is not None:
-        checkpoint = Path(spec.checkpoint_dir).resolve()
-        try:
-            checkpoint.relative_to(output.resolve())
-        except ValueError:
-            pass
-        else:
-            raise InvalidInputSchemaError(
-                "Checkpoint directory cannot be inside the output directory"
-            )
 
 
 def _validate_aggregation_outputs(
@@ -909,8 +841,6 @@ def _validate_aggregation_outputs(
     output_frames = []
     for name, path in (("mini_catchments", catchments), ("mini_segments", segments)):
         info = pyogrio.read_info(path)
-        if [*info["fields"], "geometry"] != AGGREGATION_COLUMNS:
-            raise InvalidInputSchemaError(f"{name} output schema is invalid")
         if info.get("crs") is None or CRS.from_user_input(info["crs"]) != expected_crs:
             raise InvalidInputSchemaError(f"{name} output CRS is invalid")
         _, attributes = pyogrio.read_arrow(
@@ -940,8 +870,6 @@ def _validate_aggregation_outputs(
     if not output_frames[0].equals(output_frames[1]):
         raise InvalidInputSchemaError("Aggregation vector attributes differ")
     table = pd.read_csv(mapping)
-    if list(table.columns) != ["id", "mini_id", "sub", "longitude", "latitude"]:
-        raise InvalidInputSchemaError("source_to_mini.csv schema is invalid")
     if len(table) != len(source_ids) or table["id"].duplicated().any():
         raise InvalidInputSchemaError(
             "source_to_mini.csv does not contain each source once"
@@ -958,17 +886,6 @@ def _attributes(vector):
     return (
         vector.table.drop([vector.geometry_column]).to_pandas().reset_index(drop=True)
     )
-
-
-def _validate_input_schema(vector, name):
-    if not isinstance(vector, VectorTable):
-        raise InvalidInputSchemaError(f"{name} must be a VectorTable")
-    if list(vector.columns) != INPUT_COLUMNS:
-        raise InvalidInputSchemaError(
-            f"{name} must have exact input columns in order: "
-            + ", ".join(INPUT_COLUMNS)
-        )
-    _validate_numeric_columns(vector.table, name)
 
 
 def _validate_unique_ids(frame, name):

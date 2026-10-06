@@ -5,7 +5,6 @@ from pathlib import Path
 import click
 
 from mgb_vec_hydro.aggregation import AggregationSpec, aggregate_roi_dataset
-from mgb_vec_hydro.exceptions import MgbVecHydroError
 from mgb_vec_hydro.preparation import NamedRaster, PreparationSpec, prepare_dataset
 from mgb_vec_hydro.roi import RoiSpec, define_roi_dataset
 from mgb_vec_hydro.sampling import MiniSamplingSpec, sample_minibasins
@@ -97,24 +96,21 @@ def prepare_command(
         [NamedRaster(name, path, "continuous") for name, path in continuous_raster]
         + [NamedRaster(name, path, "categorical") for name, path in categorical_raster]
     )
-    try:
-        report = prepare_dataset(
-            PreparationSpec(
-                dem=dem,
-                dem_scale=dem_scale,
-                mini_catchments=mini_catchments,
-                mini_segments=mini_segments,
-                rasters=rasters,
-                d8=d8,
-                d8_encoding=d8_encoding,
-                workers=workers,
-                memory_limit_mb=memory_limit_mb,
-                io_slots=io_slots,
-                output_dir=output_dir,
-            )
+    report = prepare_dataset(
+        PreparationSpec(
+            dem=dem,
+            dem_scale=dem_scale,
+            mini_catchments=mini_catchments,
+            mini_segments=mini_segments,
+            rasters=rasters,
+            d8=d8,
+            d8_encoding=d8_encoding,
+            workers=workers,
+            memory_limit_mb=memory_limit_mb,
+            io_slots=io_slots,
+            output_dir=output_dir,
         )
-    except MgbVecHydroError as exc:
-        raise click.ClickException(str(exc)) from exc
+    )
     for path in report.files:
         click.echo(f"Wrote {path}")
     click.echo(f"Prepared {report.raster_count} raster(s)")
@@ -162,7 +158,6 @@ def prepare_command(
 @click.option(
     "--batch-size", type=click.IntRange(min=1), default=10_000, show_default=True
 )
-@click.option("--checkpoint-dir", type=click.Path(file_okay=False, path_type=Path))
 def define_roi_command(
     crs: str,
     catchments_path: Path,
@@ -180,34 +175,29 @@ def define_roi_command(
     memory_limit_mb: int,
     io_slots: int,
     batch_size: int,
-    checkpoint_dir: Path | None,
 ) -> None:
     """Select and normalize an ROI from raw vector providers."""
 
-    try:
-        report = define_roi_dataset(
-            RoiSpec(
-                crs=crs,
-                catchments=catchments_path,
-                catchments_layer=catchments_layer,
-                catchments_source_crs=catchments_source_crs,
-                segments=segments_path,
-                segments_layer=segments_layer,
-                segments_source_crs=segments_source_crs,
-                outlet_ids=outlet_ids,
-                id_col=id_col,
-                id_down_col=id_down_col,
-                strahler_order_col=strahler_order_col,
-                output_dir=output_dir,
-                workers=workers,
-                memory_limit_mb=memory_limit_mb,
-                io_slots=io_slots,
-                batch_size=batch_size,
-                checkpoint_dir=checkpoint_dir,
-            )
+    report = define_roi_dataset(
+        RoiSpec(
+            crs=crs,
+            catchments=catchments_path,
+            catchments_layer=catchments_layer,
+            catchments_source_crs=catchments_source_crs,
+            segments=segments_path,
+            segments_layer=segments_layer,
+            segments_source_crs=segments_source_crs,
+            outlet_ids=outlet_ids,
+            id_col=id_col,
+            id_down_col=id_down_col,
+            strahler_order_col=strahler_order_col,
+            output_dir=output_dir,
+            workers=workers,
+            memory_limit_mb=memory_limit_mb,
+            io_slots=io_slots,
+            batch_size=batch_size,
         )
-    except MgbVecHydroError as exc:
-        raise click.ClickException(str(exc)) from exc
+    )
 
     click.echo(f"Wrote {report.catchments}")
     click.echo(f"Wrote {report.segments}")
@@ -243,7 +233,6 @@ def define_roi_command(
 @click.option(
     "--batch-size", type=click.IntRange(min=1), default=10_000, show_default=True
 )
-@click.option("--checkpoint-dir", type=click.Path(file_okay=False, path_type=Path))
 def aggregate_command(
     roi_catchments: Path,
     roi_segments: Path,
@@ -254,27 +243,22 @@ def aggregate_command(
     memory_limit_mb: int,
     io_slots: int,
     batch_size: int,
-    checkpoint_dir: Path | None,
 ) -> None:
     """Aggregate explicit ROI files into mini-basins."""
 
-    try:
-        report = aggregate_roi_dataset(
-            AggregationSpec(
-                roi_catchments=roi_catchments,
-                roi_segments=roi_segments,
-                uparea_min=uparea_min,
-                lmin=lmin,
-                output_dir=output_dir,
-                workers=workers,
-                memory_limit_mb=memory_limit_mb,
-                io_slots=io_slots,
-                batch_size=batch_size,
-                checkpoint_dir=checkpoint_dir,
-            )
+    report = aggregate_roi_dataset(
+        AggregationSpec(
+            roi_catchments=roi_catchments,
+            roi_segments=roi_segments,
+            uparea_min=uparea_min,
+            lmin=lmin,
+            output_dir=output_dir,
+            workers=workers,
+            memory_limit_mb=memory_limit_mb,
+            io_slots=io_slots,
+            batch_size=batch_size,
         )
-    except MgbVecHydroError as exc:
-        raise click.ClickException(str(exc)) from exc
+    )
 
     click.echo(f"Wrote {report.mini_catchments}")
     click.echo(f"Wrote {report.mini_segments}")
@@ -295,11 +279,6 @@ def aggregate_command(
 )
 @click.option(
     "--drainage",
-    type=click.Path(exists=True, dir_okay=False, path_type=Path),
-    required=True,
-)
-@click.option(
-    "--mini-index",
     type=click.Path(exists=True, dir_okay=False, path_type=Path),
     required=True,
 )
@@ -348,15 +327,10 @@ def aggregate_command(
     "--memory-limit-mb", type=click.IntRange(min=1), default=512, show_default=True
 )
 @click.option("--io-slots", type=click.IntRange(min=1), default=2, show_default=True)
-@click.option(
-    "--batch-size", type=click.IntRange(min=1), default=10_000, show_default=True
-)
-@click.option("--checkpoint-dir", type=click.Path(file_okay=False, path_type=Path))
 def terrain_products_command(
     dem: Path,
     cells: Path,
     drainage: Path,
-    mini_index: Path,
     d8: Path | None,
     output_dir: Path,
     direction_source: str,
@@ -367,34 +341,26 @@ def terrain_products_command(
     workers: int,
     memory_limit_mb: int,
     io_slots: int,
-    batch_size: int,
-    checkpoint_dir: Path | None,
 ) -> None:
     """Generate flat bounded terrain COG files from explicit inputs."""
 
-    try:
-        report = create_terrain_dataset(
-            TerrainSpec(
-                dem=dem,
-                mini_ownership=cells,
-                drainage=drainage,
-                mini_index=mini_index,
-                d8=d8,
-                output_dir=output_dir,
-                direction_source=direction_source.lower(),
-                write_flow_direction=write_flow_direction,
-                agree_sharp=agree_sharp,
-                agree_smooth=agree_smooth,
-                agree_buffer=agree_buffer,
-                workers=workers,
-                memory_limit_mb=memory_limit_mb,
-                io_slots=io_slots,
-                batch_size=batch_size,
-                checkpoint_dir=checkpoint_dir,
-            )
+    report = create_terrain_dataset(
+        TerrainSpec(
+            dem=dem,
+            mini_ownership=cells,
+            drainage=drainage,
+            d8=d8,
+            output_dir=output_dir,
+            direction_source=direction_source.lower(),
+            write_flow_direction=write_flow_direction,
+            agree_sharp=agree_sharp,
+            agree_smooth=agree_smooth,
+            agree_buffer=agree_buffer,
+            workers=workers,
+            memory_limit_mb=memory_limit_mb,
+            io_slots=io_slots,
         )
-    except MgbVecHydroError as exc:
-        raise click.ClickException(str(exc)) from exc
+    )
 
     click.echo(f"Wrote {report.hand}")
     click.echo(f"Wrote {report.ltnd}")
@@ -425,11 +391,6 @@ def terrain_products_command(
 )
 @click.option(
     "--mini-segments",
-    type=click.Path(exists=True, dir_okay=False, path_type=Path),
-    required=True,
-)
-@click.option(
-    "--mini-index",
     type=click.Path(exists=True, dir_okay=False, path_type=Path),
     required=True,
 )
@@ -476,11 +437,9 @@ def terrain_products_command(
 @click.option(
     "--batch-size", type=click.IntRange(min=1), default=10_000, show_default=True
 )
-@click.option("--checkpoint-dir", type=click.Path(file_okay=False, path_type=Path))
 def sample_minis_command(
     mini_catchments: Path,
     mini_segments: Path,
-    mini_index: Path,
     dem: Path,
     cells: Path,
     drainage: Path,
@@ -492,31 +451,25 @@ def sample_minis_command(
     memory_limit_mb: int,
     io_slots: int,
     batch_size: int,
-    checkpoint_dir: Path | None,
 ) -> None:
     """Sample explicit canonical rasters and mini vectors into one CSV."""
-    try:
-        report = sample_minibasins(
-            MiniSamplingSpec(
-                mini_catchments=mini_catchments,
-                mini_segments=mini_segments,
-                mini_index=mini_index,
-                dem=dem,
-                mini_ownership=cells,
-                drainage=drainage,
-                hand=hand,
-                ltnd=ltnd,
-                hru=hru,
-                output_dir=output_dir,
-                workers=workers,
-                memory_limit_mb=memory_limit_mb,
-                io_slots=io_slots,
-                batch_size=batch_size,
-                checkpoint_dir=checkpoint_dir,
-            )
+    report = sample_minibasins(
+        MiniSamplingSpec(
+            mini_catchments=mini_catchments,
+            mini_segments=mini_segments,
+            dem=dem,
+            mini_ownership=cells,
+            drainage=drainage,
+            hand=hand,
+            ltnd=ltnd,
+            hru=hru,
+            output_dir=output_dir,
+            workers=workers,
+            memory_limit_mb=memory_limit_mb,
+            io_slots=io_slots,
+            batch_size=batch_size,
         )
-    except MgbVecHydroError as exc:
-        raise click.ClickException(str(exc)) from exc
+    )
     click.echo(f"Wrote {report.sampled_minis}")
     click.echo(
         f"Sampled {report.mini_count} minis; "

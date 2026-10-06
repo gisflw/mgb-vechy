@@ -29,10 +29,6 @@ class InvalidInputSchemaError(MgbVecHydroError):
     """Raised when vector inputs do not match the expected schema."""
 
 
-class MissingCrsError(MgbVecHydroError):
-    """Raised when an input layer has no CRS for geometry measurements."""
-
-
 class DuplicateSegmentIdError(MgbVecHydroError):
     """Raised when segment IDs are duplicated in a topology table."""
 
@@ -83,10 +79,6 @@ class ExecutionCancelledError(MgbVecHydroError):
     def __init__(self, message: str, *, report=None):
         super().__init__(message)
         self.report = report
-
-
-class CheckpointError(MgbVecHydroError):
-    """Raised for incompatible, missing, or corrupt checkpoint state."""
 
 
 class RasterGridError(MgbVecHydroError):

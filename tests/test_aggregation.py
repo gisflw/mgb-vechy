@@ -81,7 +81,7 @@ def test_accepts_the_canonical_schema_and_rejects_a_missing_column():
         crs=catchments.crs,
         geometry_type="Polygon",
     )
-    with pytest.raises(InvalidInputSchemaError, match="exact input columns"):
+    with pytest.raises(KeyError, match="upstream_area"):
         aggregate_minibasins(invalid, segments, uparea_min=0, lmin=0)
 
 

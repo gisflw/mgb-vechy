@@ -1,7 +1,7 @@
 """Opt-in Stage 5 throughput and block-reuse measurements.
 
 Set RUN_SAMPLING_BENCHMARKS=1 and provide the explicit BHAE mini vector,
-index, raster, and terrain-product file paths.
+raster and terrain-product file paths.
 """
 
 import os
@@ -31,7 +31,6 @@ def test_sampling_reports_serial_and_parallel_throughput(tmp_path, record_proper
     paths = {name: _input(name) for name in (
         "BHAE_MINI_CATCHMENTS",
         "BHAE_MINI_SEGMENTS",
-        "BHAE_MINI_INDEX",
         "BHAE_DEM",
         "BHAE_MINI_OWNERSHIP",
         "BHAE_DRAINAGE",
@@ -45,7 +44,7 @@ def test_sampling_reports_serial_and_parallel_throughput(tmp_path, record_proper
             MiniSamplingSpec(
                 mini_catchments=paths["BHAE_MINI_CATCHMENTS"],
                 mini_segments=paths["BHAE_MINI_SEGMENTS"],
-                mini_index=paths["BHAE_MINI_INDEX"],
+
                 dem=paths["BHAE_DEM"],
                 mini_ownership=paths["BHAE_MINI_OWNERSHIP"],
                 drainage=paths["BHAE_DRAINAGE"],

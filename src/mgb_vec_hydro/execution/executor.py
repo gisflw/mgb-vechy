@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import multiprocessing as mp
 import multiprocessing.reduction
-import pickle
 import queue
 import time
 import traceback
@@ -16,7 +15,7 @@ from collections import OrderedDict, defaultdict
 from collections.abc import Callable, Iterable, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Generic, TypeVar
+from typing import Any, Generic, TypeVar
 
 from mgb_vec_hydro.exceptions import (
     ExecutionCancelledError,
@@ -28,9 +27,6 @@ from mgb_vec_hydro.exceptions import (
 
 PayloadT = TypeVar("PayloadT")
 ResultT = TypeVar("ResultT")
-
-if TYPE_CHECKING:
-    from mgb_vec_hydro.execution.checkpoints import CheckpointStore
 
 
 @dataclass(frozen=True)
@@ -135,7 +131,6 @@ class ProgressEvent:
     submitted: int
     completed: int
     reduced: int
-    resumed: int
     admitted_bytes: int
 
 
@@ -145,7 +140,6 @@ class ExecutionReport:
     submitted: int
     completed: int
     reduced: int
-    resumed: int
     peak_admitted_bytes: int
     wall_seconds: float
     timings: Mapping[str, float]
@@ -261,12 +255,11 @@ class LocalExecutor:
         worker: Callable[[PayloadT, WorkerContext], ResultT | WorkerOutput[ResultT]],
         reduce: Callable[[WorkResult[ResultT]], Mapping[str, float] | None],
         *,
-        checkpoint: CheckpointStore[ResultT] | None = None,
         progress: Callable[[ProgressEvent], None] | None = None,
         cancelled: Callable[[], bool] | None = None,
     ) -> ExecutionReport:
         started = time.perf_counter()
-        _require_picklable(worker, "Worker callable")
+        multiprocessing.reduction.ForkingPickler.dumps(worker)
         ctx = mp.get_context("spawn")
         task_queue = ctx.Queue(maxsize=self.config.in_flight_limit)
         result_queue = ctx.Queue(maxsize=self.config.in_flight_limit)
@@ -298,11 +291,10 @@ class LocalExecutor:
         expected_ordinal = 0
         next_reduce = 0
         admitted: dict[int, WorkItem[PayloadT]] = {}
-        resumed_pending: dict[int, WorkItem[PayloadT]] = {}
         buffered: dict[int, WorkResult[ResultT]] = {}
         admitted_bytes = 0
         peak_admitted = 0
-        submitted = completed = reduced = resumed = task_count = 0
+        submitted = completed = reduced = task_count = 0
         failures: list[TaskFailure] = []
         timings: defaultdict[str, float] = defaultdict(float)
         diagnostics: list[Mapping[str, Any]] = []
@@ -317,7 +309,6 @@ class LocalExecutor:
                         submitted,
                         completed,
                         reduced,
-                        resumed,
                         admitted_bytes,
                     )
                 )
@@ -328,7 +319,6 @@ class LocalExecutor:
                 submitted,
                 completed,
                 reduced,
-                resumed,
                 peak_admitted,
                 time.perf_counter() - started,
                 dict(timings),
@@ -346,16 +336,7 @@ class LocalExecutor:
                 made_progress = False
                 while next_reduce in buffered:
                     result = buffered.pop(next_reduce)
-                    item = admitted.pop(next_reduce, None)
-                    was_submitted = item is not None
-                    if item is None:
-                        item = resumed_pending.pop(next_reduce)
-                    if checkpoint is not None and was_submitted:
-                        checkpoint_started = time.perf_counter()
-                        checkpoint.save(item, result)
-                        timings["checkpoint_write"] += (
-                            time.perf_counter() - checkpoint_started
-                        )
+                    item = admitted.pop(next_reduce)
                     write_started = time.perf_counter()
                     reduction_timings = reduce(result)
                     timings["reduction"] += time.perf_counter() - write_started
@@ -366,8 +347,7 @@ class LocalExecutor:
                         timings[name] += float(value)
                     if result.diagnostics:
                         diagnostics.append(dict(result.diagnostics))
-                    if was_submitted:
-                        admitted_bytes -= item.estimated_bytes
+                    admitted_bytes -= item.estimated_bytes
                     reduced += 1
                     next_reduce += 1
                     event("reduced", item)
@@ -408,19 +388,13 @@ class LocalExecutor:
                         break
                     item = next_item
                     next_item = None
-                    if checkpoint is not None and checkpoint.contains(item):
-                        buffered[item.ordinal] = checkpoint.load(item)
-                        resumed_pending[item.ordinal] = item
-                        resumed += 1
-                        event("resumed", item)
-                    else:
-                        _require_picklable(item, f"Work item {item.key}")
-                        task_queue.put(item)
-                        admitted[item.ordinal] = item
-                        admitted_bytes += item.estimated_bytes
-                        peak_admitted = max(peak_admitted, admitted_bytes)
-                        submitted += 1
-                        event("submitted", item)
+                    multiprocessing.reduction.ForkingPickler.dumps(item)
+                    task_queue.put(item)
+                    admitted[item.ordinal] = item
+                    admitted_bytes += item.estimated_bytes
+                    peak_admitted = max(peak_admitted, admitted_bytes)
+                    submitted += 1
+                    event("submitted", item)
                     made_progress = True
 
                 if buffered and next_reduce in buffered:
@@ -503,18 +477,3 @@ class LocalExecutor:
             if process.is_alive():
                 process.kill()
                 process.join()
-
-
-def _require_picklable(value: Any, label: str) -> None:
-    try:
-        multiprocessing.reduction.ForkingPickler.dumps(value)
-    except (
-        AttributeError,
-        pickle.PickleError,
-        RuntimeError,
-        TypeError,
-        ValueError,
-    ) as exc:
-        raise ExecutionConfigurationError(
-            f"{label} must be pickleable for spawned workers"
-        ) from exc

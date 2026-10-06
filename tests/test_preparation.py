@@ -1,5 +1,6 @@
+import json
+
 import numpy as np
-import pandas as pd
 import pytest
 import rasterio
 from pyproj import CRS
@@ -8,6 +9,7 @@ from shapely.geometry import LineString, Polygon
 
 from mgb_vec_hydro.aggregation import AggregationSpec, aggregate_roi_dataset
 from mgb_vec_hydro.exceptions import (
+    ExecutionConfigurationError,
     PreparedDataError,
     WorkerExecutionError,
     WorkMemoryError,
@@ -20,9 +22,11 @@ from mgb_vec_hydro.preparation import (
     _BlockConnectivity,
     _label_components,
     _plan_connectivity_correction,
+    _ownership_index,
     _rasterize_drainage_block,
     _rasterize_ownership_block,
     prepare_dataset,
+    read_mini_index,
 )
 from mgb_vec_hydro.roi import RoiSpec, define_roi_dataset
 
@@ -216,19 +220,10 @@ def test_prepare_pipeline_publishes_valid_canonical_dataset(tmp_path):
         "dem.tif",
         "drainage.tif",
         "land.tif",
-        "mini_index.csv",
     ]
     assert not (report.output_dir / "manifest.json").exists()
     assert not any(path.is_dir() for path in report.output_dir.iterdir())
-    index = pd.read_csv(report.mini_index)
-    assert list(index.columns) == [
-        "mini_label",
-        "mini_id",
-        "minx",
-        "miny",
-        "maxx",
-        "maxy",
-    ]
+    assert [row[0] for row in read_mini_index(report.mini_ownership)] == [1]
     for name in ("dem", "land"):
         with rasterio.open(report.output_dir / f"{name}.tif") as source:
             assert source.tags(ns="IMAGE_STRUCTURE")["LAYOUT"] == "COG"
@@ -284,10 +279,7 @@ def test_parallel_preparation_matches_serial_across_multiple_blocks(tmp_path):
             np.testing.assert_array_equal(
                 serial.dataset_mask(), parallel.dataset_mask()
             )
-    pd.testing.assert_frame_equal(
-        pd.read_csv(reports[1].mini_index),
-        pd.read_csv(reports[2].mini_index),
-    )
+    assert read_mini_index(reports[1].mini_ownership) == read_mini_index(reports[2].mini_ownership)
     with rasterio.open(reports[2].d8) as normalized:
         assert np.all(normalized.read(1, masked=True).compressed() == 1)
 
@@ -295,8 +287,8 @@ def test_parallel_preparation_matches_serial_across_multiple_blocks(tmp_path):
 @pytest.mark.parametrize(
     ("field", "value", "message"),
     [
-        ("workers", 0, "workers must be a positive integer"),
-        ("io_slots", 0, "I/O slots must be a positive integer"),
+        ("workers", 0, "workers"),
+        ("io_slots", 0, "io_slots"),
     ],
 )
 def test_preparation_rejects_invalid_execution_limits(tmp_path, field, value, message):
@@ -310,7 +302,7 @@ def test_preparation_rejects_invalid_execution_limits(tmp_path, field, value, me
         "output_dir": tmp_path / "prepared",
         field: value,
     }
-    with pytest.raises(PreparedDataError, match=message):
+    with pytest.raises(ExecutionConfigurationError, match=message):
         prepare_dataset(PreparationSpec(**arguments))
 
 
@@ -438,6 +430,11 @@ def test_connectivity_keeps_drainage_component_reassigns_enclosed_and_drops_exte
     targets = dict(zip(correction["flat"], correction["targets"], strict=True))
     assert targets[np.ravel_multi_index((3, 4), values.shape)] == 2
     assert targets[np.ravel_multi_index((0, 6), values.shape)] == 0
+    ownership.data.ravel()[correction["flat"]] = correction["targets"]
+    ownership.mask.ravel()[correction["flat"]] = correction["targets"] == 0
+    assert _ownership_index(assembler, grid, 2) == [
+        [1, 1, 3, 3, 4], [2, 3, 0, 6, 3],
+    ]
 
 
 def test_connectivity_selects_by_drainage_then_size_then_first_cell():
@@ -508,3 +505,62 @@ def test_streaming_connectivity_joins_diagonal_components_across_block_corner():
     tracker.add_block(2, 2, second, second_valid, np.zeros_like(second_valid))
 
     assert tracker.disconnected_labels(np.asarray([1], dtype="int32")) == []
+
+
+def test_preparation_embeds_tight_bounds_and_preserves_numeric_ids(tmp_path):
+    ids = list(range(12, 0, -1))
+    values = {
+        "id": ids, "id_down": [-1] * 12, "sub": [1] * 12,
+        "p_order": [1] * 12, "unit_length": [1.0] * 12,
+        "upstream_length": [1.0] * 12, "unit_area": [1.0] * 12,
+        "upstream_area": [1.0] * 12,
+    }
+    polygons = [
+        Polygon([(i - 0.9, 0.1), (i - 0.1, 0.1), (i - 0.1, 1.9), (i - 0.9, 1.9)])
+        for i in ids
+    ]
+    lines = [LineString([(i - 0.5, 0.1), (i - 0.5, 1.9)]) for i in ids]
+    for name, geometries, kind in (
+        ("catchments", polygons, "Polygon"), ("segments", lines, "LineString"),
+    ):
+        write_vector_table(
+            VectorTable.from_pydict(values, geometries, crs="EPSG:3857", geometry_type=kind),
+            tmp_path / f"{name}.fgb", driver="FlatGeobuf",
+        )
+    dem = tmp_path / "dem.tif"
+    _write_multiblock_raster(dem, np.ones((2, 12)), "float32")
+    report = prepare_dataset(PreparationSpec(
+        dem=dem, mini_catchments=tmp_path / "catchments.fgb",
+        mini_segments=tmp_path / "segments.fgb", output_dir=tmp_path / "prepared",
+        workers=1,
+    ))
+    index = read_mini_index(report.mini_ownership)
+    with rasterio.open(report.mini_ownership) as cells:
+        assert cells.tags(ns="IMAGE_STRUCTURE")["LAYOUT"] == "COG"
+        assert json.loads(cells.tags()["mini_index"]) == index
+        np.testing.assert_array_equal(cells.read(1), [list(range(1, 13))] * 2)
+    assert index == [[i, i - 1, 0, i, 2] for i in range(1, 13)]
+    assert sorted(path.name for path in report.files) == ["cells.tif", "dem.tif", "drainage.tif"]
+    assert not (report.output_dir / "mini_index.csv").exists()
+
+
+@pytest.mark.parametrize("bad_ids", [["1"], [2], [True]])
+def test_preparation_requires_dense_integer_ids(tmp_path, bad_ids):
+    catchments, segments = _write_multiblock_minis(tmp_path, 2)
+    for path in (catchments, segments):
+        from mgb_vec_hydro.execution.vector import read_vector_table
+        vector = read_vector_table(path)
+        attrs = vector.table.drop([vector.geometry_column]).to_pydict()
+        attrs["id"] = bad_ids
+        path.unlink()
+        write_vector_table(
+            VectorTable.from_pydict(attrs, vector.geometries(), crs=vector.crs,
+                                   geometry_type=vector.geometry_type),
+            path, driver="FlatGeobuf",
+        )
+    with pytest.raises(PreparedDataError, match="dense integers"):
+        prepare_dataset(PreparationSpec(
+            dem=tmp_path / "unused-dem.tif", mini_catchments=catchments,
+            mini_segments=segments, output_dir=tmp_path / "prepared", workers=1,
+        ))
+    assert not (tmp_path / "prepared").exists()

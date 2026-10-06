@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import math
 import os
 import re
@@ -12,7 +13,6 @@ from pathlib import Path
 from typing import Any, Literal
 
 import numpy as np
-import pandas as pd
 import rasterio
 import shapely
 from numba import njit
@@ -23,7 +23,6 @@ from rasterio.features import rasterize
 from rasterio.transform import Affine
 from rasterio.windows import Window, from_bounds
 
-from mgb_vec_hydro.aggregation import AGGREGATION_COLUMNS
 from mgb_vec_hydro.exceptions import PreparedDataError
 from mgb_vec_hydro.execution.executor import (
     ExecutionConfig,
@@ -76,7 +75,6 @@ class PreparationReport:
     rasters: dict[str, Path]
     mini_ownership: Path
     drainage: Path
-    mini_index: Path
     raster_count: int
     execution: ExecutionReport
     timings: dict[str, float]
@@ -93,7 +91,7 @@ class PreparationReport:
 
         return tuple(
             [self.rasters[name] for name in sorted(self.rasters)]
-            + [self.mini_ownership, self.drainage, self.mini_index]
+            + [self.mini_ownership, self.drainage]
         )
 
 
@@ -179,14 +177,12 @@ def _prepare_dataset(spec: PreparationSpec) -> PreparationReport:
     segments_by_id = dict(
         zip(segment_ids, mini_segment_vector.geometries(), strict=True)
     )
-    ordered = sorted(
-        catchments_by_id, key=lambda value: (type(value).__name__, str(value))
-    )
+    ordered = sorted(catchments_by_id)
     catchments = np.asarray(
         [catchments_by_id[value] for value in ordered], dtype=object
     )
     segments = np.asarray([segments_by_id[value] for value in ordered], dtype=object)
-    dense_labels = np.arange(1, len(ordered) + 1, dtype="int32")
+    mini_ids = np.asarray(ordered, dtype="int32")
     domain_bounds = shapely.total_bounds(catchments)
     if not np.all(np.isfinite(domain_bounds)):
         raise PreparedDataError("Mini-catchment domain is empty")
@@ -223,12 +219,19 @@ def _prepare_dataset(spec: PreparationSpec) -> PreparationReport:
     catchment_index = shapely.STRtree(catchments)
     segment_index = shapely.STRtree(segments)
     memory_bytes = spec.memory_limit_mb * 1024 * 1024
+    config = ExecutionConfig(
+        workers=spec.workers,
+        memory_limit_bytes=memory_bytes,
+        max_in_flight=spec.workers,
+        io_slots=spec.io_slots,
+        resource_cache_size=max(8, len(rasters)),
+    )
     items = _preparation_work_items(
         grid,
         rasters,
         catchments,
         segments,
-        dense_labels,
+        mini_ids,
         catchment_index,
         segment_index,
         spec.d8_encoding or "canonical",
@@ -238,11 +241,10 @@ def _prepare_dataset(spec: PreparationSpec) -> PreparationReport:
     )
     planning_seconds = time.perf_counter() - phase_started
 
-    execution = ExecutionReport(0, 0, 0, 0, 0, 0, 0.0, {}, ())
+    execution = ExecutionReport(0, 0, 0, 0, 0, 0.0, {}, ())
     correction_seconds = compression_seconds = 0.0
     publisher = AtomicOutputDirectory(output)
     with publisher as staging:
-        mini_index = _write_mini_index(staging, ordered, catchments_by_id, dense_labels)
         correction_root = staging / ".ownership-corrections"
         correction_root.mkdir()
         try:
@@ -293,15 +295,9 @@ def _prepare_dataset(spec: PreparationSpec) -> PreparationReport:
                         )
                     return {"output_write": time.perf_counter() - started}
 
-                execution = LocalExecutor(
-                    ExecutionConfig(
-                        workers=spec.workers,
-                        memory_limit_bytes=memory_bytes,
-                        max_in_flight=spec.workers,
-                        io_slots=spec.io_slots,
-                        resource_cache_size=max(8, len(rasters)),
-                    )
-                ).run(items, _prepare_block_worker, reduce_block)
+                execution = LocalExecutor(config).run(
+                    items, _prepare_block_worker, reduce_block
+                )
 
                 correction_started = time.perf_counter()
                 _correct_connectivity(
@@ -310,12 +306,16 @@ def _prepare_dataset(spec: PreparationSpec) -> PreparationReport:
                     grid,
                     catchments,
                     ordered,
-                    dense_labels,
+                    mini_ids,
                     connectivity,
                     memory_bytes,
                     RasterPatch,
                 )
                 correction_seconds = time.perf_counter() - correction_started
+                assembler.specs["cells"].tags["mini_index"] = json.dumps(
+                    _ownership_index(assembler, grid, len(ordered)),
+                    separators=(",", ":"),
+                )
                 compression_started = time.perf_counter()
                 output_paths = assembler.finish()
                 compression_seconds = time.perf_counter() - compression_started
@@ -325,13 +325,10 @@ def _prepare_dataset(spec: PreparationSpec) -> PreparationReport:
         validation_started = time.perf_counter()
         _validate_prepared_outputs(
             output_paths,
-            mini_index,
             grid,
             raster_kinds=raster_kinds,
         )
-        expected_names = tuple(path.name for path in output_paths.values()) + (
-            mini_index.name,
-        )
+        expected_names = tuple(path.name for path in output_paths.values())
         publisher.publish(expected_names)
         validation_publication_seconds = time.perf_counter() - validation_started
 
@@ -341,7 +338,6 @@ def _prepare_dataset(spec: PreparationSpec) -> PreparationReport:
         rasters={item.name: output / f"{item.name}.tif" for item in rasters},
         mini_ownership=output / "cells.tif",
         drainage=output / "drainage.tif",
-        mini_index=output / "mini_index.csv",
         raster_count=len(rasters),
         execution=execution,
         timings={
@@ -386,14 +382,9 @@ def _preparation_rasters(
         requested.append(("d8", Path(spec.d8), "d8"))
     result = []
     for name, path, kind in requested:
-        try:
-            with rasterio.open(path) as source:
-                _require_source_grid(source, grid.crs, name, grid)
-                itemsize = np.dtype(source.dtypes[0]).itemsize
-        except PreparedDataError:
-            raise
-        except (OSError, TypeError, rasterio.errors.RasterioError) as exc:
-            raise PreparedDataError(f"Cannot inspect raster input: {path}") from exc
+        with rasterio.open(path) as source:
+            _require_source_grid(source, grid.crs, name, grid)
+            itemsize = np.dtype(source.dtypes[0]).itemsize
         result.append(_PreparationRaster(name, path, kind, itemsize))
     return tuple(result)
 
@@ -403,7 +394,7 @@ def _preparation_work_items(
     rasters: tuple[_PreparationRaster, ...],
     catchments: np.ndarray,
     segments: np.ndarray,
-    dense_labels: np.ndarray,
+    mini_ids: np.ndarray,
     catchment_index,
     segment_index,
     d8_encoding: str,
@@ -449,10 +440,10 @@ def _preparation_work_items(
                     window,
                     rasters,
                     catchment_wkb,
-                    tuple(int(dense_labels[index]) for index in catchment_hits),
+                    tuple(int(mini_ids[index]) for index in catchment_hits),
                     ownership_indices,
                     segment_wkb,
-                    tuple(int(dense_labels[index]) for index in segment_hits),
+                    tuple(int(mini_ids[index]) for index in segment_hits),
                     d8_encoding,
                     gdal_cache_bytes,
                     dem_scale,
@@ -613,20 +604,41 @@ def _normalize_d8(raw, valid, encoding: str, *, source: Path) -> np.ndarray:
     return np.vectorize(lambda value: esri.get(value, 0), otypes=["uint8"])(raw)
 
 
-def _write_mini_index(staging, ordered, catchments_by_id, dense_labels) -> Path:
-    index = staging / "mini_index.csv"
-    bounds = [catchments_by_id[mini_id].bounds for mini_id in ordered]
-    pd.DataFrame(
-        {
-            "mini_label": dense_labels,
-            "mini_id": ordered,
-            "minx": [value[0] for value in bounds],
-            "miny": [value[1] for value in bounds],
-            "maxx": [value[2] for value in bounds],
-            "maxy": [value[3] for value in bounds],
-        }
-    ).to_csv(index, index=False, lineterminator="\n")
-    return index
+def read_mini_index(cells: Path) -> list[list[int | float]]:
+    """Read mini IDs and pixel-edge bounds embedded in the ownership raster."""
+    with rasterio.open(cells) as source:
+        return json.loads(source.tags()["mini_index"])
+
+
+def _ownership_index(assembler, grid: GridSpec, mini_count: int):
+    """Accumulate tight final ownership bounds using one bounded block scan."""
+    from mgb_vec_hydro.execution.raster import plan_raster_blocks
+
+    min_rows = np.full(mini_count + 1, grid.height, dtype="int64")
+    min_cols = np.full(mini_count + 1, grid.width, dtype="int64")
+    max_rows = np.full(mini_count + 1, -1, dtype="int64")
+    max_cols = np.full(mini_count + 1, -1, dtype="int64")
+    for window in plan_raster_blocks(grid):
+        cells = assembler.read("cells", window)
+        rows, cols = np.nonzero(~np.ma.getmaskarray(cells))
+        ids = cells.data[rows, cols]
+        rows += int(window.row_off)
+        cols += int(window.col_off)
+        np.minimum.at(min_rows, ids, rows)
+        np.minimum.at(min_cols, ids, cols)
+        np.maximum.at(max_rows, ids, rows)
+        np.maximum.at(max_cols, ids, cols)
+    records = []
+    for mini_id in range(1, mini_count + 1):
+        if max_rows[mini_id] < 0:
+            raise PreparedDataError(f"Mini {mini_id} has no rasterized ownership cells")
+        window = Window(
+            int(min_cols[mini_id]), int(min_rows[mini_id]),
+            int(max_cols[mini_id] - min_cols[mini_id] + 1),
+            int(max_rows[mini_id] - min_rows[mini_id] + 1),
+        )
+        records.append([mini_id, *rasterio.windows.bounds(window, grid.transform)])
+    return records
 
 
 def _gdal_cache_bytes(memory_limit_bytes: int, workers: int) -> int:
@@ -637,8 +649,6 @@ def _gdal_cache_bytes(memory_limit_bytes: int, workers: int) -> int:
 
 
 def _validate_spec(spec: PreparationSpec) -> None:
-    if not Path(spec.dem).is_file():
-        raise PreparedDataError(f"DEM input is not a local file: {spec.dem}")
     if (
         isinstance(spec.dem_scale, bool)
         or not isinstance(spec.dem_scale, (int, float, np.integer, np.floating))
@@ -646,54 +656,22 @@ def _validate_spec(spec: PreparationSpec) -> None:
         or spec.dem_scale <= 0
     ):
         raise PreparedDataError("DEM scale must be a finite positive number")
-    for name, value in (
-        ("workers", spec.workers),
-        ("memory limit", spec.memory_limit_mb),
-        ("I/O slots", spec.io_slots),
-    ):
-        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
-            raise PreparedDataError(f"{name} must be a positive integer")
-    for name, path in (
-        ("mini-catchments", spec.mini_catchments),
-        ("mini-segments", spec.mini_segments),
-    ):
-        if not Path(path).is_file():
-            raise PreparedDataError(f"{name} input is not a local file: {path}")
     names: set[str] = set()
-    for item in spec.rasters:
-        if not NAME_RE.fullmatch(item.name) or item.name in RESERVED_RASTER_NAMES:
-            raise PreparedDataError(f"Invalid or reserved raster name: {item.name}")
-        if item.name in names:
-            raise PreparedDataError(f"Duplicate raster name: {item.name}")
-        names.add(item.name)
-        if item.kind not in {"continuous", "categorical"}:
-            raise PreparedDataError(f"Invalid raster kind for {item.name}: {item.kind}")
-        if not Path(item.path).is_file():
-            raise PreparedDataError(f"Raster input is not a local file: {item.path}")
     if (spec.d8 is None) != (spec.d8_encoding is None):
         raise PreparedDataError("--d8 and --d8-encoding must be supplied together")
     if spec.d8_encoding not in {None, "canonical", "esri"}:
         raise PreparedDataError(f"Unsupported D8 encoding: {spec.d8_encoding}")
-    if spec.d8 is not None and not Path(spec.d8).is_file():
-        raise PreparedDataError(f"D8 input is not a local file: {spec.d8}")
 
 
 def _read_mini_inputs(catchments: Path, segments: Path):
     """Read and validate the explicit aggregated mini vector inputs."""
 
-    try:
-        catchment_vector = read_vector_table(catchments)
-        segment_vector = read_vector_table(segments)
-    except Exception as exc:
-        raise PreparedDataError("Cannot read explicit mini-catchment inputs") from exc
+    catchment_vector = read_vector_table(catchments)
+    segment_vector = read_vector_table(segments)
     for name, vector, allowed in (
         ("mini catchments", catchment_vector, {3, 6}),
         ("mini segments", segment_vector, {1, 5}),
     ):
-        if list(vector.columns) != AGGREGATION_COLUMNS:
-            raise PreparedDataError(
-                f"{name} must have the exact aggregated mini schema"
-            )
         geometries = vector.geometries()
         if (
             np.any(shapely.is_missing(geometries))
@@ -703,8 +681,13 @@ def _read_mini_inputs(catchments: Path, segments: Path):
         ):
             raise PreparedDataError(f"{name} contains invalid geometry")
         ids = vector.table["id"].to_pylist()
-        if vector.table["id"].null_count or len(set(ids)) != len(ids):
-            raise PreparedDataError(f"{name} IDs must be non-null and unique")
+        if (
+            not ids
+            or any(isinstance(value, bool) or not isinstance(value, int) for value in ids)
+            or sorted(ids) != list(range(1, len(ids) + 1))
+            or len(ids) > np.iinfo(np.int32).max
+        ):
+            raise PreparedDataError(f"{name} IDs must be dense integers 1..N")
     if catchment_vector.crs != segment_vector.crs:
         raise PreparedDataError("Mini catchment and segment CRS values differ")
     if set(catchment_vector.table["id"].to_pylist()) != set(
@@ -750,7 +733,6 @@ def _require_source_grid(
 
 def _validate_prepared_outputs(
     paths: dict[str, Path],
-    index_path: Path,
     grid: GridSpec,
     *,
     raster_kinds: dict[str, str],
@@ -769,66 +751,21 @@ def _validate_prepared_outputs(
             expected_dtype = "int32"
         else:
             expected_dtype = "float32"
-        try:
-            with rasterio.open(path) as source:
-                if (
-                    source.count != 1
-                    or source.crs is None
-                    or CRS.from_user_input(source.crs) != grid.crs
-                    or source.transform != grid.transform
-                    or source.shape != (grid.height, grid.width)
-                    or source.nodata is not None
-                    or source.dtypes[0] != expected_dtype
-                    or source.tags(ns="IMAGE_STRUCTURE").get("LAYOUT") != "COG"
-                    or MaskFlags.per_dataset not in source.mask_flag_enums[0]
-                ):
-                    raise PreparedDataError(
-                        f"Prepared raster {name} does not match the canonical COG grid"
-                    )
-        except PreparedDataError:
-            raise
-        except (OSError, rasterio.errors.RasterioError) as exc:
-            raise PreparedDataError(f"Cannot inspect prepared raster: {name}") from exc
-    _validate_mini_index(index_path, PreparedDataError)
-
-
-def _validate_mini_index(path: Path, error_type=PreparedDataError) -> pd.DataFrame:
-    """Read and validate the one shared six-column mini index."""
-
-    required = ["mini_label", "mini_id", "minx", "miny", "maxx", "maxy"]
-    try:
-        table = pd.read_csv(
-            path,
-            dtype={"mini_label": "int32", "mini_id": "string"},
-            keep_default_na=False,
-        )
-    except Exception as exc:
-        raise error_type(f"Cannot read mini index: {path}") from exc
-    if list(table.columns) != required or table.empty:
-        raise error_type("Mini index schema is invalid")
-    labels = table["mini_label"]
-    if (
-        labels.dtype != np.dtype("int32")
-        or labels.duplicated().any()
-        or table["mini_id"].isna().any()
-        or table["mini_id"].eq("").any()
-        or table["mini_id"].duplicated().any()
-        or not np.array_equal(
-            labels.to_numpy(), np.arange(1, len(table) + 1, dtype="int32")
-        )
-    ):
-        raise error_type("Mini index values are invalid")
-    try:
-        bounds = table[["minx", "miny", "maxx", "maxy"]].to_numpy(dtype=float)
-    except (TypeError, ValueError) as exc:
-        raise error_type("Mini index bounds are invalid") from exc
-    if (
-        not np.isfinite(bounds).all()
-        or np.any(bounds[:, 0] > bounds[:, 2])
-        or np.any(bounds[:, 1] > bounds[:, 3])
-    ):
-        raise error_type("Mini index bounds are invalid")
-    return table
+        with rasterio.open(path) as source:
+            if (
+                source.count != 1
+                or source.crs is None
+                or CRS.from_user_input(source.crs) != grid.crs
+                or source.transform != grid.transform
+                or source.shape != (grid.height, grid.width)
+                or source.nodata is not None
+                or source.dtypes[0] != expected_dtype
+                or source.tags(ns="IMAGE_STRUCTURE").get("LAYOUT") != "COG"
+                or MaskFlags.per_dataset not in source.mask_flag_enums[0]
+            ):
+                raise PreparedDataError(
+                    f"Prepared raster {name} does not match the canonical COG grid"
+                )
 
 
 def _correct_connectivity(
@@ -837,12 +774,12 @@ def _correct_connectivity(
     grid,
     catchments,
     ordered,
-    dense_labels,
+    mini_ids,
     connectivity,
     memory_limit_bytes,
     raster_patch_type,
 ) -> None:
-    disconnected_labels = connectivity.disconnected_labels(dense_labels)
+    disconnected_labels = connectivity.disconnected_labels(mini_ids)
     correction_paths = []
     for label in disconnected_labels:
         index = int(label) - 1
@@ -1020,7 +957,7 @@ class _BlockConnectivity:
             roots = roots_by_label.get(int(label), [])
             if not roots or not any(self.drainage[root] for root in roots):
                 raise PreparedDataError(
-                    f"Mini label {label} has no rasterized ownership or drainage cells"
+                    f"Mini {label} has no rasterized ownership or drainage cells"
                 )
             if len(roots) > 1:
                 disconnected.append(int(label))

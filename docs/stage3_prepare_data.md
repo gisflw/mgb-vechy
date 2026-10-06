@@ -28,7 +28,7 @@ mgb-vec-hydro prepare \
 | `--memory-limit-mb` | Optional | Positive integer MB; default `512` | Admitted memory budget used to size bounded raster block tasks. |
 | `--workers` | Optional | Positive integer; default `4` | Number of worker processes used for bounded block processing. There is no upper limit imposed by the CLI or stage validator. |
 | `--io-slots` | Optional | Positive integer; default `2` | Maximum number of concurrent source-raster reads. |
-| `--output-dir` | Required | Directory path | New directory where prepared COGs, cells, drainage, and the shared mini index are published. |
+| `--output-dir` | Required | Directory path | New directory where prepared COGs, cells with embedded mini bounds, and drainage are published. |
 
 Click also provides `--help` to display the command’s generated option list.
 
@@ -50,7 +50,7 @@ For a centimetre DEM, add `--dem-scale 0.01` to the command above. Library
 callers use `PreparationSpec(dem_scale=0.01, ...)`. Regenerate preparation,
 terrain products, and sampling into new output directories when migrating
 existing centimetre-based datasets; downstream stages do not scale a second
-time. Existing unitless products are rejected with regeneration instructions.
+time. Prepared elevations and distances must declare `units=m`.
 
 Source clipping, domain masking, cell and drainage rasterization, and
 local connectivity labeling run as bounded 512-pixel block tasks through the
@@ -62,20 +62,23 @@ reads.
 Preparation derives its raster domain from the explicit mini-catchment file.
 Catchments and matching segments are jointly rasterized in deterministic
 512-pixel blocks. Cells exactly cover the center-of-pixel catchment union;
-shared boundary cells use the lowest stable dense label, while true cell
+shared boundary cells use the lowest mini ID, while true cell
 overlaps are rejected. Connectivity validation keeps one drainage-bearing
 8-connected component per mini, deterministically reassigning enclosed
 discarded components and masking exterior fragments. Drainage always has the
 ownership validity mask.
 
-The six-column `mini_index.csv` is the single shared mini index for later
-stages. Its columns, in order, are:
+Preparation requires dense integer mini IDs `1..N`, matching aggregation
+output. `cells.tif` stores those IDs directly as `int32` values. Its dataset
+metadata contains a compact JSON tag named `mini_index`: ordered records
+`[mini_id, minx, miny, maxx, maxy]` in the raster CRS. Bounds are tight
+pixel-edge rectangles derived from final ownership after connectivity
+corrections, using a bounded block scan.
 
-`mini_label`, `mini_id`, `minx`, `miny`, `maxx`, `maxy`.
-
-Labels are dense one-based `int32` values and bounds are finite. The published
-directory contains exactly these root-level files, plus one `<name>.tif` for
-each requested named raster:
+Terrain and sampling read this tag directly. There is no separate index file,
+version, or compatibility reader. Previously prepared rasters must be
+regenerated. The published directory contains these root-level files, plus
+one `<name>.tif` for each requested named raster:
 
 ```text
 prepared/
@@ -83,8 +86,7 @@ prepared/
 ├── <name>.tif
 ├── d8.tif                  # optional
 ├── cells.tif
-├── drainage.tif
-└── mini_index.csv
+└── drainage.tif
 ```
 
 There is no `manifest.json` and no nested output directory. All files are

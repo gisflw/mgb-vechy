@@ -39,7 +39,7 @@ Before architectural work, read
 `docs/changes/larger-than-memory-processing.md` and the documentation for the
 stage being changed. Shared execution contracts are documented in
 `docs/shared_execution.md`. Do not add stage-specific scheduling, worker
-management, checkpointing, or output-publication implementations when the
+management or output-publication implementations when the
 capability belongs in the shared execution layer.
 
 ## Repository map
@@ -83,5 +83,5 @@ RUN_SAMPLING_BENCHMARKS=1 pytest tests/benchmark/test_sampling_scaling.py
 ```
 
 The full terrain benchmark requires explicit `BHAE_DEM`,
-`BHAE_MINI_OWNERSHIP`, `BHAE_DRAINAGE`, and `BHAE_MINI_INDEX` paths; set
+`BHAE_MINI_OWNERSHIP` and `BHAE_DRAINAGE` paths; set
 `BHAE_D8` as well when exercising an explicit D8 input.

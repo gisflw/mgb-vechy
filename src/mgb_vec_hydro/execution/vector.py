@@ -32,21 +32,7 @@ class VectorTable:
     geometry_type: str
 
     def __post_init__(self) -> None:
-        if not isinstance(self.table, pa.Table):
-            raise InvalidInputSchemaError("Vector data must be a PyArrow table")
-        if self.geometry_column not in self.table.column_names:
-            raise InvalidInputSchemaError(
-                f"Vector geometry column is missing: {self.geometry_column}"
-            )
-        field = self.table.schema.field(self.geometry_column)
-        if not (pa.types.is_binary(field.type) or pa.types.is_large_binary(field.type)):
-            raise InvalidInputSchemaError("Vector geometry must use WKB binary values")
-        try:
-            object.__setattr__(self, "crs", CRS.from_user_input(self.crs))
-        except Exception as exc:
-            raise InvalidInputSchemaError("Vector CRS is invalid") from exc
-        if not isinstance(self.geometry_type, str) or not self.geometry_type:
-            raise InvalidInputSchemaError("Vector geometry type is missing")
+        object.__setattr__(self, "crs", CRS.from_user_input(self.crs))
 
     def __len__(self) -> int:
         return self.table.num_rows
@@ -60,17 +46,12 @@ class VectorTable:
 
     def geometries(self) -> np.ndarray:
         """Decode the WKB column with Shapely's vectorized reader."""
-        try:
-            values = (
-                self.table[self.geometry_column]
-                .combine_chunks()
-                .to_numpy(zero_copy_only=False)
-            )
-            return shapely.from_wkb(values, on_invalid="raise")
-        except Exception as exc:
-            raise InvalidInputSchemaError(
-                "Vector contains invalid WKB geometry"
-            ) from exc
+        values = (
+            self.table[self.geometry_column]
+            .combine_chunks()
+            .to_numpy(zero_copy_only=False)
+        )
+        return shapely.from_wkb(values, on_invalid="raise")
 
     def to_pandas(self, *, decode_geometry: bool = True):
         """Return a Pandas view, optionally decoding its geometry objects."""
@@ -104,8 +85,8 @@ class VectorTable:
         return cls(table, CRS.from_user_input(crs), geometry_column, geometry_type)
 
 
-class VectorTableCheckpointCodec:
-    """Durable Arrow IPC codec retaining VectorTable spatial metadata."""
+class VectorTablePacketCodec:
+    """Arrow IPC packet I/O retaining VectorTable spatial metadata."""
 
     suffix = ".arrow"
 
@@ -127,15 +108,10 @@ class VectorTableCheckpointCodec:
     def load(self, path: Path) -> VectorTable:
         with path.open("rb") as stream:
             table = ipc.open_file(stream).read_all()
-        metadata = table.schema.metadata or {}
-        try:
-            crs = CRS.from_wkt(metadata[b"mgb:crs_wkt"].decode())
-            geometry_column = metadata[b"mgb:geometry_column"].decode()
-            geometry_type = metadata[b"mgb:geometry_type"].decode()
-        except (KeyError, UnicodeDecodeError, ValueError) as exc:
-            raise InvalidInputSchemaError(
-                "Arrow vector checkpoint metadata is invalid"
-            ) from exc
+        metadata = table.schema.metadata
+        crs = CRS.from_wkt(metadata[b"mgb:crs_wkt"].decode())
+        geometry_column = metadata[b"mgb:geometry_column"].decode()
+        geometry_type = metadata[b"mgb:geometry_type"].decode()
         return VectorTable(table, crs, geometry_column, geometry_type)
 
 
@@ -175,13 +151,8 @@ def read_vector_table(
     columns: Sequence[str] | None = None,
 ) -> VectorTable:
     """Read a vector provider directly into an Arrow-native table."""
-    try:
-        metadata, table = pyogrio.read_arrow(path, layer=layer, columns=columns)
-        return vector_table_from_arrow(metadata, table)
-    except InvalidInputSchemaError:
-        raise
-    except Exception as exc:
-        raise InvalidInputSchemaError(f"Cannot read vector provider: {path}") from exc
+    metadata, table = pyogrio.read_arrow(path, layer=layer, columns=columns)
+    return vector_table_from_arrow(metadata, table)
 
 
 def write_vector_table(
@@ -199,20 +170,17 @@ def write_vector_table(
         if driver in {"FlatGeobuf", "GPKG"}
         else {}
     )
-    try:
-        pyogrio.write_arrow(
-            vector.table,
-            path,
-            layer=layer,
-            driver=driver,
-            geometry_name=vector.geometry_column,
-            geometry_type=vector.geometry_type,
-            crs=vector.crs.to_wkt(version="WKT2_2019", pretty=False),
-            append=append,
-            layer_options=options,
-        )
-    except Exception as exc:
-        raise InvalidInputSchemaError(f"Cannot write vector provider: {path}") from exc
+    pyogrio.write_arrow(
+        vector.table,
+        path,
+        layer=layer,
+        driver=driver,
+        geometry_name=vector.geometry_column,
+        geometry_type=vector.geometry_type,
+        crs=vector.crs.to_wkt(version="WKT2_2019", pretty=False),
+        append=append,
+        layer_options=options,
+    )
 
 
 @dataclass(frozen=True)
@@ -235,12 +203,7 @@ def inspect_vector_provider(
 ) -> VectorProvider:
     """Inspect schema and CRS without reading feature geometry."""
     path = Path(path)
-    try:
-        info = pyogrio.read_info(path, layer=layer)
-    except Exception as exc:
-        raise InvalidInputSchemaError(
-            f"Cannot inspect vector provider: {path}"
-        ) from exc
+    info = pyogrio.read_info(path, layer=layer)
     driver = info.get("driver")
     if driver not in SUPPORTED_PROVIDER_DRIVERS:
         raise InvalidInputSchemaError(
@@ -253,10 +216,7 @@ def inspect_vector_provider(
         raise InvalidInputSchemaError(
             "Vector provider has no CRS; supply a source-CRS override"
         )
-    try:
-        crs = CRS.from_user_input(value)
-    except Exception as exc:
-        raise InvalidInputSchemaError("Vector provider CRS is invalid") from exc
+    crs = CRS.from_user_input(value)
     return VectorProvider(
         path.resolve(),
         layer,
@@ -296,11 +256,6 @@ def iter_provider_batches(
     """Yield hard-bounded Arrow batches under the shared I/O semaphore."""
     if batch_size <= 0:
         raise InvalidInputSchemaError("Vector batch size must be positive")
-    unknown = set(columns) - set(provider.fields)
-    if unknown:
-        raise InvalidInputSchemaError(
-            "Vector provider lacks column(s): " + ", ".join(sorted(unknown))
-        )
     selected_fids = list(fids) if fids is not None else None
     fid_chunks = (
         (None,)
@@ -310,28 +265,23 @@ def iter_provider_batches(
             for offset in range(0, len(selected_fids), MAX_OGRSQL_ARROW_FIDS)
         )
     )
-    try:
-        for fid_chunk in fid_chunks:
-            guard = context.io_bound() if context is not None else nullcontext()
-            with (
-                guard,
-                pyogrio.open_arrow(
-                    provider.path,
-                    layer=provider.layer,
-                    columns=list(columns),
-                    batch_size=batch_size,
-                    read_geometry=read_geometry,
-                    where=where,
-                    fids=fid_chunk,
-                    return_fids=return_fids,
-                    use_pyarrow=True,
-                ) as (_, batches),
-            ):
-                yield from batches
-    except InvalidInputSchemaError:
-        raise
-    except Exception as exc:
-        raise InvalidInputSchemaError("Cannot stream vector provider") from exc
+    for fid_chunk in fid_chunks:
+        guard = context.io_bound() if context is not None else nullcontext()
+        with (
+            guard,
+            pyogrio.open_arrow(
+                provider.path,
+                layer=provider.layer,
+                columns=list(columns),
+                batch_size=batch_size,
+                read_geometry=read_geometry,
+                where=where,
+                fids=fid_chunk,
+                return_fids=return_fids,
+                use_pyarrow=True,
+            ) as (_, batches),
+        ):
+            yield from batches
 
 
 def id_predicate(field: str, values: Sequence[Hashable]) -> str:
@@ -392,10 +342,7 @@ def conservative_geometry_packet_rows(
     """Reduce packet admission as the per-feature source estimate nears budget."""
     if memory_limit_bytes <= 0 or requested_rows <= 0:
         raise InvalidInputSchemaError("Geometry packet limits must be positive")
-    try:
-        source_bytes = max(1, provider.path.stat().st_size)
-    except OSError as exc:
-        raise InvalidInputSchemaError("Cannot estimate vector provider size") from exc
+    source_bytes = max(1, provider.path.stat().st_size)
     per_feature = max(
         4096, math.ceil(source_bytes / max(1, provider.feature_count)) * 4
     )

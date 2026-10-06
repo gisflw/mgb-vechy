@@ -100,22 +100,15 @@ def grid_from_dem(dem: str | Path) -> GridSpec:
     """Discover the canonical grid directly from an explicit DEM file."""
 
     path = Path(dem)
-    if not path.is_file():
-        raise RasterGridError(f"DEM input is not a local file: {path}")
-    try:
-        with rasterio.open(path) as source:
-            if source.count != 1 or source.crs is None:
-                raise RasterGridError("DEM must be single-band and declare a CRS")
-            result = GridSpec(
-                CRS.from_user_input(source.crs),
-                source.transform,
-                int(source.width),
-                int(source.height),
-            )
-    except RasterGridError:
-        raise
-    except (rasterio.errors.RasterioError, TypeError, ValueError) as exc:
-        raise RasterGridError(f"Cannot inspect DEM grid: {path}") from exc
+    with rasterio.open(path) as source:
+        if source.count != 1 or source.crs is None:
+            raise RasterGridError("DEM must be single-band and declare a CRS")
+        result = GridSpec(
+            CRS.from_user_input(source.crs),
+            source.transform,
+            int(source.width),
+            int(source.height),
+        )
     if (
         result.width <= 0
         or result.height <= 0
@@ -307,12 +300,7 @@ class AlignedRasterReader:
         self.context = context
 
     def source(self, name: str):
-        try:
-            path = self.assets[name]
-        except KeyError as exc:
-            raise RasterGridError(f"Unknown aligned raster asset: {name}") from exc
-        if not path.is_file():
-            raise RasterGridError(f"Aligned raster input is missing: {path}")
+        path = self.assets[name]
         key = f"aligned-raster:{path}"
 
         def open_source():
@@ -347,12 +335,7 @@ class CoveringRasterReader:
         self.context = context
 
     def source(self, name: str):
-        try:
-            path = self.assets[name]
-        except KeyError as exc:
-            raise RasterGridError(f"Unknown covering raster asset: {name}") from exc
-        if not path.is_file():
-            raise RasterGridError(f"Covering raster input is missing: {path}")
+        path = self.assets[name]
         key = f"covering-raster:{path}"
 
         def open_source():
@@ -424,13 +407,6 @@ class RasterAssembler:
             or compression_threads <= 0
         ):
             raise RasterGridError("Raster compression threads must be positive")
-        for spec in product_list:
-            try:
-                np.dtype(spec.dtype)
-            except TypeError as exc:
-                raise RasterGridError(
-                    f"Invalid dtype for raster product {spec.name}: {spec.dtype}"
-                ) from exc
         self.root.mkdir(parents=True, exist_ok=True)
         self._sources: dict[str, Any] = {}
         self._mask_initialized: set[str] = set()

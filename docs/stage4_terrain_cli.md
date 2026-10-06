@@ -2,14 +2,13 @@
 
 `mgb-vec-hydro terrain-products` consumes explicit prepared files. The DEM is
 authoritative for the canonical CRS, transform, dimensions, and grid. The cells,
-drainage, optional D8, and index inputs must match that grid exactly.
+drainage, and optional D8 inputs must match that grid exactly.
 
 ```bash
 mgb-vec-hydro terrain-products \
   --dem prepared/dem.tif \
   --cells prepared/cells.tif \
   --drainage prepared/drainage.tif \
-  --mini-index prepared/mini_index.csv \
   --direction-source dem \
   --agree-sharp 80 \
   --agree-smooth 8 \
@@ -22,9 +21,8 @@ mgb-vec-hydro terrain-products \
 | Option | Status | Type/default | Meaning |
 | --- | --- | --- | --- |
 | `--dem` | Required | Existing raster path | Canonical DEM defining the CRS, transform, dimensions, and grid. |
-| `--cells` | Required | Existing raster path | Prepared dense mini-label raster defining the cells for each mini. |
+| `--cells` | Required | Existing raster path | Prepared mini-ID raster with embedded bounds defining the cells for each mini. |
 | `--drainage` | Required | Existing raster path | Prepared drainage raster identifying the matching drainage cells. |
-| `--mini-index` | Required | Existing CSV path | Six-column index that defines the minis and their grid-aligned bounds. |
 | `--d8` | Optional; required in D8 mode | Existing raster path | Canonical clockwise D8 raster used when `--direction-source=d8`; it must match the DEM grid. |
 | `--output-dir` | Required | Directory path | New directory where `hand.tif`, `ltnd.tif`, and any requested flow-direction output are published. |
 | `--direction-source` | Optional | `dem` or `d8`; default `dem` | Selects DEM-conditioned routing or the explicit D8 raster as the flow-direction source. |
@@ -35,8 +33,6 @@ mgb-vec-hydro terrain-products \
 | `--workers` | Optional | Positive integer; default `4` | Number of worker processes used for bounded terrain work. There is no upper limit imposed by the CLI or stage validator. |
 | `--memory-limit-mb` | Optional | Positive integer MB; default `512` | Admitted memory budget used to size terrain packets. |
 | `--io-slots` | Optional | Positive integer; default `2` | Maximum number of concurrent raster reads. |
-| `--batch-size` | Optional | Positive integer rows; default `10000` | Batch size used for bounded mini-index planning and execution metadata. |
-| `--checkpoint-dir` | Optional | Directory path | Scratch location for resumable terrain packets; it must be outside `--output-dir`. |
 
 Click also provides `--help` to display the command’s generated option list.
 
@@ -45,12 +41,11 @@ Click also provides `--help` to display the command’s generated option list.
 `--write-flow-direction` to publish the directions selected by the run.
 Execution defaults are four workers, 512 MB of admitted task memory, and two I/O
 slots, with at most eight complete minis per packet. Worker counts may be any
-positive integer. `--checkpoint-dir` enables
-resumable terrain packets and must be outside `--output-dir`.
+positive integer.
 
-Terrain reads `mini_index.csv` directly and never republishes it. It does
-not read mini vectors or regenerate cells and drainage. Each mini is an
-indivisible work unit. Workers use the shared aligned COG reader, preserve
+Terrain reads mini IDs and bounds from the `mini_index` JSON tag in
+`cells.tif`. It does not read mini vectors or regenerate cells and drainage.
+Each mini is an indivisible work unit. Workers use the shared aligned COG reader, preserve
 strict ownership without buffering, and the coordinator alone assembles final
 COGs.
 
@@ -75,7 +70,7 @@ nested directory. All outputs are full canonical-grid COGs with internal
 validity masks: HAND and LTND are `float32`, and flow direction is `uint8`
 with codes 0 for drainage and 1–8 for N, NE, E, SE, S, SW, W, and NW. The
 report and CLI status identify the concrete paths written and include planning,
-raster-read, conditioning/D8-validation, routing, compression, checkpoint, and
+raster-read, conditioning/D8-validation, routing, compression, and
 cell-count diagnostics.
 
 The prepared DEM must declare `units=m`. HAND stores metre elevation
@@ -96,8 +91,4 @@ AGREE defaults remain **80.0** for sharp incision, **8.0** for smooth depth,
 and **4** buffer pixels. The two depth parameters operate in normalized DEM
 units (metres); they are not automatically rescaled by `--dem-scale`.
 
-For the low-level library API, `compute_ltnd(..., crs=...)` returns metres;
-omitting `crs` retains the legacy raster-coordinate-unit calculation. The
-production stage always supplies CRS. Regenerate legacy terrain products
-after normalizing the source DEM; old terrain checkpoints are incompatible
-with the corrected distance contract.
+`compute_ltnd(..., crs=...)` requires an explicit CRS and returns metres.

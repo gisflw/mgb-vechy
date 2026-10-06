@@ -2,8 +2,7 @@
 
 The shared execution layer provides bounded, deterministic infrastructure for
 the CLI stages. It is internal and is not exported from the package root.
-Stages import contracts from `execution.executor`, `execution.checkpoints`,
-`execution.vector`, `execution.raster`, and `execution.publication`.
+Stages import contracts from `execution.executor`, `execution.vector`, `execution.raster`, and `execution.publication`.
 
 ## Local execution
 
@@ -19,15 +18,7 @@ an `io_bound()` semaphore shared by all workers. Reports include counts,
 admitted-memory peaks, ordered diagnostics, timings, cancellation, and remote
 failures.
 
-## Checkpoints and publication
-
-`CheckpointStore` is optional. `execution_fingerprint` hashes the algorithm,
-version, explicit input identity, parameters, and ordered work descriptors.
-Stage input identity records each concrete local file path, size, and
-modification time, along with authoritative CRS where relevant. This means a
-checkpoint cannot silently resume against a different input file or processing
-contract. Stage checkpoint directories are scratch locations outside the
-published output and are cleaned only after successful atomic publication.
+## Publication
 
 `AtomicOutputDirectory` creates a private sibling staging directory. A stage
 validates every expected file, removes packet/work artifacts, rejects extra
@@ -74,10 +65,11 @@ and participates in the same shared I/O semaphore.
 block writes and bounded corrections, and creates internally masked COGs with
 bounded compression threads. Working rasters are deleted before publication.
 
-Preparation derives the raster domain from the explicit mini-catchment file and
-produces `mini_index.csv` with exactly `mini_label`, `mini_id`, `minx`,
-`miny`, `maxx`, and `maxy`. Terrain and sampling consume that same index by
-direct path; terrain does not copy or republish it.
+Preparation derives its raster domain from mini-catchment polygons and stores
+mini IDs directly in `cells.tif`. A `mini_index` dataset tag contains JSON
+records `[mini_id, minx, miny, maxx, maxy]`, ordered by ID. Bounds enclose the
+final owned pixels after connectivity correction. Terrain and sampling read
+this embedded metadata directly; no index sidecar is published.
 
 ## Stage execution
 
@@ -92,5 +84,5 @@ flow direction. Sampling derives block-aware packets and reduces exact mini
 statistics into the single sampled CSV.
 
 Scientific kernels remain responsible for their schemas, validation,
-memory factors, checkpoint codecs, topology, ownership, and product rules;
+memory factors, topology, ownership, and product rules;
 shared infrastructure remains independent of those rules.

@@ -4,11 +4,6 @@ import time
 import pytest
 
 from mgb_vec_hydro.exceptions import WorkerExecutionError, WorkMemoryError
-from mgb_vec_hydro.execution.checkpoints import (
-    CheckpointStore,
-    JsonCheckpointCodec,
-    execution_fingerprint,
-)
 from mgb_vec_hydro.execution.executor import (
     ExecutionConfig,
     LocalExecutor,
@@ -55,41 +50,6 @@ def test_executor_rejects_single_oversized_item():
         LocalExecutor(ExecutionConfig(workers=1, memory_limit_bytes=10)).run(
             [item], _delayed_worker, lambda result: None
         )
-
-
-def test_checkpoint_resume_skips_completed_work(tmp_path):
-    items = _items()
-    fingerprint = execution_fingerprint(
-        algorithm="test",
-        version="1",
-        input_identity={"input": {"path": "input.tif", "size": 1, "mtime_ns": 1}},
-        parameters={"x": 1},
-        work_items=items,
-    )
-    checkpoint = CheckpointStore(
-        tmp_path / "resume", fingerprint, JsonCheckpointCodec()
-    )
-
-    def interrupt(_result):
-        raise RuntimeError("stop after durable result")
-
-    with pytest.raises(RuntimeError, match="durable"):
-        LocalExecutor(ExecutionConfig(workers=1, memory_limit_bytes=20)).run(
-            items, _delayed_worker, interrupt, checkpoint=checkpoint
-        )
-
-    resumed = []
-    report = LocalExecutor(ExecutionConfig(workers=1, memory_limit_bytes=20)).run(
-        items,
-        _delayed_worker,
-        lambda result: resumed.append(result.value),
-        checkpoint=CheckpointStore(
-            tmp_path / "resume", fingerprint, JsonCheckpointCodec()
-        ),
-    )
-    assert resumed == [2, 4, 6]
-    assert report.resumed == 1
-    assert report.submitted == 2
 
 
 def test_atomic_output_directory_publishes_or_cleans_up(tmp_path):

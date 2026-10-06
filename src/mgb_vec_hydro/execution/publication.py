@@ -34,12 +34,7 @@ class AtomicOutputDirectory:
         for path in expected:
             relative = Path(path)
             candidate = (self.staging / relative).resolve()
-            try:
-                candidate.relative_to(self.staging.resolve())
-            except ValueError as exc:
-                raise PublicationError(
-                    f"Expected output escapes staging directory: {path}"
-                ) from exc
+            candidate.relative_to(self.staging.resolve())
             safe_expected.append((relative, candidate))
         missing = [
             str(path) for path, candidate in safe_expected if not candidate.is_file()
@@ -75,12 +70,7 @@ class AtomicOutputDirectory:
                 )
         if self.target.exists():
             raise PublicationError(f"Output directory already exists: {self.target}")
-        try:
-            os.replace(self.staging, self.target)
-        except OSError as exc:
-            raise PublicationError(
-                f"Cannot publish output directory: {self.target}"
-            ) from exc
+        os.replace(self.staging, self.target)
         self._published = True
         return self.target
 

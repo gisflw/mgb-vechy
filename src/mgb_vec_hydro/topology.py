@@ -99,19 +99,6 @@ def resolve_column_name(table: pd.DataFrame, column: str) -> str:
     )
 
 
-def _validate_columns(table: pd.DataFrame, required_columns: Iterable[str]) -> None:
-    missing = []
-    for column in required_columns:
-        try:
-            resolve_column_name(table, column)
-        except MissingColumnsError:
-            missing.append(column)
-    if missing:
-        raise MissingColumnsError(
-            "Missing required column(s): " + ", ".join(missing)
-        )
-
-
 def _validate_unique_segments(table: pd.DataFrame, id_col: str) -> None:
     duplicated = table.loc[table[id_col].duplicated(), id_col].tolist()
     if duplicated:

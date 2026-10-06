@@ -9,14 +9,12 @@ from __future__ import annotations
 
 import heapq
 import math
-import pickle
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 
 import numpy as np
-import pandas as pd
 import rasterio
 from affine import Affine
 from numba import njit
@@ -25,14 +23,9 @@ from rasterio.enums import Resampling
 from rasterio.env import get_gdal_config, set_gdal_config
 from rasterio.windows import Window
 
-from mgb_vec_hydro.exceptions import RasterGridError, TerrainProductsError
+from mgb_vec_hydro.exceptions import TerrainProductsError
 from mgb_vec_hydro.crs_utils import (
-    CrsError, geodetic_tools, require_metre_units,
-)
-from mgb_vec_hydro.execution.checkpoints import (
-    CheckpointStore,
-    execution_fingerprint,
-    file_identity,
+geodetic_tools, require_metre_units,
 )
 from mgb_vec_hydro.execution.executor import (
     ExecutionConfig,
@@ -55,7 +48,7 @@ from mgb_vec_hydro.execution.raster import (
     grid_from_dem,
     _require_grid,
 )
-from mgb_vec_hydro.preparation import GridSpec
+from mgb_vec_hydro.preparation import read_mini_index, GridSpec
 
 # Code, row delta, column delta. This order is also the final tie-break.
 _DIRECTIONS = (
@@ -94,7 +87,6 @@ class TerrainSpec:
     dem: Path
     mini_ownership: Path
     drainage: Path
-    mini_index: Path
     output_dir: Path
     d8: Path | None = None
     direction_source: Literal["dem", "d8"] = "dem"
@@ -105,8 +97,6 @@ class TerrainSpec:
     workers: int = 4
     memory_limit_mb: int = 512
     io_slots: int = 2
-    batch_size: int = 10_000
-    checkpoint_dir: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -835,9 +825,9 @@ def compute_ltnd(
     transform: Affine,
     rank: np.ndarray | None = None,
     *,
-    crs: str | CRS | None = None,
+    crs: str | CRS,
 ) -> np.ndarray:
-    """Accumulate route distance in metres with CRS, or native units without it."""
+    """Accumulate route distance in metres on the CRS ellipsoid."""
 
     direction = np.asarray(direction)
     if direction.ndim != 2:
@@ -845,11 +835,8 @@ def compute_ltnd(
     rank = _routing_rank(direction) if rank is None else np.asarray(rank)
     if rank.shape != direction.shape:
         raise TerrainProductsError("Rank and direction must have equal shapes")
-    width, height = _pixel_sizes(transform)
     order = _rank_order(rank)
-    if crs is not None:
-        return _metric_ltnd(direction, order, transform, crs)
-    return _ltnd_kernel(direction, order, width, height)
+    return _metric_ltnd(direction, order, transform, crs)
 
 
 def _uses_row_steps(crs: CRS) -> bool:
@@ -866,66 +853,61 @@ def _metric_ltnd(direction, order, transform, crs):
     if not isinstance(transform, Affine):
         transform = Affine(*transform)
     _pixel_sizes(transform)
-    try:
-        source = CRS.from_user_input(crs)
-        if not (source.is_geographic or source.is_projected):
-            raise TerrainProductsError("LTND requires a geographic or projected raster CRS")
-        transformer, geod = geodetic_tools(source.to_wkt())
-        if _uses_row_steps(source):
-            # Geographic and separable cylindrical grids have the same edge
-            # lengths at every column. Measure three kinds of edge per row
-            # and reuse symmetry for all eight route directions.
-            steps = np.zeros((direction.shape[0], 8), dtype=np.float64)
-            x = np.full(direction.shape[0], transform.c + 0.5 * transform.a)
-            y = transform.f + (np.arange(direction.shape[0]) + 0.5) * transform.e
-            lon, lat = transformer.transform(x, y)
-            elon, elat = transformer.transform(x + transform.a, y)
-            horizontal = geod.inv(lon, lat, elon, elat)[2]
-            _require_metric_distances(horizontal)
-            steps[:, 2] = horizontal
-            steps[:, 6] = horizontal
-            if direction.shape[0] > 1:
-                vertical = geod.inv(lon[:-1], lat[:-1], lon[1:], lat[1:])[2]
-                diagonal = geod.inv(lon[:-1], lat[:-1], elon[1:], elat[1:])[2]
-                _require_metric_distances(vertical)
-                _require_metric_distances(diagonal)
-                steps[:-1, 4] = vertical
-                steps[1:, 0] = vertical
-                steps[:-1, 3] = diagonal
-                steps[:-1, 5] = diagonal
-                steps[1:, 1] = diagonal
-                steps[1:, 7] = diagonal
-            return _ltnd_row_steps_kernel(direction, order, steps)
+    source = CRS.from_user_input(crs)
+    if not (source.is_geographic or source.is_projected):
+        raise TerrainProductsError("LTND requires a geographic or projected raster CRS")
+    transformer, geod = geodetic_tools(source.to_wkt())
+    if _uses_row_steps(source):
+        # Geographic and separable cylindrical grids have the same edge
+        # lengths at every column. Measure three kinds of edge per row
+        # and reuse symmetry for all eight route directions.
+        steps = np.zeros((direction.shape[0], 8), dtype=np.float64)
+        x = np.full(direction.shape[0], transform.c + 0.5 * transform.a)
+        y = transform.f + (np.arange(direction.shape[0]) + 0.5) * transform.e
+        lon, lat = transformer.transform(x, y)
+        elon, elat = transformer.transform(x + transform.a, y)
+        horizontal = geod.inv(lon, lat, elon, elat)[2]
+        _require_metric_distances(horizontal)
+        steps[:, 2] = horizontal
+        steps[:, 6] = horizontal
+        if direction.shape[0] > 1:
+            vertical = geod.inv(lon[:-1], lat[:-1], lon[1:], lat[1:])[2]
+            diagonal = geod.inv(lon[:-1], lat[:-1], elon[1:], elat[1:])[2]
+            _require_metric_distances(vertical)
+            _require_metric_distances(diagonal)
+            steps[:-1, 4] = vertical
+            steps[1:, 0] = vertical
+            steps[:-1, 3] = diagonal
+            steps[:-1, 5] = diagonal
+            steps[1:, 1] = diagonal
+            steps[1:, 7] = diagonal
+        return _ltnd_row_steps_kernel(direction, order, steps)
 
-        # Transform only actual route edges, in batches with bounded temporaries.
-        flat = direction.ravel()
-        edges = np.zeros(direction.shape, dtype=np.float64)
-        output = edges.ravel()
-        for start in range(0, flat.size, GEODESIC_BATCH_CELLS):
-            codes = flat[start : start + GEODESIC_BATCH_CELLS]
-            cells = np.flatnonzero(codes > 0) + start
-            if not cells.size:
-                continue
-            rows, cols = np.divmod(cells, direction.shape[1])
-            indices = flat[cells] - 1
-            x = transform.c + (cols + 0.5) * transform.a
-            y = transform.f + (rows + 0.5) * transform.e
-            px = x + _DC[indices] * transform.a
-            py = y + _DR[indices] * transform.e
-            # These float64 buffers are local to the batch and no longer need
-            # native coordinates. Reuse them for lon/lat and inverse results.
-            lon, lat = transformer.transform(x, y, inplace=True)
-            plon, plat = transformer.transform(px, py, inplace=True)
-            distances = geod.inv(
-                lon, lat, plon, plat, inplace=True, return_back_azimuth=False
-            )[2]
-            _require_metric_distances(distances)
-            output[cells] = distances
-        return _ltnd_edge_steps_kernel(direction, order, edges)
-    except TerrainProductsError:
-        raise
-    except Exception as exc:
-        raise TerrainProductsError("Cannot measure LTND in metres for the raster CRS") from exc
+    # Transform only actual route edges, in batches with bounded temporaries.
+    flat = direction.ravel()
+    edges = np.zeros(direction.shape, dtype=np.float64)
+    output = edges.ravel()
+    for start in range(0, flat.size, GEODESIC_BATCH_CELLS):
+        codes = flat[start : start + GEODESIC_BATCH_CELLS]
+        cells = np.flatnonzero(codes > 0) + start
+        if not cells.size:
+            continue
+        rows, cols = np.divmod(cells, direction.shape[1])
+        indices = flat[cells] - 1
+        x = transform.c + (cols + 0.5) * transform.a
+        y = transform.f + (rows + 0.5) * transform.e
+        px = x + _DC[indices] * transform.a
+        py = y + _DR[indices] * transform.e
+        # These float64 buffers are local to the batch and no longer need
+        # native coordinates. Reuse them for lon/lat and inverse results.
+        lon, lat = transformer.transform(x, y, inplace=True)
+        plon, plat = transformer.transform(px, py, inplace=True)
+        distances = geod.inv(
+            lon, lat, plon, plat, inplace=True, return_back_azimuth=False
+        )[2]
+        _require_metric_distances(distances)
+        output[cells] = distances
+    return _ltnd_edge_steps_kernel(direction, order, edges)
 
 
 def _require_metric_distances(distances):
@@ -994,29 +976,6 @@ def _hand_kernel(elevation, direction, order):
     return result.reshape(direction.shape)
 
 
-@njit(cache=True)
-def _ltnd_kernel(direction, order, width, height):
-    result = np.full(direction.size, np.nan)
-    dirs = direction.ravel()
-    cols = direction.shape[1]
-    diagonal = math.hypot(width, height)
-    steps = np.array(
-        [height, diagonal, width, diagonal, height, diagonal, width, diagonal]
-    )
-    for oi in range(order.size):
-        cell = order[oi]
-        code = dirs[cell]
-        if code < 0:
-            continue
-        if code == 0:
-            result[cell] = 0.0
-        else:
-            r, c = cell // cols, cell % cols
-            parent = (r + _DR[code - 1]) * cols + c + _DC[code - 1]
-            result[cell] = result[parent] + steps[code - 1]
-    return result.reshape(direction.shape)
-
-
 def _parent(row: int, col: int, code: int, shape: tuple[int, int]) -> tuple[int, int]:
     if code not in _DELTAS:
         raise TerrainProductsError(f"Invalid flow-direction code {code}")
@@ -1029,15 +988,12 @@ def _parent(row: int, col: int, code: int, shape: tuple[int, int]) -> tuple[int,
 
 def _routing_rank(direction: np.ndarray) -> np.ndarray:
     """Derive ranks while validating that every route terminates."""
-    try:
-        return _rank_and_terminal(np.asarray(direction))[0]
-    except ValueError as exc:
-        raise TerrainProductsError(str(exc)) from exc
+    return _rank_and_terminal(np.asarray(direction))[0]
 
 
 def _warm_routing_kernels() -> None:
     """Load/compile cached kernels separately from measured production routing."""
-    if _ltnd_kernel.signatures and _agree_condition_kernel.signatures:
+    if _ltnd_row_steps_kernel.signatures and _agree_condition_kernel.signatures:
         return
     elevation = np.array([[1.0, 0.0]], dtype=np.float64)
     labels = np.zeros((1, 2), dtype=np.int64)
@@ -1047,14 +1003,13 @@ def _warm_routing_kernels() -> None:
         elevation, labels, drainage, Affine(1, 0, 0, 0, -1, 0)
     )
     compute_hand(elevation, direction, rank)
-    compute_ltnd(direction, Affine(1, 0, 0, 0, -1, 0), rank)
+    compute_ltnd(direction, Affine(1, 0, 0, 0, -1, 0), rank, crs="EPSG:3857")
 
 
 @dataclass(frozen=True)
 class _MiniUnit:
     raster: RasterUnit
-    mini_label: int
-    mini_id: Any
+    mini_id: int
     catchment_fid: int = -1
     segment_fid: int = -1
 
@@ -1086,18 +1041,6 @@ class _PacketValue:
     patches: tuple[Any, ...]
 
 
-class _PickleCheckpointCodec:
-    suffix = ".pkl"
-
-    def dump(self, value: Any, path: Path) -> None:
-        with path.open("wb") as stream:
-            pickle.dump(value, stream, protocol=pickle.HIGHEST_PROTOCOL)
-
-    def load(self, path: Path) -> Any:
-        with path.open("rb") as stream:
-            return pickle.load(stream)
-
-
 def create_terrain_dataset(spec: TerrainSpec) -> TerrainReport:
     """Build terrain products with a bounded coordinator GDAL block cache."""
     previous = get_gdal_config("GDAL_CACHEMAX")
@@ -1116,10 +1059,7 @@ def _create_terrain_dataset(spec: TerrainSpec) -> TerrainReport:
 
     overall_started = time.perf_counter()
     _validate_terrain_spec(spec)
-    try:
-        grid = grid_from_dem(spec.dem)
-    except RasterGridError as exc:
-        raise TerrainProductsError("Cannot discover the canonical DEM grid") from exc
+    grid = grid_from_dem(spec.dem)
     raster_assets = {
         "dem": Path(spec.dem),
         "cells": Path(spec.mini_ownership),
@@ -1130,7 +1070,7 @@ def _create_terrain_dataset(spec: TerrainSpec) -> TerrainReport:
     _validate_terrain_inputs(raster_assets, grid)
 
     planning_started = time.perf_counter()
-    mini_units, mini_identity = _plan_minis(Path(spec.mini_index), grid)
+    mini_units = _plan_minis(Path(spec.mini_ownership), grid)
     memory_bytes = spec.memory_limit_mb * 1024 * 1024
     planning_seconds = time.perf_counter() - planning_started
     config = ExecutionConfig(
@@ -1139,9 +1079,7 @@ def _create_terrain_dataset(spec: TerrainSpec) -> TerrainReport:
         max_in_flight=spec.workers,
         io_slots=spec.io_slots,
     )
-    checkpoint_root = Path(spec.checkpoint_dir) if spec.checkpoint_dir else None
-    domain_report = ExecutionReport(0, 0, 0, 0, 0, 0, 0.0, {}, ())
-    terrain_checkpoint = None
+    domain_report = ExecutionReport(0, 0, 0, 0, 0, 0.0, {}, ())
 
     publisher = AtomicOutputDirectory(spec.output_dir)
     compression_seconds = 0.0
@@ -1152,22 +1090,6 @@ def _create_terrain_dataset(spec: TerrainSpec) -> TerrainReport:
             grid,
             raster_assets,
             memory_bytes,
-        )
-        input_identity = {
-            name: file_identity(path) for name, path in raster_assets.items()
-        } | mini_identity
-        terrain_checkpoint = _checkpoint(
-            checkpoint_root / "terrain" if checkpoint_root else None,
-            "terrain-products",
-            input_identity,
-            {
-                "direction_source": spec.direction_source,
-                "write_flow_direction": spec.write_flow_direction,
-                "agree_sharp": spec.agree_sharp,
-                "agree_smooth": spec.agree_smooth,
-                "agree_buffer": spec.agree_buffer,
-            },
-            terrain_items,
         )
         terrain_specs = [
             RasterProductSpec(
@@ -1224,7 +1146,6 @@ def _create_terrain_dataset(spec: TerrainSpec) -> TerrainReport:
                 terrain_items,
                 _terrain_worker,
                 reduce_terrain,
-                checkpoint=terrain_checkpoint,
             )
             started = time.perf_counter()
             terrain_paths = terrain_assembler.finish()
@@ -1233,13 +1154,6 @@ def _create_terrain_dataset(spec: TerrainSpec) -> TerrainReport:
         _validate_terrain_outputs(terrain_paths, grid)
         publisher.publish(tuple(path.name for path in terrain_paths.values()))
 
-    if terrain_checkpoint is not None:
-        terrain_checkpoint.cleanup()
-    if checkpoint_root is not None:
-        try:
-            checkpoint_root.rmdir()
-        except OSError:
-            pass
 
     diagnostics = tuple(terrain_report.worker_diagnostics)
     owned_cells = sum(int(value.get("owned_cells", 0)) for value in diagnostics)
@@ -1284,41 +1198,10 @@ def _create_terrain_dataset(spec: TerrainSpec) -> TerrainReport:
 
 
 def _validate_terrain_spec(spec: TerrainSpec) -> None:
-    for name, path in (
-        ("DEM", spec.dem),
-        ("cells", spec.mini_ownership),
-        ("drainage", spec.drainage),
-        ("mini index", spec.mini_index),
-    ):
-        if not Path(path).is_file():
-            raise TerrainProductsError(f"{name} input is not a local file: {path}")
-    if spec.d8 is not None and not Path(spec.d8).is_file():
-        raise TerrainProductsError(f"D8 input is not a local file: {spec.d8}")
     if spec.direction_source == "d8" and spec.d8 is None:
         raise TerrainProductsError("D8 input is required when direction source is 'd8'")
     if spec.direction_source not in {"dem", "d8"}:
         raise TerrainProductsError("direction source must be 'dem' or 'd8'")
-    for name, value in (
-        ("workers", spec.workers),
-        ("memory limit", spec.memory_limit_mb),
-        ("I/O slots", spec.io_slots),
-        ("batch size", spec.batch_size),
-    ):
-        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
-            raise TerrainProductsError(f"{name} must be a positive integer")
-    output = Path(spec.output_dir)
-    if output.exists():
-        raise TerrainProductsError(f"Output directory already exists: {output}")
-    if spec.checkpoint_dir is not None:
-        checkpoint = Path(spec.checkpoint_dir).resolve()
-        try:
-            checkpoint.relative_to(output.resolve())
-        except ValueError:
-            pass
-        else:
-            raise TerrainProductsError(
-                "Checkpoint directory cannot be inside the output directory"
-            )
     _validate_agree_parameters(spec.agree_sharp, spec.agree_smooth, spec.agree_buffer)
 
 
@@ -1330,29 +1213,16 @@ def _validate_terrain_inputs(assets: dict[str, Path], grid: GridSpec) -> None:
         "d8": "uint8",
     }
     for name, path in assets.items():
-        try:
-            with rasterio.open(path) as source:
-                _require_grid(source, grid, name)
-                if name == "dem":
-                    require_metre_units(source, "DEM")
-                expected = expected_dtypes[name]
-                if expected is not None and source.dtypes[0] != expected:
-                    raise TerrainProductsError(
-                        f"{name} raster has dtype {source.dtypes[0]}, "
-                        f"expected {expected}"
-                    )
-        except TerrainProductsError:
-            raise
-        except CrsError as exc:
-            raise TerrainProductsError(str(exc)) from exc
-        except RasterGridError as exc:
-            raise TerrainProductsError(
-                f"Explicit {name} raster does not match the canonical DEM grid"
-            ) from exc
-        except (OSError, rasterio.errors.RasterioError, TypeError, ValueError) as exc:
-            raise TerrainProductsError(
-                f"Cannot inspect explicit {name} raster: {path}"
-            ) from exc
+        with rasterio.open(path) as source:
+            _require_grid(source, grid, name)
+            if name == "dem":
+                require_metre_units(source, "DEM")
+            expected = expected_dtypes[name]
+            if expected is not None and source.dtypes[0] != expected:
+                raise TerrainProductsError(
+                    f"{name} raster has dtype {source.dtypes[0]}, "
+                    f"expected {expected}"
+                )
 
 
 def _validate_terrain_outputs(paths: dict[str, Path], grid: GridSpec) -> None:
@@ -1361,88 +1231,24 @@ def _validate_terrain_outputs(paths: dict[str, Path], grid: GridSpec) -> None:
         raise TerrainProductsError("Terrain output file set is incomplete")
     expected_dtypes = {"hand": "float32", "ltnd": "float32", "flow_direction": "uint8"}
     for name, path in paths.items():
-        try:
-            with rasterio.open(path) as source:
-                _require_grid(source, grid, name)
-                if source.dtypes[0] != expected_dtypes[name]:
-                    raise TerrainProductsError(
-                        f"Terrain raster {name} has unexpected dtype {source.dtypes[0]}"
-                    )
-        except TerrainProductsError:
-            raise
-        except RasterGridError as exc:
-            raise TerrainProductsError(
-                f"Terrain output {name} does not match the canonical DEM grid"
-            ) from exc
-        except (OSError, rasterio.errors.RasterioError, TypeError, ValueError) as exc:
-            raise TerrainProductsError(f"Cannot inspect terrain output: {path}") from exc
+        with rasterio.open(path) as source:
+            _require_grid(source, grid, name)
+            if source.dtypes[0] != expected_dtypes[name]:
+                raise TerrainProductsError(
+                    f"Terrain raster {name} has unexpected dtype {source.dtypes[0]}"
+                )
 
 
-def _plan_minis(
-    index_path: Path, grid: GridSpec
-) -> tuple[tuple[_MiniUnit, ...], dict[str, Any]]:
-    try:
-        table = pd.read_csv(
-            index_path,
-            dtype={"mini_label": "int32", "mini_id": "string"},
-            keep_default_na=False,
-        )
-    except Exception as exc:
-        raise TerrainProductsError(f"Cannot read explicit mini index: {index_path}") from exc
-    required = ["mini_label", "mini_id", "minx", "miny", "maxx", "maxy"]
-    if (
-        list(table.columns) != required
-        or table.empty
-        or table["mini_label"].dtype != np.dtype("int32")
-        or table["mini_label"].duplicated().any()
-        or table["mini_id"].isna().any()
-        or table["mini_id"].eq("").any()
-        or table["mini_id"].duplicated().any()
-        or not np.array_equal(
-            table["mini_label"].to_numpy(),
-            np.arange(1, len(table) + 1, dtype="int32"),
-        )
-    ):
-        raise TerrainProductsError("Mini index schema or values are invalid")
-    try:
-        bounds = table[["minx", "miny", "maxx", "maxy"]].to_numpy(dtype=float)
-    except (TypeError, ValueError) as exc:
-        raise TerrainProductsError("Mini index bounds are invalid") from exc
-    if (
-        not np.isfinite(bounds).all()
-        or np.any(bounds[:, 0] > bounds[:, 2])
-        or np.any(bounds[:, 1] > bounds[:, 3])
-    ):
-        raise TerrainProductsError("Mini index bounds are invalid")
-    labels_by_key = {
-        f"mini-{int(row.mini_label):010d}": (int(row.mini_label), row.mini_id)
-        for row in table.itertuples(index=False)
-    }
-    unit_bounds = [
-        (f"mini-{int(row.mini_label):010d}", (float(row.minx), float(row.miny), float(row.maxx), float(row.maxy)))
-        for row in table.itertuples(index=False)
-    ]
-    try:
-        planned = plan_raster_units(
-            grid,
-            unit_bounds,
-            bytes_per_cell=DOMAIN_BYTES_PER_CELL,
-            fixed_bytes=TASK_FIXED_BYTES,
-        )
-    except RasterGridError as exc:
-        raise TerrainProductsError("Mini index bounds do not overlap the DEM grid") from exc
-    result = tuple(
-        _MiniUnit(
-            raster,
-            labels_by_key[raster.key][0],
-            labels_by_key[raster.key][1],
-        )
-        for raster in planned
+def _plan_minis(cells: Path, grid: GridSpec) -> tuple[_MiniUnit, ...]:
+    records = read_mini_index(cells)
+    ids_by_key = {f"mini-{mini_id:010d}": mini_id for mini_id, *_ in records}
+    planned = plan_raster_units(
+        grid,
+        [(f"mini-{mini_id:010d}", tuple(bounds)) for mini_id, *bounds in records],
+        bytes_per_cell=DOMAIN_BYTES_PER_CELL,
+        fixed_bytes=TASK_FIXED_BYTES,
     )
-    identity = {
-        "mini_index": file_identity(index_path),
-    }
-    return result, identity
+    return tuple(_MiniUnit(raster, ids_by_key[raster.key]) for raster in planned)
 
 
 def _reestimated_units(
@@ -1576,7 +1382,7 @@ def _terrain_worker_with_cache(
         )
         timings["raster_read"] += time.perf_counter() - read_started
         owned = (~np.ma.getmaskarray(ownership)) & (
-            np.asarray(ownership.data) == unit.mini_label
+            np.asarray(ownership.data) == unit.mini_id
         )
         if not np.any(owned):
             raise TerrainProductsError(
@@ -1686,12 +1492,7 @@ def _validated_d8(
     direction = np.full(owned.shape, -1, dtype="int8")
     direction[owned] = raw[owned].astype("int8", copy=False)
     direction[drainage] = 0
-    try:
-        rank, _ = _rank_and_terminal(direction)
-    except ValueError as exc:
-        raise TerrainProductsError(
-            f"Invalid D8 routing in mini {mini_id}: {exc}"
-        ) from exc
+    rank, _ = _rank_and_terminal(direction)
     if np.any(rank[owned] < 0):
         raise TerrainProductsError(f"D8 does not terminate within mini {mini_id}")
     return direction, rank
@@ -1709,25 +1510,6 @@ def _terrain_products_float32(
     hand = _hand_kernel(elevation, direction, order).astype("float32")
     ltnd = _metric_ltnd(direction, order, transform, crs).astype("float32")
     return hand, ltnd
-
-
-def _checkpoint(
-    root: Path | None,
-    algorithm: str,
-    input_identity: dict[str, Any],
-    parameters: dict[str, Any],
-    items: tuple[WorkItem[Any], ...],
-) -> CheckpointStore[Any] | None:
-    if root is None:
-        return None
-    fingerprint = execution_fingerprint(
-        algorithm=algorithm,
-        version="2",
-        input_identity=input_identity,
-        parameters=parameters,
-        work_items=items,
-    )
-    return CheckpointStore(root, fingerprint, _PickleCheckpointCodec())
 
 
 def _terrain_tags(spec: TerrainSpec, role: str) -> dict[str, Any]:
@@ -1770,8 +1552,6 @@ def _terrain_timings(
         "products": terrain_report.timings.get("products", 0.0),
         "coordination": domain_report.timings.get("coordination", 0.0)
         + terrain_report.timings.get("coordination", 0.0),
-        "checkpoint": domain_report.timings.get("checkpoint_write", 0.0)
-        + terrain_report.timings.get("checkpoint_write", 0.0),
         "output_write": domain_report.timings.get("output_write", 0.0)
         + terrain_report.timings.get("output_write", 0.0),
         "compression": compression_seconds,

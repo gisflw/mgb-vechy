@@ -10,7 +10,6 @@ import time
 from pathlib import Path
 
 import numpy as np
-import pandas as pd
 import pytest
 import rasterio
 from rasterio.shutil import copy as copy_raster
@@ -87,22 +86,14 @@ def _write_prepared(root, feature_count, raster_size):
             blockxsize=512,
             blockysize=512,
         ) as target:
-            target.write(np.zeros((raster_size, raster_size), dtype=dtype), 1)
+            if name == "cells":
+                target.update_tags(mini_index=f"[[1,0,0,{raster_size},{raster_size}]]")
+            target.write(np.full((raster_size, raster_size), int(name == "cells"), dtype=dtype), 1)
             target.write_mask(np.full((raster_size, raster_size), 255, dtype="uint8"))
         copy_raster(
             working, root / f"{name}.tif", driver="COG", BLOCKSIZE=512
         )
         working.unlink()
-    pd.DataFrame(
-        {
-            "mini_label": [1],
-            "mini_id": [1],
-            "minx": [0.0],
-            "miny": [0.0],
-            "maxx": [1.0],
-            "maxy": [1.0],
-        }
-    ).to_csv(root / "mini_index.csv", index=False)
 
 
 def _measure_vector(root, result_queue):

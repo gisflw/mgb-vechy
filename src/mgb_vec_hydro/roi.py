@@ -25,21 +25,16 @@ from mgb_vec_hydro.exceptions import (
     PreparedDataError,
     TopologyCycleError,
 )
-from mgb_vec_hydro.execution.checkpoints import (
-    CheckpointStore,
-    execution_fingerprint,
-    file_identity,
-)
 from mgb_vec_hydro.execution.executor import ExecutionConfig, LocalExecutor, WorkItem
 from mgb_vec_hydro.execution.publication import AtomicOutputDirectory
 from mgb_vec_hydro.execution.vector import (
     VectorTable,
-    VectorTableCheckpointCodec,
+    VectorTablePacketCodec,
     inspect_vector_provider,
     vector_table_from_arrow,
     write_vector_table,
 )
-from mgb_vec_hydro.crs_utils import CrsError, geodetic_tools, parse_crs
+from mgb_vec_hydro.crs_utils import geodetic_tools, parse_crs
 
 DEFAULT_STRAHLER_ORDER_COL = "strahler_order"
 ROI_COLUMNS = [
@@ -74,7 +69,6 @@ class RoiSpec:
     memory_limit_mb: int = 512
     io_slots: int = 2
     batch_size: int = 10_000
-    checkpoint_dir: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -139,7 +133,6 @@ def define_roi_dataset(spec: RoiSpec) -> RoiReport:
     memory_bytes = spec.memory_limit_mb * 1024 * 1024
     output = Path(spec.output_dir)
     publisher = AtomicOutputDirectory(output)
-    checkpoint = None
     with publisher as staging:
         phase_started = time.perf_counter()
         catchment_fids = _scan_fids(catchment_provider, spec.batch_size)
@@ -160,10 +153,9 @@ def define_roi_dataset(spec: RoiSpec) -> RoiReport:
             memory_bytes=memory_bytes,
             workers=spec.workers,
         )
-        checkpoint = _roi_checkpoint(spec, target_crs, items)
         packet_dir = staging / ".packets"
         packet_dir.mkdir()
-        codec = VectorTableCheckpointCodec()
+        codec = VectorTablePacketCodec()
 
         def reduce_packet(result):
             codec.dump(result.value, packet_dir / f"{result.ordinal:012d}.arrow")
@@ -175,7 +167,7 @@ def define_roi_dataset(spec: RoiSpec) -> RoiReport:
                 memory_limit_bytes=memory_bytes,
                 io_slots=spec.io_slots,
             )
-        ).run(items, _process_geometry_packet, reduce_packet, checkpoint=checkpoint)
+        ).run(items, _process_geometry_packet, reduce_packet)
         metrics: dict[Hashable, dict[str, float]] = {}
         for ordinal in range(len(items)):
             packet = codec.load(packet_dir / f"{ordinal:012d}.arrow")
@@ -226,8 +218,6 @@ def define_roi_dataset(spec: RoiSpec) -> RoiReport:
         publisher.publish((catchments_path.name, segments_path.name))
     output_publication_seconds = time.perf_counter() - phase_started
 
-    if checkpoint is not None:
-        checkpoint.cleanup()
     return RoiReport(
         output,
         output / "roi_catchments.fgb",
@@ -241,32 +231,6 @@ def define_roi_dataset(spec: RoiSpec) -> RoiReport:
             "output_publication": output_publication_seconds,
             "total": time.perf_counter() - overall_started,
         },
-    )
-
-
-def _roi_checkpoint(
-    spec: RoiSpec, target_crs: CRS, work_items: Iterable[WorkItem[Any]]
-) -> CheckpointStore[Any] | None:
-    if spec.checkpoint_dir is None:
-        return None
-    fingerprint = execution_fingerprint(
-        algorithm="define-roi",
-        version="2",
-        input_identity={
-            "catchments": file_identity(spec.catchments),
-            "segments": file_identity(spec.segments),
-            "target_crs": target_crs.to_wkt(version="WKT2_2019", pretty=False),
-        },
-        parameters={
-            "outlets": list(spec.outlet_ids),
-            "columns": [spec.id_col, spec.id_down_col, spec.strahler_order_col],
-            "layers": [spec.catchments_layer, spec.segments_layer],
-            "source_crs": [spec.catchments_source_crs, spec.segments_source_crs],
-        },
-        work_items=work_items,
-    )
-    return CheckpointStore(
-        spec.checkpoint_dir, fingerprint, VectorTableCheckpointCodec()
     )
 
 
@@ -311,18 +275,13 @@ def _geometry_work_items(
 
 def _process_geometry_packet(payload: _GeometryPacket, context) -> VectorTable:
     provider = payload.provider
-    try:
-        with context.io_bound():
-            metadata, table = pyogrio.read_arrow(
-                provider.path,
-                layer=provider.layer,
-                columns=list(dict.fromkeys(provider.fields.values())),
-                fids=list(payload.fids),
-            )
-    except Exception as exc:
-        raise InvalidInputSchemaError(
-            "Cannot read selected provider geometry packet"
-        ) from exc
+    with context.io_bound():
+        metadata, table = pyogrio.read_arrow(
+            provider.path,
+            layer=provider.layer,
+            columns=list(dict.fromkeys(provider.fields.values())),
+            fids=list(payload.fids),
+        )
     frame = _normalize_vector_table(
         _provider_vector(metadata, table, provider), provider
     )
@@ -371,7 +330,7 @@ def _write_cached_outputs(
 ) -> None:
     lookup = attrs.set_index("id").to_dict("index")
     id_type = pa.array(attrs["id"].tolist()).type
-    codec = VectorTableCheckpointCodec()
+    codec = VectorTablePacketCodec()
     first = {"segments": True, "catchments": True}
     paths = {"segments": segments_path, "catchments": catchments_path}
     for ordinal in range(len(kinds)):
@@ -409,31 +368,9 @@ def define_roi(spec: RoiSpec) -> RoiReport:
 
 
 def _validate_spec(spec: RoiSpec) -> None:
-    for label, path in (("catchments", spec.catchments), ("segments", spec.segments)):
-        if not Path(path).exists():
-            raise PreparedDataError(f"{label} input does not exist: {path}")
     if not spec.outlet_ids:
         raise InvalidInputSchemaError("At least one outlet ID is required")
-    for name, value in (
-        ("workers", spec.workers),
-        ("memory limit", spec.memory_limit_mb),
-        ("I/O slots", spec.io_slots),
-        ("batch size", spec.batch_size),
-    ):
-        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
-            raise InvalidInputSchemaError(f"{name} must be a positive integer")
     parse_crs(spec.crs)
-    if spec.checkpoint_dir is not None:
-        output = Path(spec.output_dir).resolve()
-        checkpoint = Path(spec.checkpoint_dir).resolve()
-        try:
-            checkpoint.relative_to(output)
-        except ValueError:
-            pass
-        else:
-            raise InvalidInputSchemaError(
-                "Checkpoint directory cannot be inside the output directory"
-            )
 
 
 def _provider(
@@ -477,38 +414,25 @@ def _read_topology(
 ) -> tuple[pd.DataFrame, dict[Hashable, int]]:
     columns = list(provider.fields.values())
     batches: list[pa.RecordBatch] = []
-    try:
-        with pyogrio.open_arrow(
-            provider.path,
-            layer=provider.layer,
-            columns=columns,
-            read_geometry=False,
-            return_fids=True,
-            batch_size=batch_size,
-            use_pyarrow=True,
-        ) as (_, stream):
-            for batch in stream:
-                order = batch[provider.fields["strahler_order"]]
-                if not (
-                    pa.types.is_integer(order.type)
-                    or pa.types.is_floating(order.type)
-                    or pa.types.is_decimal(order.type)
-                ):
-                    raise InvalidInputSchemaError("Strahler order must be numeric")
-                numeric = pc.cast(order, pa.float64())
-                mask = pc.fill_null(
-                    pc.and_(pc.is_finite(numeric), pc.greater_equal(numeric, 1.0)),
-                    False,
-                )
-                filtered = batch.filter(mask)
-                if filtered.num_rows:
-                    batches.append(filtered)
-    except InvalidInputSchemaError:
-        raise
-    except Exception as exc:
-        raise InvalidInputSchemaError(
-            "Cannot stream segment topology attributes"
-        ) from exc
+    with pyogrio.open_arrow(
+        provider.path,
+        layer=provider.layer,
+        columns=columns,
+        read_geometry=False,
+        return_fids=True,
+        batch_size=batch_size,
+        use_pyarrow=True,
+    ) as (_, stream):
+        for batch in stream:
+            order = batch[provider.fields["strahler_order"]]
+            numeric = pc.cast(order, pa.float64())
+            mask = pc.fill_null(
+                pc.and_(pc.is_finite(numeric), pc.greater_equal(numeric, 1.0)),
+                False,
+            )
+            filtered = batch.filter(mask)
+            if filtered.num_rows:
+                batches.append(filtered)
     if not batches:
         raise InvalidInputSchemaError("No segments remain after Strahler filtering")
     table = pa.Table.from_batches(batches).combine_chunks()
@@ -532,17 +456,12 @@ def _coerce_outlets(values: Iterable[str], ids: pd.Series) -> list[Hashable]:
     dtype = ids.dtype
     result: list[Hashable] = []
     for value in values:
-        try:
-            if pd.api.types.is_integer_dtype(dtype):
-                result.append(int(value))
-            elif pd.api.types.is_float_dtype(dtype):
-                result.append(float(value))
-            else:
-                result.append(value)
-        except ValueError as exc:
-            raise OutletNotFoundError(
-                f"Outlet ID is incompatible with provider IDs: {value}"
-            ) from exc
+        if pd.api.types.is_integer_dtype(dtype):
+            result.append(int(value))
+        elif pd.api.types.is_float_dtype(dtype):
+            result.append(float(value))
+        else:
+            result.append(value)
     return result
 
 
@@ -625,45 +544,37 @@ def _validate_selected_attributes(frame: pd.DataFrame) -> None:
 
 def _scan_fids(provider: _Provider, batch_size: int) -> dict[Hashable, int]:
     result: dict[Hashable, int] = {}
-    try:
-        with pyogrio.open_arrow(
-            provider.path,
-            layer=provider.layer,
-            columns=[provider.fields["id"]],
-            read_geometry=False,
-            return_fids=True,
-            batch_size=batch_size,
-            use_pyarrow=True,
-        ) as (metadata, batches):
-            fid_name = metadata.get("fid_column") or "fid"
-            for batch in batches:
-                fid_index = batch.schema.get_field_index(fid_name)
-                fid_index = max(fid_index, 0)
-                values = zip(
-                    batch[provider.fields["id"]].to_pylist(),
-                    batch.column(fid_index).to_pylist(),
-                    strict=True,
-                )
-                for segment_id, fid in values:
-                    if pd.isna(segment_id):
-                        continue
-                    if segment_id in result:
-                        raise InvalidInputSchemaError(
-                            f"Provider contains duplicate ID: {segment_id}"
-                        )
-                    result[segment_id] = fid
-    except InvalidInputSchemaError:
-        raise
-    except Exception as exc:
-        raise InvalidInputSchemaError("Cannot scan provider IDs and FIDs") from exc
+    with pyogrio.open_arrow(
+        provider.path,
+        layer=provider.layer,
+        columns=[provider.fields["id"]],
+        read_geometry=False,
+        return_fids=True,
+        batch_size=batch_size,
+        use_pyarrow=True,
+    ) as (metadata, batches):
+        fid_name = metadata.get("fid_column") or "fid"
+        for batch in batches:
+            fid_index = batch.schema.get_field_index(fid_name)
+            fid_index = max(fid_index, 0)
+            values = zip(
+                batch[provider.fields["id"]].to_pylist(),
+                batch.column(fid_index).to_pylist(),
+                strict=True,
+            )
+            for segment_id, fid in values:
+                if pd.isna(segment_id):
+                    continue
+                if segment_id in result:
+                    raise InvalidInputSchemaError(
+                        f"Provider contains duplicate ID: {segment_id}"
+                    )
+                result[segment_id] = fid
     return result
 
 
 def _geometry_metric(geometry, provider: _Provider, kind: str) -> float:
-    try:
-        transformer, geod = geodetic_tools(provider.crs.to_wkt())
-    except CrsError as exc:
-        raise InvalidInputSchemaError(str(exc)) from exc
+    transformer, geod = geodetic_tools(provider.crs.to_wkt())
     geographic = shapely.transform(geometry, transformer.transform, interleaved=False)
     if kind == "segments":
         value = geod.geometry_length(geographic) / 1000.0
@@ -816,14 +727,9 @@ def _validate_roi_outputs(
     for name, path in (("catchments", catchments), ("segments", segments)):
         if not path.is_file():
             raise PreparedDataError(f"ROI output is missing: {path}")
-        try:
-            info = pyogrio.read_info(path)
-        except Exception as exc:
-            raise PreparedDataError(f"Cannot inspect ROI output: {path}") from exc
+        info = pyogrio.read_info(path)
         if info.get("driver") != "FlatGeobuf":
             raise PreparedDataError(f"ROI {name} output is not FlatGeobuf")
-        if list(info.get("fields", ())) != ROI_COLUMNS[:-1]:
-            raise PreparedDataError(f"ROI {name} output schema is invalid")
         if info.get("features") != feature_count:
             raise PreparedDataError(f"ROI {name} output feature count is invalid")
         if info.get("crs") is None or CRS.from_user_input(info["crs"]) != target_crs:

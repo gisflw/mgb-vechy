@@ -26,7 +26,6 @@ mgb-vec-hydro aggregate \
 | `--memory-limit-mb` | Optional | Positive integer MB; default `512` | Memory budget used to size bounded processing packets. |
 | `--io-slots` | Optional | Positive integer; default `2` | Maximum number of concurrent vector-I/O operations. |
 | `--batch-size` | Optional | Positive integer rows; default `10000` | Number of rows processed per bounded vector batch. |
-| `--checkpoint-dir` | Optional | Directory path | Scratch location for resumable aggregation work; it must be outside `--output-dir`. |
 
 Click also provides `--help` to display the command’s generated option list.
 
@@ -71,5 +70,3 @@ preserved.
 The files are staged privately, validated, and atomically published. Defaults
 are 512 MB, four workers, two I/O operations, and 10,000-row batches. Worker
 counts may be any positive integer.
-`--checkpoint-dir` is optional scratch state outside `--output-dir` and is
-removed after successful publication.

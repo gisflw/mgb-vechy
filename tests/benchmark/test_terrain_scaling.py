@@ -2,7 +2,7 @@
 
 Run synthetic scaling checks with ``RUN_TERRAIN_BENCHMARKS=1 pytest
 tests/benchmark``. Set ``BHAE_DEM``, ``BHAE_MINI_OWNERSHIP``, ``BHAE_DRAINAGE``,
-and ``BHAE_MINI_INDEX`` to exercise the
+to exercise the
 complete Stage 4 BHAE pipeline without making its one-minute target a portable
 release gate.
 """
@@ -42,7 +42,7 @@ def _fixed_mini_worker(side, context):
 
     direction, rank = compute_flow_directions(elevation, labels, drainage, transform)
     hand = compute_hand(elevation, direction, rank)
-    ltnd = compute_ltnd(direction, transform, rank)
+    ltnd = compute_ltnd(direction, transform, rank, crs="EPSG:3857")
     return float(hand[-1, -1] + ltnd[-1, -1])
 
 
@@ -122,7 +122,6 @@ def test_full_bhae_performance_target(tmp_path, record_property):
         "BHAE_DEM",
         "BHAE_MINI_OWNERSHIP",
         "BHAE_DRAINAGE",
-        "BHAE_MINI_INDEX",
     )
     values = {name: os.environ.get(name) for name in names}
     if not all(values.values()):
@@ -133,7 +132,6 @@ def test_full_bhae_performance_target(tmp_path, record_property):
             dem=Path(values["BHAE_DEM"]),
             mini_ownership=Path(values["BHAE_MINI_OWNERSHIP"]),
             drainage=Path(values["BHAE_DRAINAGE"]),
-            mini_index=Path(values["BHAE_MINI_INDEX"]),
             d8=Path(os.environ["BHAE_D8"]) if os.environ.get("BHAE_D8") else None,
             output_dir=tmp_path / "terrain",
         )

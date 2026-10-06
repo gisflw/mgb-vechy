@@ -1,17 +1,18 @@
+import json
+
 import numpy as np
-import pandas as pd
 import pytest
 import rasterio
 from pyproj import CRS, Transformer
 from affine import Affine
 from shapely.geometry import LineString, Polygon
 
-from mgb_vec_hydro.exceptions import TerrainProductsError
+from mgb_vec_hydro.exceptions import RasterGridError, TerrainProductsError
 from mgb_vec_hydro.execution.vector import (
     VectorTable,
     write_vector_table,
 )
-from mgb_vec_hydro.preparation import PreparationSpec, prepare_dataset
+from mgb_vec_hydro.preparation import PreparationSpec, prepare_dataset, read_mini_index
 from mgb_vec_hydro.terrain import (
     TerrainSpec,
     _agree_condition_dem,
@@ -175,20 +176,18 @@ def _terrain_inputs(tmp_path, *, with_d8=False):
 def test_terrain_outputs_custom_agree_profile_and_strict_domain(tmp_path):
     prepared, _minis = _terrain_inputs(tmp_path)
     output_dir = tmp_path / "out"
-    checkpoint_dir = tmp_path / "checkpoints"
 
     report = create_terrain_dataset(
         TerrainSpec(
             dem=prepared.dem,
             mini_ownership=prepared.mini_ownership,
             drainage=prepared.drainage,
-            mini_index=prepared.mini_index,
             output_dir=output_dir,
             agree_sharp=12,
             agree_smooth=3,
             agree_buffer=2,
             workers=1,
-            checkpoint_dir=checkpoint_dir,
+
         )
     )
 
@@ -210,20 +209,10 @@ def test_terrain_outputs_custom_agree_profile_and_strict_domain(tmp_path):
     ):
         np.testing.assert_array_equal(ownership.dataset_mask(), drainage.dataset_mask())
         assert np.all(drainage.read(1)[ownership.dataset_mask() == 0] == 0)
-    index = pd.read_csv(prepared.mini_index)
-    assert list(index.columns) == [
-        "mini_label",
-        "mini_id",
-        "minx",
-        "miny",
-        "maxx",
-        "maxy",
-    ]
-    assert index["mini_id"].tolist() == [1, 2]
-    assert not checkpoint_dir.exists()
+    assert [row[0] for row in read_mini_index(prepared.mini_ownership)] == [1, 2]
 
 
-def test_terrain_validates_direct_grid_and_shared_index_inputs(tmp_path):
+def test_terrain_validates_direct_grid_inputs(tmp_path):
     prepared, _minis = _terrain_inputs(tmp_path)
     mismatched = tmp_path / "mismatched-ownership.tif"
     with rasterio.open(prepared.mini_ownership) as source:
@@ -236,36 +225,17 @@ def test_terrain_validates_direct_grid_and_shared_index_inputs(tmp_path):
         target.write_mask(mask)
 
     grid_output = tmp_path / "grid-error"
-    with pytest.raises(TerrainProductsError, match="canonical DEM grid"):
+    with pytest.raises(RasterGridError, match="canonical grid"):
         create_terrain_dataset(
             TerrainSpec(
                 dem=prepared.dem,
                 mini_ownership=mismatched,
                 drainage=prepared.drainage,
-                mini_index=prepared.mini_index,
                 output_dir=grid_output,
                 workers=1,
             )
         )
     assert not grid_output.exists()
-
-    invalid_index = tmp_path / "invalid-index.csv"
-    index = pd.read_csv(prepared.mini_index)
-    index.loc[0, "minx"] = index.loc[0, "maxx"] + 1
-    index.to_csv(invalid_index, index=False)
-    index_output = tmp_path / "index-error"
-    with pytest.raises(TerrainProductsError, match="bounds"):
-        create_terrain_dataset(
-            TerrainSpec(
-                dem=prepared.dem,
-                mini_ownership=prepared.mini_ownership,
-                drainage=prepared.drainage,
-                mini_index=invalid_index,
-                output_dir=index_output,
-                workers=1,
-            )
-        )
-    assert not index_output.exists()
 
 
 def test_terrain_d8_mode_consumes_explicit_d8_and_publishes_only_products(tmp_path):
@@ -276,7 +246,6 @@ def test_terrain_d8_mode_consumes_explicit_d8_and_publishes_only_products(tmp_pa
             dem=prepared.dem,
             mini_ownership=prepared.mini_ownership,
             drainage=prepared.drainage,
-            mini_index=prepared.mini_index,
             d8=prepared.d8,
             direction_source="d8",
             write_flow_direction=True,
@@ -308,14 +277,14 @@ def test_d8_validation_terminalizes_drainage_and_rejects_invalid_paths():
             drainage,
             "mini",
         )
-    with pytest.raises(TerrainProductsError, match="outside"):
+    with pytest.raises(ValueError, match="outside"):
         _validated_d8(
             np.ma.array([[7, 3, 0]], mask=False, dtype="uint8"),
             owned,
             drainage,
             "mini",
         )
-    with pytest.raises(TerrainProductsError, match="cycle"):
+    with pytest.raises(ValueError, match="cycle"):
         _validated_d8(
             np.ma.array([[3, 7, 0]], mask=False, dtype="uint8"),
             owned,
@@ -396,12 +365,15 @@ def test_hand_and_ltnd_follow_selected_tree_with_rectangular_pixels():
 
     direction, rank = compute_flow_directions(elevation, labels, drainage, transform)
     hand = compute_hand(elevation, direction, rank)
-    ltnd = compute_ltnd(direction, transform, rank)
+    ltnd = compute_ltnd(direction, transform, rank, crs="EPSG:3857")
 
     np.testing.assert_array_equal(hand, elevation - 1)
-    assert ltnd[0, 0] == pytest.approx(5)
-    assert ltnd[0, 1] == pytest.approx(4)
-    assert ltnd[1, 0] == pytest.approx(3)
+    transformer = Transformer.from_crs("EPSG:3857", "EPSG:4326", always_xy=True)
+    geod = CRS.from_epsg(3857).get_geod()
+    terminal = transformer.transform(*rasterio.transform.xy(transform, 1, 1))
+    for row, col in ((0, 0), (0, 1), (1, 0)):
+        start = transformer.transform(*rasterio.transform.xy(transform, row, col))
+        assert ltnd[row, col] == pytest.approx(geod.inv(*start, *terminal)[2])
 
 
 @pytest.mark.parametrize(
@@ -447,7 +419,32 @@ def test_ltnd_with_crs_matches_geodesic_route_sums(crs, transform, direction):
 def test_agree_defaults_are_unchanged(tmp_path):
     spec = TerrainSpec(
         dem=tmp_path / "dem", mini_ownership=tmp_path / "ownership",
-        drainage=tmp_path / "drainage", mini_index=tmp_path / "index",
+        drainage=tmp_path / "drainage",
         output_dir=tmp_path / "output",
     )
     assert (spec.agree_sharp, spec.agree_smooth, spec.agree_buffer) == (80.0, 8.0, 4)
+
+
+@pytest.mark.parametrize("metadata,error", [(None, KeyError), ("broken", json.JSONDecodeError)])
+def test_terrain_missing_or_malformed_index_fails_natively(tmp_path, metadata, error):
+    from rasterio.shutil import copy as copy_raster
+
+    prepared, _ = _terrain_inputs(tmp_path)
+    working = tmp_path / "working.tif"
+    cells = tmp_path / "cells.tif"
+    with rasterio.open(prepared.mini_ownership) as source:
+        profile = source.profile.copy()
+        profile.update(driver="GTiff")
+        with rasterio.open(working, "w", **profile) as target:
+            target.write(source.read(1), 1)
+            target.write_mask(source.dataset_mask())
+            if metadata is not None:
+                target.update_tags(mini_index=metadata)
+    copy_raster(working, cells, driver="COG")
+    output = tmp_path / "terrain"
+    with pytest.raises(error):
+        create_terrain_dataset(TerrainSpec(
+            dem=prepared.dem, mini_ownership=cells, drainage=prepared.drainage,
+            output_dir=output, workers=1,
+        ))
+    assert not output.exists()
