@@ -8,9 +8,9 @@ categorical HRU raster.
 mgb-vec-hydro sample-minis \
   --mini-catchments minis/mini_catchments.fgb \
   --mini-segments minis/mini_segments.fgb \
-  --mini-index prepared/mini_index.parquet \
+  --mini-index prepared/mini_index.csv \
   --dem prepared/dem.tif \
-  --mini-ownership prepared/mini_ownership.tif \
+  --cells prepared/cells.tif \
   --drainage prepared/drainage.tif \
   --hand terrain/hand.tif \
   --ltnd terrain/ltnd.tif \
@@ -24,9 +24,9 @@ mgb-vec-hydro sample-minis \
 | --- | --- | --- | --- |
 | `--mini-catchments` | Required | Existing vector path | Aggregated mini-catchment polygons and normalized mini attributes. |
 | `--mini-segments` | Required | Existing vector path | Aggregated mini-segment lines and normalized reach attributes. |
-| `--mini-index` | Required | Existing Parquet path | Shared six-column mini index whose IDs and labels must match the mini vectors. |
+| `--mini-index` | Required | Existing CSV path | Shared six-column mini index whose IDs and labels must match the mini vectors. |
 | `--dem` | Required | Existing raster path | Prepared DEM and authoritative canonical grid for sampling. |
-| `--mini-ownership` | Required | Existing raster path | Dense ownership labels used to select catchment cells for each mini. |
+| `--cells` | Required | Existing raster path | Dense mini labels used to select catchment cells for each mini. |
 | `--drainage` | Required | Existing raster path | Drainage labels used to select reach cells for each mini. |
 | `--hand` | Required | Existing raster path | Terrain height-above-drainage raster used for reach and tributary statistics. |
 | `--ltnd` | Required | Existing raster path | Local terrain-to-drainage distance raster used for tributary statistics. |
@@ -42,7 +42,7 @@ Click also provides `--help` to display the command’s generated option list.
 
 The DEM is authoritative for CRS and canonical grid. Both mini vectors must
 declare that CRS, use the exact aggregation schema, and contain the same IDs
-as the six-column `mini_index.parquet`. All six raster inputs must be
+as the six-column `mini_index.csv`. All six raster inputs must be
 single-band COGs with the exact DEM grid, matching CRS, and internal masks.
 The HRU raster must be integer-valued; sampled class IDs must be in `1..100`.
 Missing or mismatched files, CRS, grid, masks, schemas, or IDs are rejected.
@@ -55,9 +55,10 @@ stored in centimetres, run preparation with `--dem-scale 0.01`, then regenerate
 terrain and sampling into new directories. Old sampling checkpoints cannot
 resume under the corrected unit contract.
 
-Sampling uses dense ownership labels rather than polygon masks. Catchment
-statistics use cells owned by each mini; reach elevation uses matching
-drainage cells. Exact percentiles and deterministic accumulators are reduced
+Sampling uses dense cell labels rather than polygon masks. Catchment
+statistics use cells labeled for each mini; reach elevation uses matching
+drainage cells. Longitude and latitude use a representative point on each mini
+segment. Exact percentiles and deterministic accumulators are reduced
 over complete mini packets, while each distinct canonical COG block is read
 once per raster in a packet. No raster is reprojected and no terrain or index
 file is republished.
@@ -72,16 +73,17 @@ sampled/
 
 Rows preserve the aggregation attributes (`id`, `id_down`, `sub`, `p_order`,
 `unit_length`, `upstream_length`, `unit_area`, and `upstream_area`) without
-geometry. The output includes longitude/latitude, reach slope and reference
-elevation, tributary length and slope, `flooded_area_<stage>m_km2` columns for
-stages 1 through 100 in stage order before the HRU columns, and sorted
-`hru_<id>_pct` columns summing to 100% for every mini. Optional
-`--checkpoint-dir` is operational scratch outside `--output-dir`; it is
+geometry. The output includes longitude/latitude, `reach_slope`,
+`reach_elevation`, `tributary_length`, and `tributary_slope`; sorted `hru_<id>`
+percentage columns summing to 100%; and `flooded_area_<stage>` columns for
+stages 1 through 100, in that order. Column names omit units; lengths and
+elevations are metres, slopes are metres per kilometre, and areas are km².
+Optional `--checkpoint-dir` is operational scratch outside `--output-dir`; it is
 removed after successful publication. The CLI prints the concrete CSV path.
 Execution defaults are four workers, 512 MB of admitted task memory, two I/O
 slots, and 10,000-row batches. Worker counts may be any positive integer.
 
-Reach reference elevation is the median DEM elevation of cells owned by each
+Reach elevation is the median DEM elevation of cells labeled for each
 mini and marked as drainage, in metres. Reach slope is the difference between
 the 85th and 10th percentiles of those same reach elevations (metres), divided
 by `0.75 * unit_length` (kilometres). Each flooded-area column is the cumulative

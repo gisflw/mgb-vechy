@@ -289,7 +289,7 @@ def aggregate_command(
     required=True,
 )
 @click.option(
-    "--mini-ownership",
+    "--cells",
     type=click.Path(exists=True, dir_okay=False, path_type=Path),
     required=True,
 )
@@ -354,7 +354,7 @@ def aggregate_command(
 @click.option("--checkpoint-dir", type=click.Path(file_okay=False, path_type=Path))
 def terrain_products_command(
     dem: Path,
-    mini_ownership: Path,
+    cells: Path,
     drainage: Path,
     mini_index: Path,
     d8: Path | None,
@@ -376,7 +376,7 @@ def terrain_products_command(
         report = create_terrain_dataset(
             TerrainSpec(
                 dem=dem,
-                mini_ownership=mini_ownership,
+                mini_ownership=cells,
                 drainage=drainage,
                 mini_index=mini_index,
                 d8=d8,
@@ -439,7 +439,7 @@ def terrain_products_command(
     required=True,
 )
 @click.option(
-    "--mini-ownership",
+    "--cells",
     type=click.Path(exists=True, dir_okay=False, path_type=Path),
     required=True,
 )
@@ -482,7 +482,7 @@ def sample_minis_command(
     mini_segments: Path,
     mini_index: Path,
     dem: Path,
-    mini_ownership: Path,
+    cells: Path,
     drainage: Path,
     hand: Path,
     ltnd: Path,
@@ -502,7 +502,7 @@ def sample_minis_command(
                 mini_segments=mini_segments,
                 mini_index=mini_index,
                 dem=dem,
-                mini_ownership=mini_ownership,
+                mini_ownership=cells,
                 drainage=drainage,
                 hand=hand,
                 ltnd=ltnd,

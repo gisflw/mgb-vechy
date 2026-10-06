@@ -212,15 +212,15 @@ def test_prepare_pipeline_publishes_valid_canonical_dataset(tmp_path):
 
     assert report.raster_count == 2
     assert sorted(path.name for path in report.output_dir.iterdir()) == [
+        "cells.tif",
         "dem.tif",
         "drainage.tif",
         "land.tif",
-        "mini_index.parquet",
-        "mini_ownership.tif",
+        "mini_index.csv",
     ]
     assert not (report.output_dir / "manifest.json").exists()
     assert not any(path.is_dir() for path in report.output_dir.iterdir())
-    index = pd.read_parquet(report.mini_index)
+    index = pd.read_csv(report.mini_index)
     assert list(index.columns) == [
         "mini_label",
         "mini_id",
@@ -274,7 +274,7 @@ def test_parallel_preparation_matches_serial_across_multiple_blocks(tmp_path):
         )
         == 2
     )
-    for name in ("dem", "land", "d8", "mini_ownership", "drainage"):
+    for name in ("dem", "land", "d8", "cells", "drainage"):
         with (
             rasterio.open(reports[1].output_dir / f"{name}.tif") as serial,
             rasterio.open(reports[2].output_dir / f"{name}.tif") as parallel,
@@ -285,8 +285,8 @@ def test_parallel_preparation_matches_serial_across_multiple_blocks(tmp_path):
                 serial.dataset_mask(), parallel.dataset_mask()
             )
     pd.testing.assert_frame_equal(
-        pd.read_parquet(reports[1].mini_index),
-        pd.read_parquet(reports[2].mini_index),
+        pd.read_csv(reports[1].mini_index),
+        pd.read_csv(reports[2].mini_index),
     )
     with rasterio.open(reports[2].d8) as normalized:
         assert np.all(normalized.read(1, masked=True).compressed() == 1)
@@ -396,7 +396,7 @@ def test_components_use_eight_neighbors_and_deterministic_statistics():
 
 class _ArrayAssembler:
     def __init__(self, ownership, drainage):
-        self.arrays = {"mini_ownership": ownership, "drainage": drainage}
+        self.arrays = {"cells": ownership, "drainage": drainage}
 
     def read(self, product, window, *, masked=True):
         row = int(window.row_off)

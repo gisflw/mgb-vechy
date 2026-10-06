@@ -21,7 +21,7 @@ def test_public_stage_commands_expose_their_primary_inputs():
         ),
         "terrain-products": (
             "--dem",
-            "--mini-ownership",
+            "--cells",
             "--drainage",
             "--mini-index",
             "--direction-source",
@@ -31,7 +31,7 @@ def test_public_stage_commands_expose_their_primary_inputs():
             "--mini-segments",
             "--mini-index",
             "--dem",
-            "--mini-ownership",
+            "--cells",
             "--drainage",
             "--hand",
             "--ltnd",

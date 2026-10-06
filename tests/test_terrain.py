@@ -210,7 +210,7 @@ def test_terrain_outputs_custom_agree_profile_and_strict_domain(tmp_path):
     ):
         np.testing.assert_array_equal(ownership.dataset_mask(), drainage.dataset_mask())
         assert np.all(drainage.read(1)[ownership.dataset_mask() == 0] == 0)
-    index = pd.read_parquet(prepared.mini_index)
+    index = pd.read_csv(prepared.mini_index)
     assert list(index.columns) == [
         "mini_label",
         "mini_id",
@@ -249,10 +249,10 @@ def test_terrain_validates_direct_grid_and_shared_index_inputs(tmp_path):
         )
     assert not grid_output.exists()
 
-    invalid_index = tmp_path / "invalid-index.parquet"
-    index = pd.read_parquet(prepared.mini_index)
+    invalid_index = tmp_path / "invalid-index.csv"
+    index = pd.read_csv(prepared.mini_index)
     index.loc[0, "minx"] = index.loc[0, "maxx"] + 1
-    index.to_parquet(invalid_index, index=False)
+    index.to_csv(invalid_index, index=False)
     index_output = tmp_path / "index-error"
     with pytest.raises(TerrainProductsError, match="bounds"):
         create_terrain_dataset(
@@ -290,7 +290,7 @@ def test_terrain_d8_mode_consumes_explicit_d8_and_publishes_only_products(tmp_pa
         "hand.tif",
         "ltnd.tif",
     ]
-    assert not (output / "mini_index.parquet").exists()
+    assert not (output / "mini_index.csv").exists()
 
 def test_d8_validation_terminalizes_drainage_and_rejects_invalid_paths():
     owned = np.ones((1, 3), dtype=bool)

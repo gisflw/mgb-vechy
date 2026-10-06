@@ -28,7 +28,7 @@ mgb-vec-hydro prepare \
 | `--memory-limit-mb` | Optional | Positive integer MB; default `512` | Admitted memory budget used to size bounded raster block tasks. |
 | `--workers` | Optional | Positive integer; default `4` | Number of worker processes used for bounded block processing. There is no upper limit imposed by the CLI or stage validator. |
 | `--io-slots` | Optional | Positive integer; default `2` | Maximum number of concurrent source-raster reads. |
-| `--output-dir` | Required | Directory path | New directory where prepared COGs, ownership, drainage, and the shared mini index are published. |
+| `--output-dir` | Required | Directory path | New directory where prepared COGs, cells, drainage, and the shared mini index are published. |
 
 Click also provides `--help` to display the command’s generated option list.
 
@@ -52,7 +52,7 @@ terrain products, and sampling into new output directories when migrating
 existing centimetre-based datasets; downstream stages do not scale a second
 time. Existing unitless products are rejected with regeneration instructions.
 
-Source clipping, domain masking, ownership and drainage rasterization, and
+Source clipping, domain masking, cell and drainage rasterization, and
 local connectivity labeling run as bounded 512-pixel block tasks through the
 shared process executor. Results may finish out of order, but the coordinator
 reduces them in row-major order and is the only process that writes working
@@ -61,14 +61,14 @@ reads.
 
 Preparation derives its raster domain from the explicit mini-catchment file.
 Catchments and matching segments are jointly rasterized in deterministic
-512-pixel blocks. Ownership exactly covers the center-of-pixel catchment union;
+512-pixel blocks. Cells exactly cover the center-of-pixel catchment union;
 shared boundary cells use the lowest stable dense label, while true cell
 overlaps are rejected. Connectivity validation keeps one drainage-bearing
 8-connected component per mini, deterministically reassigning enclosed
 discarded components and masking exterior fragments. Drainage always has the
 ownership validity mask.
 
-The six-column `mini_index.parquet` is the single shared mini index for later
+The six-column `mini_index.csv` is the single shared mini index for later
 stages. Its columns, in order, are:
 
 `mini_label`, `mini_id`, `minx`, `miny`, `maxx`, `maxy`.
@@ -82,9 +82,9 @@ prepared/
 ├── dem.tif
 ├── <name>.tif
 ├── d8.tif                  # optional
-├── mini_ownership.tif
+├── cells.tif
 ├── drainage.tif
-└── mini_index.parquet
+└── mini_index.csv
 ```
 
 There is no `manifest.json` and no nested output directory. All files are

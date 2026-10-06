@@ -1,15 +1,15 @@
 # Stage 4: terrain products
 
 `mgb-vec-hydro terrain-products` consumes explicit prepared files. The DEM is
-authoritative for the canonical CRS, transform, dimensions, and grid. The
-ownership, drainage, optional D8, and index inputs must match that grid exactly.
+authoritative for the canonical CRS, transform, dimensions, and grid. The cells,
+drainage, optional D8, and index inputs must match that grid exactly.
 
 ```bash
 mgb-vec-hydro terrain-products \
   --dem prepared/dem.tif \
-  --mini-ownership prepared/mini_ownership.tif \
+  --cells prepared/cells.tif \
   --drainage prepared/drainage.tif \
-  --mini-index prepared/mini_index.parquet \
+  --mini-index prepared/mini_index.csv \
   --direction-source dem \
   --agree-sharp 80 \
   --agree-smooth 8 \
@@ -22,9 +22,9 @@ mgb-vec-hydro terrain-products \
 | Option | Status | Type/default | Meaning |
 | --- | --- | --- | --- |
 | `--dem` | Required | Existing raster path | Canonical DEM defining the CRS, transform, dimensions, and grid. |
-| `--mini-ownership` | Required | Existing raster path | Prepared dense mini-label raster defining the owned cells for each mini. |
+| `--cells` | Required | Existing raster path | Prepared dense mini-label raster defining the cells for each mini. |
 | `--drainage` | Required | Existing raster path | Prepared drainage raster identifying the matching drainage cells. |
-| `--mini-index` | Required | Existing Parquet path | Six-column index that defines the minis and their grid-aligned bounds. |
+| `--mini-index` | Required | Existing CSV path | Six-column index that defines the minis and their grid-aligned bounds. |
 | `--d8` | Optional; required in D8 mode | Existing raster path | Canonical clockwise D8 raster used when `--direction-source=d8`; it must match the DEM grid. |
 | `--output-dir` | Required | Directory path | New directory where `hand.tif`, `ltnd.tif`, and any requested flow-direction output are published. |
 | `--direction-source` | Optional | `dem` or `d8`; default `dem` | Selects DEM-conditioned routing or the explicit D8 raster as the flow-direction source. |
@@ -48,8 +48,8 @@ slots, with at most eight complete minis per packet. Worker counts may be any
 positive integer. `--checkpoint-dir` enables
 resumable terrain packets and must be outside `--output-dir`.
 
-Terrain reads `mini_index.parquet` directly and never republishes it. It does
-not read mini vectors or regenerate ownership and drainage. Each mini is an
+Terrain reads `mini_index.csv` directly and never republishes it. It does
+not read mini vectors or regenerate cells and drainage. Each mini is an
 indivisible work unit. Workers use the shared aligned COG reader, preserve
 strict ownership without buffering, and the coordinator alone assembles final
 COGs.

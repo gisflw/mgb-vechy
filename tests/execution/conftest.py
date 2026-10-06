@@ -30,6 +30,6 @@ def prepared_execution_dataset(tmp_path):
             target.write_mask(np.full((2, 3), 255, dtype="uint8"))
 
     write_cog("dem.tif", [[0, 1, 2], [3, 4, 5]], "float32")
-    write_cog("mini_ownership.tif", [[1, 2, 3], [1, 2, 3]], "int32")
+    write_cog("cells.tif", [[1, 2, 3], [1, 2, 3]], "int32")
     write_cog("drainage.tif", [[1, 1, 1], [0, 0, 0]], "uint8")
     return root

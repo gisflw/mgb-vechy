@@ -75,7 +75,7 @@ block writes and bounded corrections, and creates internally masked COGs with
 bounded compression threads. Working rasters are deleted before publication.
 
 Preparation derives the raster domain from the explicit mini-catchment file and
-produces `mini_index.parquet` with exactly `mini_label`, `mini_id`, `minx`,
+produces `mini_index.csv` with exactly `mini_label`, `mini_id`, `minx`,
 `miny`, `maxx`, and `maxy`. Terrain and sampling consume that same index by
 direct path; terrain does not copy or republish it.
 

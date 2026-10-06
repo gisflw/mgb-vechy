@@ -134,7 +134,7 @@ def sample_minibasins(spec: MiniSamplingSpec) -> MiniSamplingReport:
     raster_assets = {
         "dem": Path(spec.dem),
         "hru": Path(spec.hru),
-        "mini_ownership": Path(spec.mini_ownership),
+        "cells": Path(spec.mini_ownership),
         "drainage": Path(spec.drainage),
         "hand": Path(spec.hand),
         "ltnd": Path(spec.ltnd),
@@ -171,7 +171,7 @@ def sample_minibasins(spec: MiniSamplingSpec) -> MiniSamplingReport:
     if spec.checkpoint_dir is not None:
         fingerprint = execution_fingerprint(
             algorithm="sample-minis",
-            version="4",
+            version="5",
             input_identity={
                 name: file_identity(path) for name, path in raster_assets.items()
             }
@@ -286,7 +286,7 @@ def _validate_spec(spec: MiniSamplingSpec) -> None:
         ("mini segments", spec.mini_segments),
         ("mini index", spec.mini_index),
         ("DEM", spec.dem),
-        ("mini ownership", spec.mini_ownership),
+        ("cells", spec.mini_ownership),
         ("drainage", spec.drainage),
         ("HAND", spec.hand),
         ("LTND", spec.ltnd),
@@ -315,7 +315,7 @@ def _validate_sampling_rasters(
     expected_dtypes = {
         "dem": None,
         "hru": None,
-        "mini_ownership": "int32",
+        "cells": "int32",
         "drainage": "uint8",
         "hand": "float32",
         "ltnd": "float32",
@@ -352,7 +352,11 @@ def _validate_sampling_rasters(
 
 def _read_index(path: Path, expected_columns: list[str], name: str) -> pd.DataFrame:
     try:
-        table = pd.read_parquet(path)
+        table = pd.read_csv(
+            path,
+            dtype={"mini_label": "int32", "mini_id": "string"},
+            keep_default_na=False,
+        )
     except Exception as exc:
         raise MiniSamplingError(f"Cannot read {name} mini index") from exc
     if list(table.columns) != expected_columns or table.empty:
@@ -361,6 +365,7 @@ def _read_index(path: Path, expected_columns: list[str], name: str) -> pd.DataFr
         table["mini_label"].dtype != np.dtype("int32")
         or table["mini_label"].duplicated().any()
         or table["mini_id"].isna().any()
+        or table["mini_id"].eq("").any()
         or table["mini_id"].duplicated().any()
         or not np.array_equal(
             table["mini_label"].to_numpy(),
@@ -433,8 +438,8 @@ def _plan_sampling(
             label,
             mini_id,
             catchment["attributes"],
-            float(catchment["longitude"]),
-            float(catchment["latitude"]),
+            float(segment["longitude"]),
+            float(segment["latitude"]),
             float(segment["unit_length"]),
         )
         unit_bounds.append(
@@ -488,10 +493,10 @@ def _stream_vector_metadata(
             ):
                 raise MiniSamplingError(f"{name} contains invalid geometry")
             frame = table.drop([geometry_column]).to_pandas()
-            if name == "catchments":
-                centroids = shapely.centroid(geometries)
+            if name == "segments":
+                points = shapely.point_on_surface(geometries)
                 lonlat = shapely.transform(
-                    centroids, transformer.transform, interleaved=False
+                    points, transformer.transform, interleaved=False
                 )
             for position, row in enumerate(frame.to_dict("records")):
                 row = {
@@ -499,23 +504,23 @@ def _stream_vector_metadata(
                     for key, value in row.items()
                 }
                 mini_id = row["id"]
-                if pd.isna(mini_id) or mini_id in result:
+                mini_key = str(mini_id)
+                if pd.isna(mini_id) or mini_key in result:
                     raise MiniSamplingError(
                         f"{name} contains missing or duplicate mini IDs"
                     )
                 _validate_metric_columns(row, name, mini_id)
                 entry: dict[str, Any] = {"attributes": row}
-                if name == "catchments":
+                if name == "segments":
                     entry["longitude"] = float(shapely.get_x(lonlat[position]))
                     entry["latitude"] = float(shapely.get_y(lonlat[position]))
-                else:
                     length = float(row["unit_length"])
                     if length <= 0 or float(shapely.length(geometries[position])) <= 0:
                         raise MiniSamplingError(
                             f"Mini {mini_id} has a zero or invalid reach length"
                         )
                     entry["unit_length"] = length
-                result[mini_id] = entry
+                result[mini_key] = entry
         if not result:
             raise MiniSamplingError(f"{name} is empty")
         return result
@@ -590,7 +595,7 @@ def _sampling_worker(
         arrays = {
             "dem": rasters.read("dem", window, masked=True),
             "hru": rasters.read("hru", window, masked=True),
-            "ownership": rasters.read("mini_ownership", window, masked=True),
+            "ownership": rasters.read("cells", window, masked=True),
             "drainage": rasters.read("drainage", window, masked=True),
             "hand": rasters.read("hand", window, masked=True),
             "ltnd": rasters.read("ltnd", window, masked=True),
@@ -687,12 +692,12 @@ def _sampling_worker(
         row.update(
             longitude=value.longitude,
             latitude=value.latitude,
-            reach_reference_elevation=float(reach_percentiles[1]),
-            reach_slope_m_per_km=float(
+            reach_elevation=float(reach_percentiles[1]),
+            reach_slope=float(
                 (reach_percentiles[2] - reach_percentiles[0]) / (0.75 * length_km)
             ),
-            tributary_length_km=maximum_ltnd / 1000.0,
-            tributary_slope_m_per_km=float(
+            tributary_length=maximum_ltnd / 1000.0,
+            tributary_slope=float(
                 np.mean(hand[np.isclose(ltnd, maximum_ltnd)]) / (maximum_ltnd / 1000.0)
             ),
             _catchment_cells=int(acc["catchment_cells"]),
@@ -700,7 +705,7 @@ def _sampling_worker(
         )
         row.update(
             {
-                f"flooded_area_{stage}m_km2": float(area)
+                f"flooded_area_{stage}": float(area)
                 for stage, area in enumerate(
                     np.cumsum(acc["flooded_area"])[:100], start=1
                 )
@@ -804,19 +809,19 @@ def _assemble_csv(packet_root: Path, output: Path, classes: tuple[int, ...]) -> 
     if not classes:
         raise MiniSamplingError("Sampled mini domain contains no valid HRU classes")
     first = True
-    percentage_columns = [f"hru_{value}_pct" for value in classes]
+    percentage_columns = [f"hru_{value}" for value in classes]
     output_columns = (
         [column for column in AGGREGATION_COLUMNS if column != "geometry"]
         + [
             "longitude",
             "latitude",
-            "reach_slope_m_per_km",
-            "reach_reference_elevation",
-            "tributary_length_km",
-            "tributary_slope_m_per_km",
+            "reach_slope",
+            "reach_elevation",
+            "tributary_length",
+            "tributary_slope",
         ]
-        + [f"flooded_area_{stage}m_km2" for stage in range(1, 101)]
         + percentage_columns
+        + [f"flooded_area_{stage}" for stage in range(1, 101)]
     )
     paths = sorted(packet_root.glob("*.arrow"))
     if not paths:
@@ -828,7 +833,7 @@ def _assemble_csv(packet_root: Path, output: Path, classes: tuple[int, ...]) -> 
         if np.any(denominators <= 0):
             raise MiniSamplingError("Sampling produced an empty catchment")
         for class_id in classes:
-            frame[f"hru_{class_id}_pct"] = (
+            frame[f"hru_{class_id}"] = (
                 100.0 * frame[f"_hru_{class_id}"].to_numpy(dtype=float) / denominators
             )
         if not np.allclose(frame[percentage_columns].sum(axis=1), 100.0):

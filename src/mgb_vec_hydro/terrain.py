@@ -1122,7 +1122,7 @@ def _create_terrain_dataset(spec: TerrainSpec) -> TerrainReport:
         raise TerrainProductsError("Cannot discover the canonical DEM grid") from exc
     raster_assets = {
         "dem": Path(spec.dem),
-        "mini_ownership": Path(spec.mini_ownership),
+        "cells": Path(spec.mini_ownership),
         "drainage": Path(spec.drainage),
     }
     if spec.d8 is not None:
@@ -1286,7 +1286,7 @@ def _create_terrain_dataset(spec: TerrainSpec) -> TerrainReport:
 def _validate_terrain_spec(spec: TerrainSpec) -> None:
     for name, path in (
         ("DEM", spec.dem),
-        ("mini ownership", spec.mini_ownership),
+        ("cells", spec.mini_ownership),
         ("drainage", spec.drainage),
         ("mini index", spec.mini_index),
     ):
@@ -1325,7 +1325,7 @@ def _validate_terrain_spec(spec: TerrainSpec) -> None:
 def _validate_terrain_inputs(assets: dict[str, Path], grid: GridSpec) -> None:
     expected_dtypes = {
         "dem": None,
-        "mini_ownership": "int32",
+        "cells": "int32",
         "drainage": "uint8",
         "d8": "uint8",
     }
@@ -1382,7 +1382,11 @@ def _plan_minis(
     index_path: Path, grid: GridSpec
 ) -> tuple[tuple[_MiniUnit, ...], dict[str, Any]]:
     try:
-        table = pd.read_parquet(index_path)
+        table = pd.read_csv(
+            index_path,
+            dtype={"mini_label": "int32", "mini_id": "string"},
+            keep_default_na=False,
+        )
     except Exception as exc:
         raise TerrainProductsError(f"Cannot read explicit mini index: {index_path}") from exc
     required = ["mini_label", "mini_id", "minx", "miny", "maxx", "maxy"]
@@ -1392,6 +1396,7 @@ def _plan_minis(
         or table["mini_label"].dtype != np.dtype("int32")
         or table["mini_label"].duplicated().any()
         or table["mini_id"].isna().any()
+        or table["mini_id"].eq("").any()
         or table["mini_id"].duplicated().any()
         or not np.array_equal(
             table["mini_label"].to_numpy(),
@@ -1561,7 +1566,7 @@ def _terrain_worker_with_cache(
     for unit in payload.units:
         window = unit.raster.window
         read_started = time.perf_counter()
-        ownership = aligned_reader.read("mini_ownership", window)
+        ownership = aligned_reader.read("cells", window)
         drainage_values = aligned_reader.read("drainage", window)
         dem = aligned_reader.read("dem", window)
         d8 = (
@@ -1578,7 +1583,7 @@ def _terrain_worker_with_cache(
                 f"Rasterized mini {unit.mini_id} has no owned cells"
             )
         if np.any(np.ma.getmaskarray(drainage_values)[owned]):
-            raise TerrainProductsError("Drainage mask does not cover mini ownership")
+            raise TerrainProductsError("Drainage mask does not cover cells")
         drainage = owned & (np.asarray(drainage_values.data) != 0)
         if not np.any(drainage):
             raise TerrainProductsError(

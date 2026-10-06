@@ -38,7 +38,7 @@ from mgb_vec_hydro.execution.vector import read_vector_table
 
 BLOCK_SIZE = 512
 NAME_RE = re.compile(r"^[a-z][a-z0-9_-]*$")
-RESERVED_RASTER_NAMES = {"dem", "d8", "mini_ownership", "drainage"}
+RESERVED_RASTER_NAMES = {"dem", "d8", "cells", "drainage"}
 
 
 @dataclass(frozen=True)
@@ -264,7 +264,7 @@ def _prepare_dataset(spec: PreparationSpec) -> PreparationReport:
                 )
                 for item in rasters
             ] + [
-                RasterProductSpec("mini_ownership", "int32"),
+                RasterProductSpec("cells", "int32"),
                 RasterProductSpec("drainage", "uint8"),
             ]
             with RasterAssembler(
@@ -339,9 +339,9 @@ def _prepare_dataset(spec: PreparationSpec) -> PreparationReport:
         output_dir=output,
         dem=output / "dem.tif",
         rasters={item.name: output / f"{item.name}.tif" for item in rasters},
-        mini_ownership=output / "mini_ownership.tif",
+        mini_ownership=output / "cells.tif",
         drainage=output / "drainage.tif",
-        mini_index=output / "mini_index.parquet",
+        mini_index=output / "mini_index.csv",
         raster_count=len(rasters),
         execution=execution,
         timings={
@@ -568,7 +568,7 @@ def _prepare_block_worker_with_cache(
         patches.extend(
             (
                 RasterPatch(
-                    "mini_ownership", payload.window, ownership, ownership_valid
+                    "cells", payload.window, ownership, ownership_valid
                 ),
                 RasterPatch("drainage", payload.window, drainage, ownership_valid),
             )
@@ -614,7 +614,7 @@ def _normalize_d8(raw, valid, encoding: str, *, source: Path) -> np.ndarray:
 
 
 def _write_mini_index(staging, ordered, catchments_by_id, dense_labels) -> Path:
-    index = staging / "mini_index.parquet"
+    index = staging / "mini_index.csv"
     bounds = [catchments_by_id[mini_id].bounds for mini_id in ordered]
     pd.DataFrame(
         {
@@ -625,7 +625,7 @@ def _write_mini_index(staging, ordered, catchments_by_id, dense_labels) -> Path:
             "maxx": [value[2] for value in bounds],
             "maxy": [value[3] for value in bounds],
         }
-    ).to_parquet(index, index=False)
+    ).to_csv(index, index=False, lineterminator="\n")
     return index
 
 
@@ -757,11 +757,11 @@ def _validate_prepared_outputs(
 ) -> None:
     """Validate all direct prepared files before the atomic directory rename."""
 
-    expected = set(raster_kinds) | {"mini_ownership", "drainage"}
+    expected = set(raster_kinds) | {"cells", "drainage"}
     if set(paths) != expected:
         raise PreparedDataError("Prepared output file set is incomplete")
     for name, path in paths.items():
-        if name == "mini_ownership":
+        if name == "cells":
             expected_dtype = "int32"
         elif name in {"drainage", "d8"}:
             expected_dtype = "uint8"
@@ -797,7 +797,11 @@ def _validate_mini_index(path: Path, error_type=PreparedDataError) -> pd.DataFra
 
     required = ["mini_label", "mini_id", "minx", "miny", "maxx", "maxy"]
     try:
-        table = pd.read_parquet(path)
+        table = pd.read_csv(
+            path,
+            dtype={"mini_label": "int32", "mini_id": "string"},
+            keep_default_na=False,
+        )
     except Exception as exc:
         raise error_type(f"Cannot read mini index: {path}") from exc
     if list(table.columns) != required or table.empty:
@@ -807,6 +811,7 @@ def _validate_mini_index(path: Path, error_type=PreparedDataError) -> pd.DataFra
         labels.dtype != np.dtype("int32")
         or labels.duplicated().any()
         or table["mini_id"].isna().any()
+        or table["mini_id"].eq("").any()
         or table["mini_id"].duplicated().any()
         or not np.array_equal(
             labels.to_numpy(), np.arange(1, len(table) + 1, dtype="int32")
@@ -860,7 +865,7 @@ def _correct_connectivity(
     for path in correction_paths:
         with np.load(path) as correction:
             window = Window(*correction["window"].tolist())
-            ownership = assembler.read("mini_ownership", window, masked=True)
+            ownership = assembler.read("cells", window, masked=True)
             drainage = assembler.read("drainage", window, masked=True)
             values = np.asarray(ownership.data).copy()
             valid = ~np.ma.getmaskarray(ownership)
@@ -872,7 +877,7 @@ def _correct_connectivity(
             valid.ravel()[flat] = targets != 0
             drain_values.ravel()[flat] = 0
             assembler.replace(
-                raster_patch_type("mini_ownership", window, values, valid)
+                raster_patch_type("cells", window, values, valid)
             )
             assembler.replace(
                 raster_patch_type("drainage", window, drain_values, valid)
@@ -1190,7 +1195,7 @@ def _plan_connectivity_correction(
         raise PreparedDataError(
             f"Mini {mini_id} ownership window exceeds the configured memory limit"
         )
-    ownership = assembler.read("mini_ownership", win, masked=True)
+    ownership = assembler.read("cells", win, masked=True)
     drainage = assembler.read("drainage", win, masked=True)
     valid = ~np.ma.getmaskarray(ownership)
     values = np.asarray(ownership.data)

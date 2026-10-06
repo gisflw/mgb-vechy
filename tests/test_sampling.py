@@ -145,9 +145,9 @@ def test_sampling_geographic_centimetre_dem_has_metric_slopes(tmp_path):
     # Existing unit_length=1 km attributes are the authoritative reach metric.
     report = sample_minibasins(_sampling_spec(minis, prepared, terrain, tmp_path / "sampled"))
     frame = pd.read_csv(report.sampled_minis)
-    np.testing.assert_allclose(frame.reach_slope_m_per_km, (22.4 - 4.4) / 0.75)
-    np.testing.assert_allclose(frame.tributary_length_km, maximum_m / 1000, rtol=1e-6)
-    np.testing.assert_allclose(frame.tributary_slope_m_per_km, -2 / (maximum_m / 1000), rtol=1e-6)
+    np.testing.assert_allclose(frame.reach_slope, (22.4 - 4.4) / 0.75)
+    np.testing.assert_allclose(frame.tributary_length, maximum_m / 1000, rtol=1e-6)
+    np.testing.assert_allclose(frame.tributary_slope, -2 / (maximum_m / 1000), rtol=1e-6)
     assert report.execution.worker_diagnostics[0]["blocks_read"] == 6
     for path in (prepared.dem, terrain.hand, terrain.ltnd):
         with rasterio.open(path) as source:
@@ -285,9 +285,9 @@ def test_sampling_pipeline_is_exact_block_reusing_and_atomic(tmp_path):
     assert report.mini_count == 2
     assert report.hru_class_ids == (1, 2, 3)
     assert list(frame.filter(regex=r"^hru_").columns) == [
-        "hru_1_pct",
-        "hru_2_pct",
-        "hru_3_pct",
+        "hru_1",
+        "hru_2",
+        "hru_3",
     ]
     np.testing.assert_allclose(frame.filter(regex=r"^hru_").sum(axis=1), 100)
     assert report.execution.worker_diagnostics == (
@@ -319,16 +319,16 @@ def test_sampling_pipeline_is_exact_block_reusing_and_atomic(tmp_path):
             expected_reach_slope = (
                 np.percentile(dem_values, 85) - np.percentile(dem_values, 10)
             ) / 0.75
-            assert row.reach_reference_elevation == np.percentile(dem_values, 50)
+            assert row.reach_elevation == np.percentile(dem_values, 50)
             expected_tributary_slope = hand_values[
                 np.isclose(ltnd_values, maximum)
             ].mean() / (maximum / 1000)
-            assert row.reach_slope_m_per_km == expected_reach_slope
-            assert np.isclose(row.tributary_length_km, maximum / 1000)
-            assert np.isclose(row.tributary_slope_m_per_km, expected_tributary_slope)
+            assert row.reach_slope == expected_reach_slope
+            assert np.isclose(row.tributary_length, maximum / 1000)
+            assert np.isclose(row.tributary_slope, expected_tributary_slope)
 
     transformer = Transformer.from_crs("EPSG:3857", "EPSG:4326", always_xy=True)
-    expected = [transformer.transform(15, 20), transformer.transform(55, 20)]
+    expected = [transformer.transform(25, 20), transformer.transform(65, 20)]
     np.testing.assert_allclose(frame["longitude"], [value[0] for value in expected])
     np.testing.assert_allclose(frame["latitude"], [value[1] for value in expected])
 
@@ -365,12 +365,9 @@ def test_sampling_flooded_areas_use_hand_thresholds_and_cell_areas(tmp_path):
     )
     report = sample_minibasins(spec)
     frame = pd.read_csv(report.sampled_minis)
-    area_columns = [f"flooded_area_{stage}m_km2" for stage in range(1, 101)]
-    assert list(
-        frame.columns[
-            frame.columns.get_loc(area_columns[0]) : frame.columns.get_loc("hru_1_pct")
-        ]
-    ) == area_columns
+    area_columns = [f"flooded_area_{stage}" for stage in range(1, 101)]
+    assert frame.columns.get_loc("hru_1") < frame.columns.get_loc(area_columns[0])
+    assert list(frame.columns[frame.columns.get_loc(area_columns[0]) :]) == area_columns
     assert np.all(np.diff(frame[area_columns].to_numpy(), axis=1) >= 0)
 
     with (
@@ -390,8 +387,8 @@ def test_sampling_flooded_areas_use_hand_thresholds_and_cell_areas(tmp_path):
             reach = (labels == label) & drainage
             values = dem_values[reach]
             p10, p50, p85 = np.percentile(values, (10, 50, 85))
-            assert row.reach_reference_elevation == p50
-            assert row.reach_slope_m_per_km == (p85 - p10) / 0.75
+            assert row.reach_elevation == p50
+            assert row.reach_slope == (p85 - p10) / 0.75
 
             catchment = labels == label
             cell_rows, cell_cols = np.nonzero(catchment)

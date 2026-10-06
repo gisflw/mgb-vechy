@@ -84,9 +84,9 @@ Create strict mini-confined HAND and local terrain-to-drainage COGs. Add
 ```bash
 mgb-vec-hydro terrain-products \
   --dem prepared/dem.tif \
-  --mini-ownership prepared/mini_ownership.tif \
+  --cells prepared/cells.tif \
   --drainage prepared/drainage.tif \
-  --mini-index prepared/mini_index.parquet \
+  --mini-index prepared/mini_index.csv \
   --direction-source dem \
   --output-dir output/terrain
 ```
@@ -100,9 +100,9 @@ categorical HRU raster into a geometry-free CSV:
 mgb-vec-hydro sample-minis \
   --mini-catchments output/minis/mini_catchments.fgb \
   --mini-segments output/minis/mini_segments.fgb \
-  --mini-index prepared/mini_index.parquet \
+  --mini-index prepared/mini_index.csv \
   --dem prepared/dem.tif \
-  --mini-ownership prepared/mini_ownership.tif \
+  --cells prepared/cells.tif \
   --drainage prepared/drainage.tif \
   --hand output/terrain/hand.tif \
   --ltnd output/terrain/ltnd.tif \

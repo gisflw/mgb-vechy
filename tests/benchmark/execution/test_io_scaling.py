@@ -71,7 +71,7 @@ def _write_prepared(root, feature_count, raster_size):
             target.write_mask(np.full(shape, 255, dtype="uint8"), window=window)
     copy_raster(working, root / "dem.tif", driver="COG", BLOCKSIZE=512)
     working.unlink()
-    for name, dtype in (("mini_ownership", "int32"), ("drainage", "uint8")):
+    for name, dtype in (("cells", "int32"), ("drainage", "uint8")):
         working = root / f"{name}.working.tif"
         with rasterio.open(
             working,
@@ -102,7 +102,7 @@ def _write_prepared(root, feature_count, raster_size):
             "maxx": [1.0],
             "maxy": [1.0],
         }
-    ).to_parquet(root / "mini_index.parquet", index=False)
+    ).to_csv(root / "mini_index.csv", index=False)
 
 
 def _measure_vector(root, result_queue):
