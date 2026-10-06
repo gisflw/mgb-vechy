@@ -1,3 +1,6 @@
+import json
+from dataclasses import replace
+
 import pytest
 from shapely.geometry import LineString, Polygon
 
@@ -48,15 +51,21 @@ def _inputs(tmp_path, *, orders=(3, 2, 1), downstream=(None, 1, 2)):
 
 
 def test_roi_publishes_flat_normalized_fgb_and_provider_area(tmp_path):
-    report = define_roi_dataset(_inputs(tmp_path))
+    spec = replace(_inputs(tmp_path), outlet_ids=("1", "1"))
+    report = define_roi_dataset(spec)
     assert report.segment_count == 3
     assert report.catchments == report.output_dir / "roi_catchments.fgb"
     assert report.segments == report.output_dir / "roi_segments.fgb"
     assert sorted(path.name for path in report.output_dir.iterdir()) == [
+        "manifest-define-roi.json",
         "roi_catchments.fgb",
         "roi_segments.fgb",
     ]
-    assert not (report.output_dir / "manifest.json").exists()
+    manifest = json.loads((report.output_dir / "manifest-define-roi.json").read_text())
+    assert manifest["step"] == "define-roi"
+    assert manifest["parameters"]["catchments"] == str(spec.catchments.resolve())
+    assert manifest["parameters"]["outlet_ids"] == ["1", "1"]
+    assert manifest["parameters"]["workers"] == 1
     assert not any(path.is_dir() for path in report.output_dir.iterdir())
     segment_vector = read_vector_table(report.segments)
     catchment_vector = read_vector_table(report.catchments)
@@ -79,5 +88,17 @@ def test_roi_filters_strahler_before_selection(tmp_path):
 def test_roi_rejects_selected_cycle_without_publishing(tmp_path):
     spec = _inputs(tmp_path, downstream=(2, 1, 2))
     with pytest.raises(TopologyCycleError):
+        define_roi_dataset(spec)
+    assert not spec.output_dir.exists()
+
+
+def test_roi_manifest_failure_cleans_staging(tmp_path, monkeypatch):
+    spec = _inputs(tmp_path)
+
+    def fail_manifest(*_args):
+        raise OSError("manifest write failed")
+
+    monkeypatch.setattr("mgb_vec_hydro.roi.write_manifest", fail_manifest)
+    with pytest.raises(OSError, match="manifest write failed"):
         define_roi_dataset(spec)
     assert not spec.output_dir.exists()

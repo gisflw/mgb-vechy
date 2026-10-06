@@ -32,6 +32,7 @@ from mgb_vec_hydro.execution.executor import (
     WorkerOutput,
     WorkItem,
 )
+from mgb_vec_hydro.execution.manifest import write_manifest
 from mgb_vec_hydro.execution.publication import AtomicOutputDirectory
 from mgb_vec_hydro.execution.vector import read_vector_table
 
@@ -329,6 +330,7 @@ def _prepare_dataset(spec: PreparationSpec) -> PreparationReport:
             raster_kinds=raster_kinds,
         )
         expected_names = tuple(path.name for path in output_paths.values())
+        expected_names += (write_manifest(staging, "prepare", spec),)
         publisher.publish(expected_names)
         validation_publication_seconds = time.perf_counter() - validation_started
 

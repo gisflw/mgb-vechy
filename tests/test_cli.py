@@ -85,7 +85,7 @@ def test_prepare_cli_forwards_dem_scale(tmp_path, monkeypatch, dem_scale):
 
     def prepare(spec):
         seen.append(spec)
-        return SimpleNamespace(files=(), raster_count=0, timings={})
+        return SimpleNamespace(files=(), raster_count=0, timings={}, output_dir=tmp_path / "out")
 
     monkeypatch.setattr("mgb_vec_hydro.cli.prepare_dataset", prepare)
     inputs = []

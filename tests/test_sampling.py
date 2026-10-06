@@ -1,3 +1,4 @@
+import json
 from dataclasses import replace
 
 import numpy as np
@@ -240,9 +241,8 @@ def _direct_cell_areas_km2(crs, transform, rows, cols):
 def test_sampling_pipeline_is_exact_block_reusing_and_atomic(tmp_path):
     minis, prepared, terrain = _sampling_inputs(tmp_path)
     output = tmp_path / "sampled"
-    report = sample_minibasins(
-        _sampling_spec(minis, prepared, terrain, output)
-    )
+    spec = _sampling_spec(minis, prepared, terrain, output)
+    report = sample_minibasins(spec)
 
     frame = pd.read_csv(report.sampled_minis)
     assert frame["id"].tolist() == [1, 2]
@@ -262,7 +262,13 @@ def test_sampling_pipeline_is_exact_block_reusing_and_atomic(tmp_path):
             "reach_cells": 8,
         },
     )
-    assert sorted(path.name for path in output.iterdir()) == ["sampled_minis.csv"]
+    assert sorted(path.name for path in output.iterdir()) == [
+        "manifest-sample-minis.json",
+        "sampled_minis.csv",
+    ]
+    manifest = json.loads((output / "manifest-sample-minis.json").read_text())
+    assert manifest["parameters"]["hru"] == str(spec.hru.resolve())
+    assert manifest["parameters"]["batch_size"] == 10_000
 
     with (
         rasterio.open(prepared.dem) as dem,

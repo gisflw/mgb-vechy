@@ -51,16 +51,18 @@ remapped and mouths are written as `-1`. `source_to_mini.csv` contains exactly
 `id`, `mini_id`, `sub`, `longitude`, and `latitude`; every ROI source ID occurs
 once and `mini_id` uses the dense identity.
 
-The published directory contains exactly these root-level files:
+The published directory contains these root-level files, including an audit
+manifest with the input paths and processing parameters:
 
 ```text
 minis/
+├── manifest-aggregate.json
 ├── mini_catchments.fgb
 ├── mini_segments.fgb
 └── source_to_mini.csv
 ```
 
-There is no `manifest.json` and no nested output directory. Both FlatGeobuf
+There is no nested output directory. Both FlatGeobuf
 files use the ordered schema `id`, `id_down`, `sub`, `p_order`, `unit_length`,
 `upstream_length`, `unit_area`, `upstream_area`, `geometry` and the
 authoritative CRS. `strahler_order` and `water_course` remain Stage 1 inputs

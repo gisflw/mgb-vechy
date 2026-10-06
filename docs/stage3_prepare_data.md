@@ -78,10 +78,11 @@ corrections, using a bounded block scan.
 Terrain and sampling read this tag directly. There is no separate index file,
 version, or compatibility reader. Previously prepared rasters must be
 regenerated. The published directory contains these root-level files, plus
-one `<name>.tif` for each requested named raster:
+one `<name>.tif` for each requested named raster and an audit manifest:
 
 ```text
 prepared/
+├── manifest-prepare.json
 ├── dem.tif
 ├── <name>.tif
 ├── d8.tif                  # optional
@@ -89,9 +90,9 @@ prepared/
 └── drainage.tif
 ```
 
-There is no `manifest.json` and no nested output directory. All files are
-validated before the private staging directory is atomically renamed into
-place. Defaults are four workers, 512 MB of admitted block memory, two I/O
+There is no nested output directory. All files are validated before the
+private staging directory is atomically renamed into place. Defaults are four
+workers, 512 MB of admitted block memory, two I/O
 slots, and one native DEM-cell buffer; worker counts may be any positive integer.
 Existing output directories are rejected
 and staging-only working files are removed before publication. The CLI prints

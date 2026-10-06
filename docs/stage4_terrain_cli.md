@@ -56,17 +56,19 @@ other owned cell must have a valid direction, stay within its mini, avoid
 cycles, and terminate on matching drainage. Invalid D8 paths fail before any
 output is published.
 
-The published directory contains exactly these root-level files:
+The published directory contains these root-level files, including an audit
+manifest with the input paths and processing parameters:
 
 ```text
 terrain/
+├── manifest-terrain-products.json
 ├── hand.tif
 ├── ltnd.tif
 └── flow_direction.tif     # optional
 ```
 
-There is no `manifest.json`, no copied domain raster, no index copy, and no
-nested directory. All outputs are full canonical-grid COGs with internal
+There is no copied domain raster, no index copy, and no nested directory. All
+outputs are full canonical-grid COGs with internal
 validity masks: HAND and LTND are `float32`, and flow direction is `uint8`
 with codes 0 for drainage and 1–8 for N, NE, E, SE, S, SW, W, and NW. The
 report and CLI status identify the concrete paths written and include planning,

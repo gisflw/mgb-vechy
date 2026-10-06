@@ -23,8 +23,8 @@ failures.
 `AtomicOutputDirectory` creates a private sibling staging directory. A stage
 validates every expected file, removes packet/work artifacts, rejects extra
 files and nested directories, and publishes with one directory rename. A
-published stage output is therefore the documented flat root-level file set;
-there is no generated `manifest.json`.
+published stage output is therefore the documented flat root-level file set,
+including one `manifest-<step>.json` audit file with the inputs and parameters.
 
 ## Vector access
 

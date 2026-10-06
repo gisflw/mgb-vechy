@@ -60,15 +60,17 @@ km². Upstream metrics are deterministic topology reductions. Selected
 geometry is processed in bounded worker packets and written to spatially
 indexed FlatGeobuf files.
 
-The published directory contains exactly these root-level files:
+The published directory contains these root-level files, including an audit
+manifest with the input paths and processing parameters:
 
 ```text
 roi/
+├── manifest-define-roi.json
 ├── roi_catchments.fgb
 └── roi_segments.fgb
 ```
 
-There is no `manifest.json` and no nested output directory. The report and
-CLI status identify both concrete paths. Defaults are 512 MB, four workers,
+There is no nested output directory. The report and CLI status identify both
+concrete paths. Defaults are 512 MB, four workers,
 two concurrent I/O operations, and 10,000-row scans. Worker counts may be any
 positive integer.

@@ -26,6 +26,7 @@ from mgb_vec_hydro.exceptions import (
     TopologyCycleError,
 )
 from mgb_vec_hydro.execution.executor import ExecutionConfig, LocalExecutor, WorkItem
+from mgb_vec_hydro.execution.manifest import write_manifest
 from mgb_vec_hydro.execution.publication import AtomicOutputDirectory
 from mgb_vec_hydro.execution.vector import (
     VectorTable,
@@ -215,7 +216,8 @@ def define_roi_dataset(spec: RoiSpec) -> RoiReport:
             target_crs=target_crs,
             feature_count=len(selected_ids),
         )
-        publisher.publish((catchments_path.name, segments_path.name))
+        manifest = write_manifest(staging, "define-roi", spec)
+        publisher.publish((catchments_path.name, segments_path.name, manifest))
     output_publication_seconds = time.perf_counter() - phase_started
 
     return RoiReport(

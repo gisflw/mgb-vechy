@@ -22,6 +22,7 @@ from mgb_vec_hydro.exceptions import (
     TopologyCycleError,
 )
 from mgb_vec_hydro.execution.executor import ExecutionConfig, LocalExecutor, WorkItem
+from mgb_vec_hydro.execution.manifest import write_manifest
 from mgb_vec_hydro.execution.publication import AtomicOutputDirectory
 from mgb_vec_hydro.execution.vector import (
     VectorProvider,
@@ -649,7 +650,8 @@ def aggregate_roi_dataset(spec: AggregationSpec) -> AggregationReport:
             expected_crs=expected_crs,
             source_ids=set(catchments["id"]),
         )
-        publisher.publish((catchment_path.name, segment_path.name, mapping_path.name))
+        manifest = write_manifest(staging, "aggregate", spec)
+        publisher.publish((catchment_path.name, segment_path.name, mapping_path.name, manifest))
     output_publication_seconds = time.perf_counter() - phase_started
     return AggregationReport(
         output,

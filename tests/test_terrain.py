@@ -193,8 +193,11 @@ def test_terrain_outputs_custom_agree_profile_and_strict_domain(tmp_path):
 
     assert report.mini_count == 2
     assert report.timings["conditioning"] >= 0
-    assert sorted(path.name for path in output_dir.iterdir()) == ["hand.tif", "ltnd.tif"]
-    assert not (output_dir / "manifest.json").exists()
+    assert sorted(path.name for path in output_dir.iterdir()) == [
+        "hand.tif", "ltnd.tif", "manifest-terrain-products.json"
+    ]
+    manifest = json.loads((output_dir / "manifest-terrain-products.json").read_text())
+    assert manifest["parameters"]["agree_sharp"] == 12
     assert not any(path.is_dir() for path in output_dir.iterdir())
     with rasterio.open(output_dir / "hand.tif") as result:
         tags = result.tags()
@@ -258,7 +261,11 @@ def test_terrain_d8_mode_consumes_explicit_d8_and_publishes_only_products(tmp_pa
         "flow_direction.tif",
         "hand.tif",
         "ltnd.tif",
+        "manifest-terrain-products.json",
     ]
+    manifest = json.loads((output / "manifest-terrain-products.json").read_text())
+    assert manifest["parameters"]["agree_buffer"] == 4
+    assert manifest["parameters"]["direction_source"] == "d8"
     assert not (output / "mini_index.csv").exists()
 
 def test_d8_validation_terminalizes_drainage_and_rejects_invalid_paths():

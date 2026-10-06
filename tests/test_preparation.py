@@ -196,23 +196,29 @@ def test_prepare_pipeline_publishes_valid_canonical_dataset(tmp_path):
         )
     )
     assert sorted(path.name for path in aggregation.output_dir.iterdir()) == [
+        "manifest-aggregate.json",
         "mini_catchments.fgb",
         "mini_segments.fgb",
         "source_to_mini.csv",
     ]
-    assert not (aggregation.output_dir / "manifest.json").exists()
+    aggregate_manifest = json.loads(
+        (aggregation.output_dir / "manifest-aggregate.json").read_text()
+    )
+    assert aggregate_manifest["parameters"]["uparea_min"] == 0
+    assert aggregate_manifest["parameters"]["roi_catchments"] == str(
+        (tmp_path / "roi/roi_catchments.fgb").resolve()
+    )
     assert not any(path.is_dir() for path in aggregation.output_dir.iterdir())
 
-    report = prepare_dataset(
-        PreparationSpec(
-            dem=dem,
-            mini_catchments=tmp_path / "minis" / "mini_catchments.fgb",
-            mini_segments=tmp_path / "minis" / "mini_segments.fgb",
-            rasters=(NamedRaster("land", land, "categorical"),),
-            output_dir=tmp_path / "prepared",
-            memory_limit_mb=16,
-        )
+    prepare_spec = PreparationSpec(
+        dem=dem,
+        mini_catchments=tmp_path / "minis" / "mini_catchments.fgb",
+        mini_segments=tmp_path / "minis" / "mini_segments.fgb",
+        rasters=(NamedRaster("land", land, "categorical"),),
+        output_dir=tmp_path / "prepared",
+        memory_limit_mb=16,
     )
+    report = prepare_dataset(prepare_spec)
 
     assert report.raster_count == 2
     assert sorted(path.name for path in report.output_dir.iterdir()) == [
@@ -220,8 +226,15 @@ def test_prepare_pipeline_publishes_valid_canonical_dataset(tmp_path):
         "dem.tif",
         "drainage.tif",
         "land.tif",
+        "manifest-prepare.json",
     ]
-    assert not (report.output_dir / "manifest.json").exists()
+    prepare_manifest = json.loads(
+        (report.output_dir / "manifest-prepare.json").read_text()
+    )
+    assert prepare_manifest["parameters"]["dem"] == str(prepare_spec.dem.resolve())
+    assert prepare_manifest["parameters"]["rasters"] == [
+        {"name": "land", "path": str(land.resolve()), "kind": "categorical"}
+    ]
     assert not any(path.is_dir() for path in report.output_dir.iterdir())
     assert [row[0] for row in read_mini_index(report.mini_ownership)] == [1]
     for name in ("dem", "land"):

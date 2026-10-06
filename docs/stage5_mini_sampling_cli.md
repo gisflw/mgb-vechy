@@ -58,11 +58,12 @@ segment. Exact percentiles and deterministic accumulators are reduced
 over complete mini packets, while each distinct canonical COG block is read
 once per raster in a packet. No raster is reprojected or republished.
 
-The output directory is staged privately and contains exactly one root-level
-file:
+The output directory is staged privately and contains the CSV and an audit
+manifest with the input paths and processing parameters:
 
 ```text
 sampled/
+├── manifest-sample-minis.json
 └── sampled_minis.csv
 ```
 

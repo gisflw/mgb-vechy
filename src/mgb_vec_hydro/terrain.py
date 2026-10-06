@@ -35,6 +35,7 @@ from mgb_vec_hydro.execution.executor import (
     WorkerOutput,
     WorkItem,
 )
+from mgb_vec_hydro.execution.manifest import write_manifest
 from mgb_vec_hydro.execution.publication import AtomicOutputDirectory
 from mgb_vec_hydro.execution.raster import (
     AlignedRasterReader,
@@ -1152,7 +1153,8 @@ def _create_terrain_dataset(spec: TerrainSpec) -> TerrainReport:
             compression_seconds += time.perf_counter() - started
 
         _validate_terrain_outputs(terrain_paths, grid)
-        publisher.publish(tuple(path.name for path in terrain_paths.values()))
+        manifest = write_manifest(staging, "terrain-products", spec)
+        publisher.publish((*tuple(path.name for path in terrain_paths.values()), manifest))
 
 
     diagnostics = tuple(terrain_report.worker_diagnostics)

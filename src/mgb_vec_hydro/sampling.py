@@ -25,6 +25,7 @@ from mgb_vec_hydro.execution.executor import (
     WorkerOutput,
     WorkItem,
 )
+from mgb_vec_hydro.execution.manifest import write_manifest
 from mgb_vec_hydro.execution.publication import AtomicOutputDirectory
 from mgb_vec_hydro.execution.raster import (
     AlignedRasterReader,
@@ -190,7 +191,8 @@ def sample_minibasins(spec: MiniSamplingSpec) -> MiniSamplingReport:
         shutil.rmtree(packet_root)
         if execution.reduced != len(items) or not output.is_file():
             raise MiniSamplingError("Sampling output is incomplete")
-        publisher.publish((output.name,))
+        manifest = write_manifest(staging, "sample-minis", spec)
+        publisher.publish((output.name, manifest))
 
     publication_seconds = (
         time.perf_counter() - publication_started - execution.wall_seconds - csv_seconds

@@ -113,6 +113,7 @@ def prepare_command(
     )
     for path in report.files:
         click.echo(f"Wrote {path}")
+    click.echo(f"Wrote {report.output_dir / 'manifest-prepare.json'}")
     click.echo(f"Prepared {report.raster_count} raster(s)")
     _echo_timings(report.timings)
 
@@ -201,6 +202,7 @@ def define_roi_command(
 
     click.echo(f"Wrote {report.catchments}")
     click.echo(f"Wrote {report.segments}")
+    click.echo(f"Wrote {report.output_dir / 'manifest-define-roi.json'}")
     click.echo(f"Selected {report.segment_count} source pairs")
     _echo_timings(report.timings)
 
@@ -263,6 +265,7 @@ def aggregate_command(
     click.echo(f"Wrote {report.mini_catchments}")
     click.echo(f"Wrote {report.mini_segments}")
     click.echo(f"Wrote {report.source_to_mini}")
+    click.echo(f"Wrote {report.output_dir / 'manifest-aggregate.json'}")
     _echo_timings(report.timings)
 
 
@@ -366,6 +369,7 @@ def terrain_products_command(
     click.echo(f"Wrote {report.ltnd}")
     if report.flow_direction is not None:
         click.echo(f"Wrote {report.flow_direction}")
+    click.echo(f"Wrote {report.output_dir / 'manifest-terrain-products.json'}")
     click.echo(f"Processed {report.mini_count} complete minis")
     click.echo(f"Cells: {report.owned_cells} owned, {report.drainage_cells} drainage")
     click.echo(
@@ -471,6 +475,7 @@ def sample_minis_command(
         )
     )
     click.echo(f"Wrote {report.sampled_minis}")
+    click.echo(f"Wrote {report.output_dir / 'manifest-sample-minis.json'}")
     click.echo(
         f"Sampled {report.mini_count} minis; "
         f"{report.catchment_cells} catchment cells and "
