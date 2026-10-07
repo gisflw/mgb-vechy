@@ -33,7 +33,7 @@ mgb-vec-hydro define-roi \
 | `--strahler-order-col` | Required | Field name | Segment field containing the Strahler order used during topology filtering. |
 | `--output-dir` | Required | Directory path | New directory where `roi_catchments.fgb` and `roi_segments.fgb` are published. |
 | `--workers` | Optional | Positive integer; default `4` | Number of worker processes used for bounded geometry work. There is no upper limit imposed by the CLI or stage validator. |
-| `--memory-limit-mb` | Optional | Positive integer MB; default `512` | Soft memory sizing hint; see [shared execution](shared_execution.md#local-execution). |
+| `--memory-limit-mb` | Optional | Positive integer MB; default `4096` | Soft memory sizing hint; see [shared execution](shared_execution.md#local-execution). |
 | `--io-slots` | Optional | Positive integer; default `2` | Maximum number of concurrent source-I/O operations. |
 | `--batch-size` | Optional | Positive integer rows; default `10000` | Number of provider rows inspected per bounded attribute scan. |
 
@@ -71,7 +71,7 @@ roi/
 ```
 
 There is no nested output directory. The report and CLI status identify both
-concrete paths. Defaults are 512 MB, four workers,
+concrete paths. Defaults are 4096 MB (4 GB), four workers,
 two concurrent I/O operations, and 10,000-row scans. Worker counts may be any
 positive integer.
 

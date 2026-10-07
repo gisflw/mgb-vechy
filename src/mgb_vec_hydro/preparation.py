@@ -63,7 +63,7 @@ class PreparationSpec:
     d8: Path | None = None
     d8_encoding: Literal["canonical", "esri"] | None = None
     workers: int = 4
-    memory_limit_mb: int = 512
+    memory_limit_mb: int = 4096
     io_slots: int = 2
     dem_scale: float = 1.0
     overwrite: bool = False

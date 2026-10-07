@@ -23,7 +23,7 @@ mgb-vec-hydro aggregate \
 | `--lmin` | Required | Non-negative number | Minimum evolving mini length used when short chains are iteratively merged; uses normalized length units (km). |
 | `--output-dir` | Required | Directory path | New directory where the mini vectors and `source_to_mini.csv` are published. |
 | `--workers` | Optional | Positive integer; default `4` | Number of worker processes used for bounded vector work. There is no upper limit imposed by the CLI or stage validator. |
-| `--memory-limit-mb` | Optional | Positive integer MB; default `512` | Soft memory sizing hint; see [shared execution](shared_execution.md#local-execution). |
+| `--memory-limit-mb` | Optional | Positive integer MB; default `4096` | Soft memory sizing hint; see [shared execution](shared_execution.md#local-execution). |
 | `--io-slots` | Optional | Positive integer; default `2` | Maximum number of concurrent vector-I/O operations. |
 | `--batch-size` | Optional | Positive integer rows; default `10000` | Number of rows processed per bounded vector batch. |
 
@@ -70,7 +70,7 @@ but are not published because downstream stages do not use them. The mini
 files intentionally omit a spatial index so physical feature order is
 preserved.
 The files are staged privately, validated, and atomically published. Defaults
-are 512 MB, four workers, two I/O operations, and 10,000-row batches. Worker
+are 4096 MB (4 GB), four workers, two I/O operations, and 10,000-row batches. Worker
 counts may be any positive integer.
 
 `--memory-limit-mb` is a soft sizing hint for task packets and retained

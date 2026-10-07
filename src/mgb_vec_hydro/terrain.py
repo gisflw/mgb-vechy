@@ -97,7 +97,7 @@ class TerrainSpec:
     agree_smooth: float = 8.0
     agree_buffer: int = 4
     workers: int = 4
-    memory_limit_mb: int = 512
+    memory_limit_mb: int = 4096
     io_slots: int = 2
     overwrite: bool = False
 

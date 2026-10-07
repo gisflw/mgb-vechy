@@ -25,7 +25,7 @@ mgb-vec-hydro prepare \
 | `--categorical-raster` | Optional; repeatable | `NAME PATH` | Named single-band categorical raster to clip and publish as `<name>.tif`; names must be valid and non-reserved. |
 | `--d8` | Optional; conditional | Existing raster path | Optional D8 raster to normalize and publish as `d8.tif`; must be supplied together with `--d8-encoding`. |
 | `--d8-encoding` | Optional; conditional | `canonical` or `esri` | Encoding of `--d8`; must be supplied together with `--d8`. Output is normalized to canonical clockwise codes. |
-| `--memory-limit-mb` | Optional | Positive integer MB; default `512` | Soft memory sizing hint for raster tasks and working storage. |
+| `--memory-limit-mb` | Optional | Positive integer MB; default `4096` | Soft memory sizing hint for raster tasks and working storage. |
 | `--workers` | Optional | Positive integer; default `4` | Number of worker processes used for bounded block processing. There is no upper limit imposed by the CLI or stage validator. |
 | `--io-slots` | Optional | Positive integer; default `2` | Maximum number of concurrent source-raster reads. |
 | `--output-dir` | Required | Directory path | New directory where prepared COGs, cells with embedded mini bounds, and drainage are published. |
@@ -100,7 +100,7 @@ prepared/
 
 There is no nested output directory. All files are validated before the
 staged files are published into the output folder. Defaults are four
-workers, 512 MB as a soft memory hint, two I/O
+workers, 4096 MB (4 GB) as a soft memory hint, two I/O
 slots, and one native DEM-cell buffer; worker counts may be any positive integer.
 Existing output folders are reused. The CLI asks before processing if any
 requested output files already exist. Staging-only working files are removed

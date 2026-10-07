@@ -119,7 +119,7 @@ def _run_stage(stage, spec):
 @click.option(
     "--memory-limit-mb",
     type=click.IntRange(min=1),
-    default=512,
+    default=4096,
     show_default=True,
 )
 @click.option(
@@ -215,7 +215,7 @@ def prepare_command(
     "--workers", type=click.IntRange(min=1), default=4, show_default=True
 )
 @click.option(
-    "--memory-limit-mb", type=click.IntRange(min=1), default=512, show_default=True
+    "--memory-limit-mb", type=click.IntRange(min=1), default=4096, show_default=True
 )
 @click.option("--io-slots", type=click.IntRange(min=1), default=2, show_default=True)
 @click.option(
@@ -297,7 +297,7 @@ def define_roi_command(
     "--workers", type=click.IntRange(min=1), default=4, show_default=True
 )
 @click.option(
-    "--memory-limit-mb", type=click.IntRange(min=1), default=512, show_default=True
+    "--memory-limit-mb", type=click.IntRange(min=1), default=4096, show_default=True
 )
 @click.option("--io-slots", type=click.IntRange(min=1), default=2, show_default=True)
 @click.option(
@@ -401,7 +401,7 @@ def aggregate_command(
     "--workers", type=click.IntRange(min=1), default=4, show_default=True
 )
 @click.option(
-    "--memory-limit-mb", type=click.IntRange(min=1), default=512, show_default=True
+    "--memory-limit-mb", type=click.IntRange(min=1), default=4096, show_default=True
 )
 @click.option("--io-slots", type=click.IntRange(min=1), default=2, show_default=True)
 def terrain_products_command(
@@ -511,7 +511,7 @@ def terrain_products_command(
     "--workers", type=click.IntRange(min=1), default=4, show_default=True
 )
 @click.option(
-    "--memory-limit-mb", type=click.IntRange(min=1), default=512, show_default=True
+    "--memory-limit-mb", type=click.IntRange(min=1), default=4096, show_default=True
 )
 @click.option("--io-slots", type=click.IntRange(min=1), default=2, show_default=True)
 @click.option(

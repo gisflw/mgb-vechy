@@ -31,7 +31,7 @@ mgb-vec-hydro terrain-products \
 | `--agree-smooth` | Optional | Non-negative number; default `8.0` | AGREE ramp depth per pixel toward the stream in DEM mode. |
 | `--agree-buffer` | Optional | Non-negative integer pixels; default `4` | AGREE conditioning radius around the stream in DEM mode. |
 | `--workers` | Optional | Positive integer; default `4` | Number of worker processes used for bounded terrain work. There is no upper limit imposed by the CLI or stage validator. |
-| `--memory-limit-mb` | Optional | Positive integer MB; default `512` | Soft memory sizing hint for terrain packets and working storage. |
+| `--memory-limit-mb` | Optional | Positive integer MB; default `4096` | Soft memory sizing hint for terrain packets and working storage. |
 | `--io-slots` | Optional | Positive integer; default `2` | Maximum number of concurrent raster reads. |
 
 Click also provides `--help` to display the command’s generated option list.
@@ -39,7 +39,7 @@ Click also provides `--help` to display the command’s generated option list.
 `--direction-source` is `dem` by default or `d8`. D8 mode requires an explicit
 `--d8` raster containing canonical clockwise codes. Use
 `--write-flow-direction` to publish the directions selected by the run.
-Execution defaults are four workers, 512 MB as a soft memory hint, and two I/O
+Execution defaults are four workers, 4096 MB (4 GB) as a soft memory hint, and two I/O
 slots. Packets target the memory hint divided by twice the worker count,
 with no fixed mini-count cap. A complete mini above the target gets its own
 packet if it fits the hint; otherwise processing raises `WorkMemoryError`.

@@ -70,7 +70,7 @@ class RoiSpec:
     catchments_source_crs: str | None = None
     segments_source_crs: str | None = None
     workers: int = 4
-    memory_limit_mb: int = 512
+    memory_limit_mb: int = 4096
     io_slots: int = 2
     batch_size: int = 10_000
     overwrite: bool = False
