@@ -37,6 +37,7 @@ from mgb_vec_hydro.execution.executor import (
 )
 from mgb_vec_hydro.execution.manifest import write_manifest
 from mgb_vec_hydro.execution.memory import MemorySizing, raster_cache
+from mgb_vec_hydro.execution.progress import ProgressCallback, StageReporter
 from mgb_vec_hydro.execution.publication import AtomicOutputDirectory
 from mgb_vec_hydro.execution.raster import (
     AlignedRasterReader,
@@ -1043,14 +1044,19 @@ class _PacketValue:
     patches: tuple[Any, ...]
 
 
-def create_terrain_dataset(spec: TerrainSpec) -> TerrainReport:
+def create_terrain_dataset(
+    spec: TerrainSpec, *, progress: ProgressCallback | None = None
+) -> TerrainReport:
     """Build terrain products with a bounded coordinator GDAL block cache."""
+    reporter = StageReporter(progress)
     sizing = MemorySizing(spec.memory_limit_mb * 1024**2, spec.workers)
     with raster_cache(sizing.coordinator_cache_bytes):
-        return _create_terrain_dataset(spec)
+        report = _create_terrain_dataset(spec, reporter)
+    reporter.finish(report.timings)
+    return report
 
 
-def _create_terrain_dataset(spec: TerrainSpec) -> TerrainReport:
+def _create_terrain_dataset(spec: TerrainSpec, reporter: StageReporter) -> TerrainReport:
     """Build and atomically publish bounded mini-based terrain products."""
 
     overall_started = time.perf_counter()
@@ -1088,6 +1094,7 @@ def _create_terrain_dataset(spec: TerrainSpec) -> TerrainReport:
             raster_assets,
             memory_bytes,
         )
+        reporter.enter("processing", len(terrain_items))
         terrain_specs = [
             RasterProductSpec(
                 "hand",
@@ -1144,7 +1151,9 @@ def _create_terrain_dataset(spec: TerrainSpec) -> TerrainReport:
                 terrain_items,
                 _terrain_worker,
                 reduce_terrain,
+                progress=reporter.execution_progress,
             )
+            reporter.enter("finalizing")
             started = time.perf_counter()
             terrain_paths = terrain_assembler.finish()
             compression_seconds += time.perf_counter() - started

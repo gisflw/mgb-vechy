@@ -23,6 +23,7 @@ from mgb_vec_hydro.exceptions import (
 from mgb_vec_hydro.execution.executor import ExecutionConfig, LocalExecutor, WorkItem
 from mgb_vec_hydro.execution.manifest import write_manifest
 from mgb_vec_hydro.execution.memory import ArrowPacketStore, MemorySizing, sqlite_cache
+from mgb_vec_hydro.execution.progress import ProgressCallback, StageReporter
 from mgb_vec_hydro.execution.publication import AtomicOutputDirectory
 from mgb_vec_hydro.execution.vector import (
     VectorProvider,
@@ -563,7 +564,17 @@ def _mapping_from_packets(store, catchments):
     ).reset_index(drop=True)
 
 
-def aggregate_roi_dataset(spec: AggregationSpec) -> AggregationReport:
+def aggregate_roi_dataset(
+    spec: AggregationSpec, *, progress: ProgressCallback | None = None
+) -> AggregationReport:
+    """Aggregate and atomically publish mini-basins with optional progress."""
+    reporter = StageReporter(progress)
+    report = _aggregate_roi_dataset(spec, reporter)
+    reporter.finish(report.timings)
+    return report
+
+
+def _aggregate_roi_dataset(spec: AggregationSpec, reporter: StageReporter) -> AggregationReport:
     overall_started = time.perf_counter()
     _validate_spec(spec)
     sizing = MemorySizing(spec.memory_limit_mb * 1024**2, spec.workers)
@@ -598,6 +609,7 @@ def aggregate_roi_dataset(spec: AggregationSpec) -> AggregationReport:
         memory_limit_bytes=sizing.limit_bytes,
         workers=spec.workers,
     )
+    reporter.enter("processing", len(items))
     output = Path(spec.output_dir)
     publisher = AtomicOutputDirectory(output, overwrite=spec.overwrite)
     phase_started = time.perf_counter()
@@ -634,7 +646,9 @@ def aggregate_roi_dataset(spec: AggregationSpec) -> AggregationReport:
             items,
             _prepare_aggregation_packet,
             reduce_packet,
+            progress=reporter.execution_progress,
         )
+        reporter.enter("finalizing")
         catchment_path = staging / "mini_catchments.fgb"
         segment_path = staging / "mini_segments.fgb"
         mapping_path = staging / "source_to_mini.csv"

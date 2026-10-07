@@ -218,7 +218,14 @@ def test_prepare_pipeline_publishes_valid_canonical_dataset(tmp_path):
         output_dir=tmp_path / "prepared",
         memory_limit_mb=16,
     )
-    report = prepare_dataset(prepare_spec)
+    updates = []
+    report = prepare_dataset(prepare_spec, progress=updates.append)
+    phase_times = [report.timings[f"{phase}_wall"] for phase in ("preparing", "processing", "finalizing")]
+    assert all(seconds >= 0 for seconds in phase_times)
+    assert sum(phase_times) == pytest.approx(report.timings["total"])
+    assert [update.phase for update in updates if update.completed == 0] == ["preparing", "processing", "finalizing"]
+    processing = [update for update in updates if update.phase == "processing"]
+    assert processing[-1].completed == processing[-1].total == report.execution.reduced
 
     assert report.raster_count == 2
     assert sorted(path.name for path in report.output_dir.iterdir()) == [

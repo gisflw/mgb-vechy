@@ -33,6 +33,7 @@ from mgb_vec_hydro.execution.executor import (
 )
 from mgb_vec_hydro.execution.manifest import write_manifest
 from mgb_vec_hydro.execution.memory import MemorySizing, raster_cache
+from mgb_vec_hydro.execution.progress import ProgressCallback, StageReporter
 from mgb_vec_hydro.execution.publication import AtomicOutputDirectory
 from mgb_vec_hydro.execution.vector import read_vector_table
 
@@ -148,14 +149,19 @@ class _PreparationBlockResult:
     components: tuple[np.ndarray, ...] | None
 
 
-def prepare_dataset(spec: PreparationSpec) -> PreparationReport:
+def prepare_dataset(
+    spec: PreparationSpec, *, progress: ProgressCallback | None = None
+) -> PreparationReport:
     """Create a prepared dataset with a bounded GDAL block cache."""
+    reporter = StageReporter(progress)
     sizing = MemorySizing(spec.memory_limit_mb * 1024**2, spec.workers)
     with raster_cache(sizing.coordinator_cache_bytes):
-        return _prepare_dataset(spec)
+        report = _prepare_dataset(spec, reporter)
+    reporter.finish(report.timings)
+    return report
 
 
-def _prepare_dataset(spec: PreparationSpec) -> PreparationReport:
+def _prepare_dataset(spec: PreparationSpec, reporter: StageReporter) -> PreparationReport:
     """Create and atomically publish one prepared dataset."""
     overall_started = time.perf_counter()
     _validate_spec(spec)
@@ -239,6 +245,11 @@ def _prepare_dataset(spec: PreparationSpec) -> PreparationReport:
     )
     planning_seconds = time.perf_counter() - phase_started
 
+    block_count = (
+        ((grid.width + BLOCK_SIZE - 1) // BLOCK_SIZE)
+        * ((grid.height + BLOCK_SIZE - 1) // BLOCK_SIZE)
+    )
+    reporter.enter("processing", block_count)
     execution = ExecutionReport(0, 0, 0, 0, 0, 0.0, {}, ())
     correction_seconds = compression_seconds = 0.0
     publisher = AtomicOutputDirectory(output, overwrite=spec.overwrite)
@@ -295,9 +306,11 @@ def _prepare_dataset(spec: PreparationSpec) -> PreparationReport:
                     return {"output_write": time.perf_counter() - started}
 
                 execution = LocalExecutor(config).run(
-                    items, _prepare_block_worker, reduce_block
+                    items, _prepare_block_worker, reduce_block,
+                    progress=reporter.execution_progress,
                 )
 
+                reporter.enter("finalizing")
                 correction_started = time.perf_counter()
                 _correct_connectivity(
                     assembler,

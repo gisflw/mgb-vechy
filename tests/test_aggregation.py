@@ -251,6 +251,9 @@ def test_dataset_defers_geometry_and_preserves_physical_sort(tmp_path, monkeypat
             batch_size=2,
         )
     )
+    phase_times = [report.timings[f"{phase}_wall"] for phase in ("preparing", "processing", "finalizing")]
+    assert all(seconds >= 0 for seconds in phase_times)
+    assert sum(phase_times) == pytest.approx(report.timings["total"])
 
     assert attribute_reads and not any(attribute_reads)
     for path in (report.mini_catchments, report.mini_segments):

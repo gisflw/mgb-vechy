@@ -53,6 +53,9 @@ def _inputs(tmp_path, *, orders=(3, 2, 1), downstream=(None, 1, 2)):
 def test_roi_publishes_flat_normalized_fgb_and_provider_area(tmp_path):
     spec = replace(_inputs(tmp_path), outlet_ids=("1", "1"))
     report = define_roi_dataset(spec)
+    phase_times = [report.timings[f"{phase}_wall"] for phase in ("preparing", "processing", "finalizing")]
+    assert all(seconds >= 0 for seconds in phase_times)
+    assert sum(phase_times) == pytest.approx(report.timings["total"])
     assert report.segment_count == 3
     assert report.catchments == report.output_dir / "roi_catchments.fgb"
     assert report.segments == report.output_dir / "roi_segments.fgb"

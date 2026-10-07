@@ -190,6 +190,9 @@ def test_terrain_outputs_custom_agree_profile_and_strict_domain(tmp_path):
 
         )
     )
+    phase_times = [report.timings[f"{phase}_wall"] for phase in ("preparing", "processing", "finalizing")]
+    assert all(seconds >= 0 for seconds in phase_times)
+    assert sum(phase_times) == pytest.approx(report.timings["total"])
 
     assert report.mini_count == 2
     assert report.timings["conditioning"] >= 0

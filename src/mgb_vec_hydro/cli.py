@@ -7,6 +7,7 @@ from pathlib import Path
 import click
 
 from mgb_vec_hydro.aggregation import AggregationSpec, aggregate_roi_dataset
+from mgb_vec_hydro.execution.progress import StageProgress
 from mgb_vec_hydro.preparation import NamedRaster, PreparationSpec, prepare_dataset
 from mgb_vec_hydro.roi import RoiSpec, define_roi_dataset
 from mgb_vec_hydro.sampling import (
@@ -40,10 +41,45 @@ def _confirm_replacement(output_dir: Path, names: tuple[str, ...]) -> bool:
 
 
 def _echo_timings(timings: dict[str, float]) -> None:
-    click.echo(
-        "Timing: "
-        + ", ".join(f"{name} {seconds:.3f}s" for name, seconds in timings.items())
+    labels = (
+        ("preparing_wall", "preparing"),
+        ("processing_wall", "processing"),
+        ("finalizing_wall", "finalizing"),
+        ("total", "total"),
     )
+    click.echo("Elapsed: " + ", ".join(
+        f"{label} {timings[key]:.1f}s" for key, label in labels if key in timings
+    ))
+
+
+def _run_stage(stage, spec):
+    labels = {
+        "preparing": "Preparing inputs",
+        "processing": "Processing batches",
+        "finalizing": "Finalizing outputs",
+    }
+    with click.progressbar(
+        length=1, label=labels["preparing"], file=sys.stderr,
+        show_eta=False, show_percent=False, show_pos=False,
+    ) as bar:
+        phase = "preparing"
+
+        def progress(update: StageProgress) -> None:
+            nonlocal phase
+            if update.phase != phase:
+                phase = update.phase
+                bar.label = labels[phase]
+                bar.length = update.total if update.total is not None else 1
+                bar.pos = 0
+                bar.finished = False
+                bar.show_percent = bar.show_pos = phase == "processing"
+                bar.render_progress()
+            if phase == "processing":
+                bar.update(update.completed - bar.pos)
+
+        report = stage(spec, progress=progress)
+        bar.update(max(0, (bar.length or 0) - bar.pos))
+        return report
 
 
 @main.command("prepare")
@@ -120,7 +156,8 @@ def prepare_command(
          *(f"{raster.name}.tif" for raster in rasters),
          *(("d8.tif",) if d8 is not None else ())),
     )
-    report = prepare_dataset(
+    report = _run_stage(
+        prepare_dataset,
         PreparationSpec(
             dem=dem,
             dem_scale=dem_scale,
@@ -208,7 +245,8 @@ def define_roi_command(
         output_dir,
         ("roi_catchments.fgb", "roi_segments.fgb", "manifest-define-roi.json"),
     )
-    report = define_roi_dataset(
+    report = _run_stage(
+        define_roi_dataset,
         RoiSpec(
             crs=crs,
             catchments=catchments_path,
@@ -282,7 +320,8 @@ def aggregate_command(
         output_dir,
         ("mini_catchments.fgb", "mini_segments.fgb", "source_to_mini.csv", "manifest-aggregate.json"),
     )
-    report = aggregate_roi_dataset(
+    report = _run_stage(
+        aggregate_roi_dataset,
         AggregationSpec(
             roi_catchments=roi_catchments,
             roi_segments=roi_segments,
@@ -387,7 +426,8 @@ def terrain_products_command(
         ("hand.tif", "ltnd.tif", "manifest-terrain-products.json",
          *(("flow_direction.tif",) if write_flow_direction else ())),
     )
-    report = create_terrain_dataset(
+    report = _run_stage(
+        create_terrain_dataset,
         TerrainSpec(
             dem=dem,
             mini_ownership=cells,
@@ -413,12 +453,7 @@ def terrain_products_command(
     click.echo(f"Wrote {report.output_dir / 'manifest-terrain-products.json'}")
     click.echo(f"Processed {report.mini_count} complete minis")
     click.echo(f"Cells: {report.owned_cells} owned, {report.drainage_cells} drainage")
-    click.echo(
-        "Timing: "
-        + ", ".join(
-            f"{name} {seconds:.3f}s" for name, seconds in report.timings.items()
-        )
-    )
+    _echo_timings(report.timings)
     if report.negative_hand_cells:
         click.echo(
             f"Negative HAND: {report.negative_hand_cells} cells, "
@@ -509,7 +544,8 @@ def sample_minis_command(
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always", _SamplingNodataWarning)
         try:
-            report = sample_minibasins(
+            report = _run_stage(
+                sample_minibasins,
                 MiniSamplingSpec(
                     mini_catchments=mini_catchments,
                     mini_segments=mini_segments,

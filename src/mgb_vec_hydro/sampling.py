@@ -27,6 +27,7 @@ from mgb_vec_hydro.execution.executor import (
 )
 from mgb_vec_hydro.execution.manifest import write_manifest
 from mgb_vec_hydro.execution.memory import ArrowPacketStore, MemorySizing, raster_cache
+from mgb_vec_hydro.execution.progress import ProgressCallback, StageReporter
 from mgb_vec_hydro.execution.publication import AtomicOutputDirectory
 from mgb_vec_hydro.execution.raster import (
     AlignedRasterReader,
@@ -110,15 +111,20 @@ class _PacketResult:
     nodata: tuple[tuple[int, str, int, int], ...]
 
 
-def sample_minibasins(spec: MiniSamplingSpec) -> MiniSamplingReport:
+def sample_minibasins(
+    spec: MiniSamplingSpec, *, progress: ProgressCallback | None = None
+) -> MiniSamplingReport:
     """Sample canonical terrain and categorical cells with bounded block reuse."""
 
+    reporter = StageReporter(progress)
     sizing = MemorySizing(spec.memory_limit_mb * 1024**2, spec.workers)
     with raster_cache(sizing.coordinator_cache_bytes):
-        return _sample_minibasins(spec)
+        report = _sample_minibasins(spec, reporter)
+    reporter.finish(report.timings)
+    return report
 
 
-def _sample_minibasins(spec: MiniSamplingSpec) -> MiniSamplingReport:
+def _sample_minibasins(spec: MiniSamplingSpec, reporter: StageReporter) -> MiniSamplingReport:
     overall_started = time.perf_counter()
 
     planning_started = time.perf_counter()
@@ -162,6 +168,7 @@ def _sample_minibasins(spec: MiniSamplingSpec) -> MiniSamplingReport:
     planning_seconds = time.perf_counter() - planning_started
 
 
+    reporter.enter("processing", len(items))
     config = ExecutionConfig(
         workers=spec.workers,
         memory_limit_bytes=memory_bytes,
@@ -197,8 +204,10 @@ def _sample_minibasins(spec: MiniSamplingSpec) -> MiniSamplingReport:
             items,
             _sampling_worker,
             reduce_packet,
+            progress=reporter.execution_progress,
         )
 
+        reporter.enter("finalizing")
         failures = [
             message
             for diagnostics in execution.worker_diagnostics

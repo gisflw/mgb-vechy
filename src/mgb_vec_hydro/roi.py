@@ -28,6 +28,7 @@ from mgb_vec_hydro.exceptions import (
 from mgb_vec_hydro.execution.executor import ExecutionConfig, LocalExecutor, WorkItem
 from mgb_vec_hydro.execution.manifest import write_manifest
 from mgb_vec_hydro.execution.memory import ArrowPacketStore, MemorySizing
+from mgb_vec_hydro.execution.progress import ProgressCallback, StageReporter
 from mgb_vec_hydro.execution.publication import AtomicOutputDirectory
 from mgb_vec_hydro.execution.vector import (
     VectorProvider,
@@ -104,7 +105,17 @@ class _GeometryPacket:
     batch_size: int = 10_000
 
 
-def define_roi_dataset(spec: RoiSpec) -> RoiReport:
+def define_roi_dataset(
+    spec: RoiSpec, *, progress: ProgressCallback | None = None
+) -> RoiReport:
+    """Select and atomically publish an ROI, optionally reporting progress."""
+    reporter = StageReporter(progress)
+    report = _define_roi_dataset(spec, reporter)
+    reporter.finish(report.timings)
+    return report
+
+
+def _define_roi_dataset(spec: RoiSpec, reporter: StageReporter) -> RoiReport:
     """Select from raw providers and atomically publish a normalized ROI."""
     overall_started = time.perf_counter()
     _validate_spec(spec)
@@ -175,6 +186,7 @@ def define_roi_dataset(spec: RoiSpec) -> RoiReport:
                 metrics.setdefault(segment_id, {})[key] = float(value)
             store.put(result.ordinal, codec.encode(packet))
 
+        reporter.enter("processing", len(items))
         execution = LocalExecutor(
             ExecutionConfig(
                 workers=spec.workers,
@@ -182,7 +194,10 @@ def define_roi_dataset(spec: RoiSpec) -> RoiReport:
                 max_in_flight=2 * spec.workers,
                 io_slots=spec.io_slots,
             )
-        ).run(items, _process_geometry_packet, reduce_packet)
+        ).run(
+            items, _process_geometry_packet, reduce_packet,
+            progress=reporter.execution_progress,
+        )
         if set(metrics) != selected_ids or any(
             "unit_length" not in value or "unit_area" not in value
             for value in metrics.values()
@@ -197,6 +212,7 @@ def define_roi_dataset(spec: RoiSpec) -> RoiReport:
         water_course = _water_course_by_segment(metric_attributes)
         metrics_seconds = time.perf_counter() - phase_started
 
+        reporter.enter("finalizing")
         phase_started = time.perf_counter()
         catchments_path = staging / "roi_catchments.fgb"
         segments_path = staging / "roi_segments.fgb"

@@ -234,6 +234,9 @@ def test_sampling_pipeline_is_exact_block_reusing_and_atomic(tmp_path):
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
         report = sample_minibasins(spec)
+        phase_times = [report.timings[f"{phase}_wall"] for phase in ("preparing", "processing", "finalizing")]
+        assert all(seconds >= 0 for seconds in phase_times)
+        assert sum(phase_times) == pytest.approx(report.timings["total"])
     assert not caught  # Masked cells outside mini ownership are not findings.
 
     frame = pd.read_csv(report.sampled_minis)

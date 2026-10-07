@@ -84,7 +84,7 @@ def test_manifest_backed_directory_options_are_removed():
 def test_prepare_cli_forwards_dem_scale(tmp_path, monkeypatch, dem_scale):
     seen = []
 
-    def prepare(spec):
+    def prepare(spec, *, progress=None):
         seen.append(spec)
         return SimpleNamespace(files=(), raster_count=0, timings={}, output_dir=tmp_path / "out")
 
@@ -129,7 +129,7 @@ def test_output_confirmation_precedes_execution(tmp_path, monkeypatch, command, 
 
     calls = []
 
-    def run(spec):
+    def run(spec, *, progress=None):
         calls.append(spec.overwrite)
         raise RuntimeError("stage started")
 
@@ -183,7 +183,7 @@ def test_sample_cli_renders_one_clean_nodata_warning_and_lists_reports(
     )
     report_path = tmp_path / "out" / "nodata_hru.csv"
 
-    def sample(spec):
+    def sample(spec, *, progress=None):
         warnings.warn(message, _SamplingNodataWarning)
         warnings.warn("ordinary warning", UserWarning)
         return SimpleNamespace(
