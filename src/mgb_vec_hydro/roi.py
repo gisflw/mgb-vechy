@@ -154,7 +154,9 @@ def _define_roi_dataset(spec: RoiSpec, reporter: StageReporter) -> RoiReport:
         ArrowPacketStore(staging / ".packets", sizing.limit_bytes) as store,
     ):
         phase_started = time.perf_counter()
-        catchment_fids = _scan_fids(catchment_provider, spec.batch_size)
+        catchment_fids = _scan_fids(
+            catchment_provider, selected_ids, spec.batch_size
+        )
         missing = selected_ids - set(catchment_fids)
         if missing:
             raise InvalidInputSchemaError(
@@ -607,7 +609,9 @@ def _validate_selected_attributes(frame: pd.DataFrame) -> None:
         )
 
 
-def _scan_fids(provider: _Provider, batch_size: int) -> dict[Hashable, int]:
+def _scan_fids(
+    provider: _Provider, selected_ids: set[Hashable], batch_size: int
+) -> dict[Hashable, int]:
     result: dict[Hashable, int] = {}
     with pyogrio.open_arrow(
         provider.path,
@@ -629,6 +633,8 @@ def _scan_fids(provider: _Provider, batch_size: int) -> dict[Hashable, int]:
             )
             for segment_id, fid in values:
                 if pd.isna(segment_id):
+                    continue
+                if segment_id not in selected_ids:
                     continue
                 if segment_id in result:
                     raise InvalidInputSchemaError(

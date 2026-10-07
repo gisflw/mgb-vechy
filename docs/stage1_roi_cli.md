@@ -46,9 +46,9 @@ CRS remains the explicit `--crs` value.
 
 Topology attributes are streamed in bounded Arrow batches. Null, non-finite,
 and below-one Strahler rows are removed before traversal; selected values must
-then be integral. Null downstream IDs are sinks. Duplicate IDs, cycles,
-missing source pairs, incompatible CRS values, and invalid polygon/line
-geometries are rejected.
+then be integral. Null downstream IDs are sinks. Duplicate segment IDs and
+duplicate catchment IDs within the selected ROI, cycles, missing source pairs,
+incompatible CRS values, and invalid polygon/line geometries are rejected.
 
 The normalized output schema is:
 

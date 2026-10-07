@@ -4,7 +4,7 @@ from dataclasses import replace
 import pytest
 from shapely.geometry import LineString, Polygon
 
-from mgb_vec_hydro.exceptions import TopologyCycleError
+from mgb_vec_hydro.exceptions import InvalidInputSchemaError, TopologyCycleError
 from mgb_vec_hydro.execution.vector import (
     VectorTable,
     read_vector_table,
@@ -86,6 +86,54 @@ def test_roi_filters_strahler_before_selection(tmp_path):
     spec = _inputs(tmp_path, orders=(3, 0, 1))
     report = define_roi_dataset(spec)
     assert report.segment_count == 1
+
+
+def test_roi_ignores_duplicate_catchment_ids_outside_selected_ids(tmp_path):
+    spec = _inputs(tmp_path)
+    catchments = VectorTable.from_pydict(
+        {"SOURCE_ID": [1, 2, 3, -1, -1]},
+        [Polygon([(i, 0), (i + 1, 0), (i + 1, 1), (i, 1)]) for i in range(5)],
+        crs="EPSG:3857",
+        geometry_type="Polygon",
+    )
+    write_vector_table(catchments, spec.catchments, driver="GPKG")
+
+    report = define_roi_dataset(spec)
+
+    assert report.catchment_count == 3
+
+
+def test_roi_rejects_duplicate_selected_catchment_ids_across_batches(tmp_path):
+    spec = _inputs(tmp_path)
+    catchments = VectorTable.from_pydict(
+        {"SOURCE_ID": [1, 1, 2, 3]},
+        [Polygon([(i, 0), (i + 1, 0), (i + 1, 1), (i, 1)]) for i in range(4)],
+        crs="EPSG:3857",
+        geometry_type="Polygon",
+    )
+    write_vector_table(catchments, spec.catchments, driver="GPKG")
+
+    with pytest.raises(InvalidInputSchemaError, match="duplicate ID: 1"):
+        define_roi_dataset(spec)
+    assert not spec.output_dir.exists()
+
+
+def test_roi_rejects_missing_selected_catchment(tmp_path):
+    spec = _inputs(tmp_path)
+    catchments = VectorTable.from_pydict(
+        {"SOURCE_ID": [1, 3]},
+        [
+            Polygon([(0, 0), (1, 0), (1, 1), (0, 1)]),
+            Polygon([(2, 0), (3, 0), (3, 1), (2, 1)]),
+        ],
+        crs="EPSG:3857",
+        geometry_type="Polygon",
+    )
+    write_vector_table(catchments, spec.catchments, driver="GPKG")
+
+    with pytest.raises(InvalidInputSchemaError, match="Selected catchment ID"):
+        define_roi_dataset(spec)
+    assert not spec.output_dir.exists()
 
 
 def test_roi_rejects_selected_cycle_without_publishing(tmp_path):
