@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import shutil
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -11,7 +10,6 @@ import pandas as pd
 import pyarrow as pa
 import rasterio
 import shapely
-from pyarrow import ipc
 from pyproj import CRS, Transformer
 
 from mgb_vec_hydro.aggregation import AGGREGATION_COLUMNS
@@ -26,6 +24,7 @@ from mgb_vec_hydro.execution.executor import (
     WorkItem,
 )
 from mgb_vec_hydro.execution.manifest import write_manifest
+from mgb_vec_hydro.execution.memory import ArrowPacketStore, MemorySizing, raster_cache
 from mgb_vec_hydro.execution.publication import AtomicOutputDirectory
 from mgb_vec_hydro.execution.raster import (
     AlignedRasterReader,
@@ -43,7 +42,6 @@ from mgb_vec_hydro.execution.vector import (
 )
 from mgb_vec_hydro.preparation import BLOCK_SIZE, GridSpec, read_mini_index
 
-MAX_PACKET_UNITS = 8
 SAMPLING_BYTES_PER_CELL = 96
 TASK_FIXED_BYTES = 8 * 1024 * 1024
 
@@ -63,6 +61,7 @@ class MiniSamplingSpec:
     memory_limit_mb: int = 512
     io_slots: int = 2
     batch_size: int = 10_000
+    overwrite: bool = False
 
 
 @dataclass(frozen=True)
@@ -92,6 +91,7 @@ class _SamplingPayload:
     raster_assets: dict[str, Path]
     packet: RasterBlockPacket
     minis: tuple[_MiniMetadata, ...]
+    gdal_cache_bytes: int
 
 
 @dataclass(frozen=True)
@@ -103,6 +103,12 @@ class _PacketResult:
 def sample_minibasins(spec: MiniSamplingSpec) -> MiniSamplingReport:
     """Sample canonical terrain and categorical cells with bounded block reuse."""
 
+    sizing = MemorySizing(spec.memory_limit_mb * 1024**2, spec.workers)
+    with raster_cache(sizing.coordinator_cache_bytes):
+        return _sample_minibasins(spec)
+
+
+def _sample_minibasins(spec: MiniSamplingSpec) -> MiniSamplingReport:
     overall_started = time.perf_counter()
 
     planning_started = time.perf_counter()
@@ -117,14 +123,15 @@ def sample_minibasins(spec: MiniSamplingSpec) -> MiniSamplingReport:
     }
     _validate_sampling_rasters(raster_assets, grid)
     metadata, units = _plan_sampling(spec, grid)
-    memory_bytes = spec.memory_limit_mb * 1024 * 1024
+    sizing = MemorySizing(spec.memory_limit_mb * 1024**2, spec.workers)
+    memory_bytes = sizing.limit_bytes
     packets = packet_raster_units_by_block(
         grid,
         units,
         memory_limit_bytes=memory_bytes,
         bytes_per_cell=SAMPLING_BYTES_PER_CELL,
         fixed_bytes=TASK_FIXED_BYTES,
-        max_units=MAX_PACKET_UNITS,
+        target_bytes=sizing.packet_bytes,
     )
     metadata_by_key = {f"mini-{value.mini_id:010d}": value for value in metadata.values()}
     items = [
@@ -137,6 +144,7 @@ def sample_minibasins(spec: MiniSamplingSpec) -> MiniSamplingReport:
                 raster_assets,
                 packet,
                 tuple(metadata_by_key[unit.key] for unit in packet.units),
+                sizing.worker_cache_bytes,
             ),
         )
         for ordinal, packet in enumerate(packets)
@@ -147,19 +155,20 @@ def sample_minibasins(spec: MiniSamplingSpec) -> MiniSamplingReport:
     config = ExecutionConfig(
         workers=spec.workers,
         memory_limit_bytes=memory_bytes,
-        max_in_flight=spec.workers,
+        max_in_flight=2 * spec.workers,
         io_slots=spec.io_slots,
     )
-    publisher = AtomicOutputDirectory(spec.output_dir)
+    publisher = AtomicOutputDirectory(spec.output_dir, overwrite=spec.overwrite)
     classes: set[int] = set()
     catchment_cells = 0
     reach_cells = 0
     csv_seconds = 0.0
     publication_started = time.perf_counter()
 
-    with publisher as staging:
-        packet_root = staging / ".sampling-packets"
-        packet_root.mkdir()
+    with (
+        publisher as staging,
+        ArrowPacketStore(staging / ".sampling-packets", sizing.limit_bytes) as store,
+    ):
 
         def reduce_packet(result):
             nonlocal catchment_cells, reach_cells
@@ -169,12 +178,7 @@ def sample_minibasins(spec: MiniSamplingSpec) -> MiniSamplingReport:
             catchment_cells += sum(int(row["_catchment_cells"]) for row in value.rows)
             reach_cells += sum(int(row["_reach_cells"]) for row in value.rows)
             table = pa.Table.from_pylist(list(value.rows))
-            path = packet_root / f"{result.ordinal:012d}.arrow"
-            with (
-                path.open("wb") as stream,
-                ipc.new_file(stream, table.schema) as writer,
-            ):
-                writer.write_table(table)
+            store.put(result.ordinal, table)
             return {"packet_staging": time.perf_counter() - started}
 
         execution = LocalExecutor(config).run(
@@ -186,9 +190,9 @@ def sample_minibasins(spec: MiniSamplingSpec) -> MiniSamplingReport:
         csv_started = time.perf_counter()
         class_ids = tuple(sorted(classes))
         output = staging / "sampled_minis.csv"
-        _assemble_csv(packet_root, output, class_ids)
+        _assemble_csv(store, output, class_ids)
         csv_seconds = time.perf_counter() - csv_started
-        shutil.rmtree(packet_root)
+        store.close()
         if execution.reduced != len(items) or not output.is_file():
             raise MiniSamplingError("Sampling output is incomplete")
         manifest = write_manifest(staging, "sample-minis", spec)
@@ -389,6 +393,13 @@ def _equal_values(left: Any, right: Any) -> bool:
 
 
 def _sampling_worker(
+    payload: _SamplingPayload, context: WorkerContext
+) -> WorkerOutput[_PacketResult]:
+    with raster_cache(payload.gdal_cache_bytes):
+        return _sampling_worker_with_cache(payload, context)
+
+
+def _sampling_worker_with_cache(
     payload: _SamplingPayload, context: WorkerContext
 ) -> WorkerOutput[_PacketResult]:
     rasters = context.resources.get(
@@ -628,7 +639,7 @@ def _validate_row(row: dict[str, Any]) -> None:
             )
 
 
-def _assemble_csv(packet_root: Path, output: Path, classes: tuple[int, ...]) -> None:
+def _assemble_csv(store: ArrowPacketStore, output: Path, classes: tuple[int, ...]) -> None:
     if not classes:
         raise MiniSamplingError("Sampled mini domain contains no valid HRU classes")
     first = True
@@ -646,12 +657,11 @@ def _assemble_csv(packet_root: Path, output: Path, classes: tuple[int, ...]) -> 
         + percentage_columns
         + [f"flooded_area_{stage}" for stage in range(1, 101)]
     )
-    paths = sorted(packet_root.glob("*.arrow"))
-    if not paths:
+    keys = sorted(store.keys)
+    if not keys:
         raise MiniSamplingError("Sampling produced no packet results")
-    for path in paths:
-        with path.open("rb") as stream:
-            frame = ipc.open_file(stream).read_all().to_pandas()
+    for key in keys:
+        frame = store.pop(key).to_pandas()
         denominators = frame["_catchment_cells"].to_numpy(dtype=float)
         if np.any(denominators <= 0):
             raise MiniSamplingError("Sampling produced an empty catchment")

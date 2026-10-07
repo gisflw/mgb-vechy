@@ -106,3 +106,61 @@ def test_agree_cli_defaults_are_unchanged():
     assert defaults["agree_sharp"] == 80.0
     assert defaults["agree_smooth"] == 8.0
     assert defaults["agree_buffer"] == 4
+
+
+@pytest.mark.parametrize("command,function,output_name,extra", [
+    ("define-roi", "define_roi_dataset", "roi_segments.fgb", []),
+    ("aggregate", "aggregate_roi_dataset", "source_to_mini.csv", []),
+    ("prepare", "prepare_dataset", "dem.tif", []),
+    ("prepare", "prepare_dataset", "hru.tif", ["--categorical-raster", "hru"]),
+    ("prepare", "prepare_dataset", "d8.tif", ["--d8"]),
+    ("terrain-products", "create_terrain_dataset", "hand.tif", []),
+    ("terrain-products", "create_terrain_dataset", "flow_direction.tif", ["--write-flow-direction"]),
+    ("sample-minis", "sample_minibasins", "sampled_minis.csv", []),
+    ("sample-minis", "sample_minibasins", "manifest-sample-minis.json", []),
+])
+def test_output_confirmation_precedes_execution(tmp_path, monkeypatch, command, function, output_name, extra):
+    import click
+
+    calls = []
+
+    def run(spec):
+        calls.append(spec.overwrite)
+        raise RuntimeError("stage started")
+
+    monkeypatch.setattr(f"mgb_vec_hydro.cli.{function}", run)
+    source = tmp_path / "input"
+    source.touch()
+    output = tmp_path / "output"
+    output.mkdir()
+    unrelated = output / "other-stage.txt"
+    unrelated.write_text("keep")
+    args = [command, "--output-dir", str(output)]
+    values = {"crs": "EPSG:3857", "uparea_min": "1", "lmin": "1"}
+    for param in main.commands[command].params:
+        if param.required and param.name != "output_dir":
+            value = str(source) if isinstance(param.type, click.Path) else values.get(param.name, "id")
+            args.extend([param.opts[0], value])
+    args.extend(extra)
+    if extra and extra[-1] != "--write-flow-direction":
+        args.append(str(source))
+
+    runner = CliRunner()
+    result = runner.invoke(main, args)
+    assert str(result.exception) == "stage started"
+    assert calls == [False]
+    assert "Replace existing" not in result.output
+    calls.clear()
+    existing = output / output_name
+    existing.write_text("old")
+    for answer in ("n\n", ""):
+        result = runner.invoke(main, args, input=answer)
+        assert result.exit_code != 0
+        assert calls == []
+        assert existing.read_text() == "old"
+    result = runner.invoke(main, args, input="y\n")
+    assert str(result.exception) == "stage started"
+    assert calls == [True]
+    assert str(existing) in result.output
+    assert str(unrelated) not in result.output
+    assert unrelated.read_text() == "keep"

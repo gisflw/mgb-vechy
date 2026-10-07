@@ -31,7 +31,7 @@ mgb-vec-hydro terrain-products \
 | `--agree-smooth` | Optional | Non-negative number; default `8.0` | AGREE ramp depth per pixel toward the stream in DEM mode. |
 | `--agree-buffer` | Optional | Non-negative integer pixels; default `4` | AGREE conditioning radius around the stream in DEM mode. |
 | `--workers` | Optional | Positive integer; default `4` | Number of worker processes used for bounded terrain work. There is no upper limit imposed by the CLI or stage validator. |
-| `--memory-limit-mb` | Optional | Positive integer MB; default `512` | Admitted memory budget used to size terrain packets. |
+| `--memory-limit-mb` | Optional | Positive integer MB; default `512` | Soft memory sizing hint for terrain packets and working storage. |
 | `--io-slots` | Optional | Positive integer; default `2` | Maximum number of concurrent raster reads. |
 
 Click also provides `--help` to display the command’s generated option list.
@@ -39,9 +39,11 @@ Click also provides `--help` to display the command’s generated option list.
 `--direction-source` is `dem` by default or `d8`. D8 mode requires an explicit
 `--d8` raster containing canonical clockwise codes. Use
 `--write-flow-direction` to publish the directions selected by the run.
-Execution defaults are four workers, 512 MB of admitted task memory, and two I/O
-slots, with at most eight complete minis per packet. Worker counts may be any
-positive integer.
+Execution defaults are four workers, 512 MB as a soft memory hint, and two I/O
+slots. Packets target the memory hint divided by twice the worker count,
+with no fixed mini-count cap. A complete mini above the target gets its own
+packet if it fits the hint; otherwise processing raises `WorkMemoryError`.
+Worker counts may be any positive integer.
 
 Terrain reads mini IDs and bounds from the `mini_index` JSON tag in
 `cells.tif`. It does not read mini vectors or regenerate cells and drainage.
@@ -94,3 +96,8 @@ and **4** buffer pixels. The two depth parameters operate in normalized DEM
 units (metres); they are not automatically rescaled by `--dem-scale`.
 
 `compute_ltnd(..., crs=...)` requires an explicit CRS and returns metres.
+
+`--memory-limit-mb` is a soft sizing hint for task packets and retained
+intermediates, without separate quotas. Workers and a small queue bound
+concurrency; library caches have explicit sizes. Actual RSS can exceed the
+hint. See [shared memory sizing](shared_execution.md#local-execution).

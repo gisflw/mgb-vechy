@@ -102,3 +102,25 @@ def test_roi_manifest_failure_cleans_staging(tmp_path, monkeypatch):
     with pytest.raises(OSError, match="manifest write failed"):
         define_roi_dataset(spec)
     assert not spec.output_dir.exists()
+
+
+def test_roi_selects_more_than_ogrsql_fid_limit(tmp_path):
+    count = 5000
+    segments = VectorTable.from_pydict(
+        {"id": range(count), "id_down": [None] + list(range(count - 1)), "strahler_order": [1] * count},
+        [LineString([(i, 0), (i + 1, 0)]) for i in range(count)],
+        crs="EPSG:3857", geometry_type="LineString",
+    )
+    catchments = VectorTable.from_pydict(
+        {"id": range(count)},
+        [Polygon([(i, 0), (i + 1, 0), (i + 1, 1), (i, 1)]) for i in range(count)],
+        crs="EPSG:3857", geometry_type="Polygon",
+    )
+    write_vector_table(segments, tmp_path / "segments.fgb", driver="FlatGeobuf")
+    write_vector_table(catchments, tmp_path / "catchments.fgb", driver="FlatGeobuf")
+    report = define_roi_dataset(RoiSpec(
+        crs="EPSG:3857", catchments=tmp_path / "catchments.fgb", segments=tmp_path / "segments.fgb",
+        outlet_ids=(0,), id_col="id", id_down_col="id_down", strahler_order_col="strahler_order", output_dir=tmp_path / "roi", workers=1,
+    ))
+    assert report.segment_count == count
+    assert set(read_vector_table(report.segments).table["id"].to_pylist()) == set(range(count))

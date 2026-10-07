@@ -18,7 +18,6 @@ import shapely
 from numba import njit
 from pyproj import CRS
 from rasterio.enums import MaskFlags, MergeAlg, Resampling
-from rasterio.env import get_gdal_config, set_gdal_config
 from rasterio.features import rasterize
 from rasterio.transform import Affine
 from rasterio.windows import Window, from_bounds
@@ -33,6 +32,7 @@ from mgb_vec_hydro.execution.executor import (
     WorkItem,
 )
 from mgb_vec_hydro.execution.manifest import write_manifest
+from mgb_vec_hydro.execution.memory import MemorySizing, raster_cache
 from mgb_vec_hydro.execution.publication import AtomicOutputDirectory
 from mgb_vec_hydro.execution.vector import read_vector_table
 
@@ -65,6 +65,7 @@ class PreparationSpec:
     memory_limit_mb: int = 512
     io_slots: int = 2
     dem_scale: float = 1.0
+    overwrite: bool = False
 
 
 @dataclass(frozen=True)
@@ -149,13 +150,9 @@ class _PreparationBlockResult:
 
 def prepare_dataset(spec: PreparationSpec) -> PreparationReport:
     """Create a prepared dataset with a bounded GDAL block cache."""
-    previous = get_gdal_config("GDAL_CACHEMAX")
-    cache_bytes = _gdal_cache_bytes(spec.memory_limit_mb * 1024 * 1024, 1)
-    set_gdal_config("GDAL_CACHEMAX", cache_bytes)
-    try:
+    sizing = MemorySizing(spec.memory_limit_mb * 1024**2, spec.workers)
+    with raster_cache(sizing.coordinator_cache_bytes):
         return _prepare_dataset(spec)
-    finally:
-        set_gdal_config("GDAL_CACHEMAX", previous)
 
 
 def _prepare_dataset(spec: PreparationSpec) -> PreparationReport:
@@ -163,8 +160,6 @@ def _prepare_dataset(spec: PreparationSpec) -> PreparationReport:
     overall_started = time.perf_counter()
     _validate_spec(spec)
     output = Path(spec.output_dir)
-    if output.exists():
-        raise PreparedDataError(f"Output directory already exists: {output}")
     phase_started = time.perf_counter()
     mini_catchment_vector, mini_segment_vector = _read_mini_inputs(
         Path(spec.mini_catchments), Path(spec.mini_segments)
@@ -219,11 +214,12 @@ def _prepare_dataset(spec: PreparationSpec) -> PreparationReport:
     raster_kinds = {item.name: item.kind for item in rasters}
     catchment_index = shapely.STRtree(catchments)
     segment_index = shapely.STRtree(segments)
-    memory_bytes = spec.memory_limit_mb * 1024 * 1024
+    sizing = MemorySizing(spec.memory_limit_mb * 1024**2, spec.workers)
+    memory_bytes = sizing.limit_bytes
     config = ExecutionConfig(
         workers=spec.workers,
         memory_limit_bytes=memory_bytes,
-        max_in_flight=spec.workers,
+        max_in_flight=2 * spec.workers,
         io_slots=spec.io_slots,
         resource_cache_size=max(8, len(rasters)),
     )
@@ -239,12 +235,13 @@ def _prepare_dataset(spec: PreparationSpec) -> PreparationReport:
         memory_bytes,
         spec.workers,
         dem_scale=spec.dem_scale,
+        gdal_cache_bytes=sizing.worker_cache_bytes,
     )
     planning_seconds = time.perf_counter() - phase_started
 
     execution = ExecutionReport(0, 0, 0, 0, 0, 0.0, {}, ())
     correction_seconds = compression_seconds = 0.0
-    publisher = AtomicOutputDirectory(output)
+    publisher = AtomicOutputDirectory(output, overwrite=spec.overwrite)
     with publisher as staging:
         correction_root = staging / ".ownership-corrections"
         correction_root.mkdir()
@@ -256,6 +253,9 @@ def _prepare_dataset(spec: PreparationSpec) -> PreparationReport:
             )
 
             product_specs = [
+                RasterProductSpec("cells", "int32"),
+                RasterProductSpec("drainage", "uint8"),
+            ] + [
                 RasterProductSpec(
                     item.name,
                     _prepared_dtype(item.kind),
@@ -265,15 +265,13 @@ def _prepare_dataset(spec: PreparationSpec) -> PreparationReport:
                     {"units": "m", "dem_scale": spec.dem_scale}
                     if item.name == "dem" else {},
                 )
-                for item in rasters
-            ] + [
-                RasterProductSpec("cells", "int32"),
-                RasterProductSpec("drainage", "uint8"),
+                for item in sorted(rasters, key=lambda item: item.name)
             ]
             with RasterAssembler(
                 staging,
                 grid,
                 product_specs,
+                scratch_memory_bytes=sizing.limit_bytes,
                 working_compression=None,
                 compression_threads=min(spec.workers, 4),
             ) as assembler:
@@ -404,6 +402,7 @@ def _preparation_work_items(
     workers: int,
     *,
     dem_scale: float = 1.0,
+    gdal_cache_bytes: int | None = None,
 ):
     from mgb_vec_hydro.execution.raster import plan_raster_blocks
 
@@ -411,7 +410,8 @@ def _preparation_work_items(
         np.dtype(_prepared_dtype(item.kind)).itemsize + 1 for item in rasters
     )
     max_source_itemsize = max(item.source_itemsize for item in rasters)
-    gdal_cache_bytes = _gdal_cache_bytes(memory_limit_bytes, workers)
+    if gdal_cache_bytes is None:
+        gdal_cache_bytes = MemorySizing(memory_limit_bytes, workers).worker_cache_bytes
 
     def items():
         for ordinal, window in enumerate(plan_raster_blocks(grid)):
@@ -458,12 +458,8 @@ def _preparation_work_items(
 def _prepare_block_worker(
     payload: _PreparationBlockPayload, context: WorkerContext
 ) -> WorkerOutput[_PreparationBlockResult]:
-    previous = get_gdal_config("GDAL_CACHEMAX")
-    set_gdal_config("GDAL_CACHEMAX", payload.gdal_cache_bytes)
-    try:
+    with raster_cache(payload.gdal_cache_bytes):
         return _prepare_block_worker_with_cache(payload, context)
-    finally:
-        set_gdal_config("GDAL_CACHEMAX", previous)
 
 
 def _prepare_block_worker_with_cache(
@@ -643,13 +639,6 @@ def _ownership_index(assembler, grid: GridSpec, mini_count: int):
     return records
 
 
-def _gdal_cache_bytes(memory_limit_bytes: int, workers: int) -> int:
-    return min(
-        64 * 1024 * 1024,
-        max(8 * 1024 * 1024, memory_limit_bytes // max(8, workers * 8)),
-    )
-
-
 def _validate_spec(spec: PreparationSpec) -> None:
     if (
         isinstance(spec.dem_scale, bool)
@@ -658,7 +647,6 @@ def _validate_spec(spec: PreparationSpec) -> None:
         or spec.dem_scale <= 0
     ):
         raise PreparedDataError("DEM scale must be a finite positive number")
-    names: set[str] = set()
     if (spec.d8 is None) != (spec.d8_encoding is None):
         raise PreparedDataError("--d8 and --d8-encoding must be supplied together")
     if spec.d8_encoding not in {None, "canonical", "esri"}:

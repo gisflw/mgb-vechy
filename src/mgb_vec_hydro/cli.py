@@ -21,6 +21,17 @@ _NAMED_RASTER = click.Tuple(
 )
 
 
+def _confirm_replacement(output_dir: Path, names: tuple[str, ...]) -> bool:
+    existing = [output_dir / name for name in names if (output_dir / name).exists()]
+    if existing:
+        click.confirm(
+            "Replace existing output files?\n" + "\n".join(str(path) for path in existing),
+            default=False,
+            abort=True,
+        )
+    return bool(existing)
+
+
 def _echo_timings(timings: dict[str, float]) -> None:
     click.echo(
         "Timing: "
@@ -96,6 +107,12 @@ def prepare_command(
         [NamedRaster(name, path, "continuous") for name, path in continuous_raster]
         + [NamedRaster(name, path, "categorical") for name, path in categorical_raster]
     )
+    overwrite = _confirm_replacement(
+        output_dir,
+        ("dem.tif", "cells.tif", "drainage.tif", "manifest-prepare.json",
+         *(f"{raster.name}.tif" for raster in rasters),
+         *(("d8.tif",) if d8 is not None else ())),
+    )
     report = prepare_dataset(
         PreparationSpec(
             dem=dem,
@@ -109,6 +126,7 @@ def prepare_command(
             memory_limit_mb=memory_limit_mb,
             io_slots=io_slots,
             output_dir=output_dir,
+            overwrite=overwrite,
         )
     )
     for path in report.files:
@@ -179,6 +197,10 @@ def define_roi_command(
 ) -> None:
     """Select and normalize an ROI from raw vector providers."""
 
+    overwrite = _confirm_replacement(
+        output_dir,
+        ("roi_catchments.fgb", "roi_segments.fgb", "manifest-define-roi.json"),
+    )
     report = define_roi_dataset(
         RoiSpec(
             crs=crs,
@@ -193,6 +215,7 @@ def define_roi_command(
             id_down_col=id_down_col,
             strahler_order_col=strahler_order_col,
             output_dir=output_dir,
+            overwrite=overwrite,
             workers=workers,
             memory_limit_mb=memory_limit_mb,
             io_slots=io_slots,
@@ -248,6 +271,10 @@ def aggregate_command(
 ) -> None:
     """Aggregate explicit ROI files into mini-basins."""
 
+    overwrite = _confirm_replacement(
+        output_dir,
+        ("mini_catchments.fgb", "mini_segments.fgb", "source_to_mini.csv", "manifest-aggregate.json"),
+    )
     report = aggregate_roi_dataset(
         AggregationSpec(
             roi_catchments=roi_catchments,
@@ -255,6 +282,7 @@ def aggregate_command(
             uparea_min=uparea_min,
             lmin=lmin,
             output_dir=output_dir,
+            overwrite=overwrite,
             workers=workers,
             memory_limit_mb=memory_limit_mb,
             io_slots=io_slots,
@@ -347,6 +375,11 @@ def terrain_products_command(
 ) -> None:
     """Generate flat bounded terrain COG files from explicit inputs."""
 
+    overwrite = _confirm_replacement(
+        output_dir,
+        ("hand.tif", "ltnd.tif", "manifest-terrain-products.json",
+         *(("flow_direction.tif",) if write_flow_direction else ())),
+    )
     report = create_terrain_dataset(
         TerrainSpec(
             dem=dem,
@@ -354,6 +387,7 @@ def terrain_products_command(
             drainage=drainage,
             d8=d8,
             output_dir=output_dir,
+            overwrite=overwrite,
             direction_source=direction_source.lower(),
             write_flow_direction=write_flow_direction,
             agree_sharp=agree_sharp,
@@ -457,6 +491,10 @@ def sample_minis_command(
     batch_size: int,
 ) -> None:
     """Sample explicit canonical rasters and mini vectors into one CSV."""
+    overwrite = _confirm_replacement(
+        output_dir,
+        ("sampled_minis.csv", "manifest-sample-minis.json"),
+    )
     report = sample_minibasins(
         MiniSamplingSpec(
             mini_catchments=mini_catchments,
@@ -468,6 +506,7 @@ def sample_minis_command(
             ltnd=ltnd,
             hru=hru,
             output_dir=output_dir,
+            overwrite=overwrite,
             workers=workers,
             memory_limit_mb=memory_limit_mb,
             io_slots=io_slots,

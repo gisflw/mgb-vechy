@@ -12,6 +12,7 @@ import numpy as np
 import rasterio
 from pyproj import CRS
 from rasterio.enums import MaskFlags, Resampling
+from rasterio.io import MemoryFile
 from rasterio.shutil import copy as copy_raster
 from rasterio.windows import Window, from_bounds
 
@@ -172,11 +173,17 @@ def packet_raster_units(
     *,
     memory_limit_bytes: int,
     max_units: int | None = None,
+    target_bytes: int | None = None,
 ) -> tuple[RasterPacket, ...]:
     """Packet adjacent complete units without exceeding declared result memory."""
 
-    if memory_limit_bytes <= 0 or (max_units is not None and max_units <= 0):
+    if (
+        memory_limit_bytes <= 0
+        or (target_bytes is not None and target_bytes <= 0)
+        or (max_units is not None and max_units <= 0)
+    ):
         raise RasterGridError("Raster packet limits must be positive")
+    target_bytes = min(memory_limit_bytes, target_bytes or memory_limit_bytes)
     packets: list[RasterPacket] = []
     current: list[RasterUnit] = []
     current_bytes = 0
@@ -189,7 +196,7 @@ def packet_raster_units(
             )
         full = max_units is not None and len(current) >= max_units
         if current and (
-            full or current_bytes + unit.estimated_bytes > memory_limit_bytes
+            full or current_bytes + unit.estimated_bytes > target_bytes
         ):
             packets.append(_packet(current, current_bytes))
             current, current_bytes = [], 0
@@ -208,6 +215,7 @@ def packet_raster_units_by_block(
     bytes_per_cell: int,
     fixed_bytes: int = 0,
     max_units: int | None = None,
+    target_bytes: int | None = None,
     block_size: int = BLOCK_SIZE,
 ) -> tuple[RasterBlockPacket, ...]:
     """Packet units while charging each shared canonical block only once."""
@@ -217,10 +225,12 @@ def packet_raster_units_by_block(
         or bytes_per_cell <= 0
         or fixed_bytes < 0
         or block_size <= 0
+        or (target_bytes is not None and target_bytes <= 0)
         or (max_units is not None and max_units <= 0)
     ):
         raise RasterGridError("Raster block-packet limits must be positive")
 
+    target_bytes = min(memory_limit_bytes, target_bytes or memory_limit_bytes)
     ordered = tuple(sorted(units, key=lambda value: (value.spatial_key, value.key)))
     packets: list[RasterBlockPacket] = []
     current: list[RasterUnit] = []
@@ -276,7 +286,7 @@ def packet_raster_units_by_block(
         combined = current_blocks | unit_blocks
         combined_estimate = estimate(combined)
         full = max_units is not None and len(current) >= max_units
-        if current and (full or combined_estimate > memory_limit_bytes):
+        if current and (full or combined_estimate > target_bytes):
             emit()
             current = []
             current_blocks = set()
@@ -375,6 +385,7 @@ class RasterAssembler:
         *,
         block_size: int = BLOCK_SIZE,
         compression_threads: int = 1,
+        scratch_memory_bytes: int = 0,
         working_compression: str | None = "DEFLATE",
     ):
         self.root = Path(staging_dir)
@@ -407,7 +418,16 @@ class RasterAssembler:
             or compression_threads <= 0
         ):
             raise RasterGridError("Raster compression threads must be positive")
+        if (
+            isinstance(scratch_memory_bytes, bool)
+            or not isinstance(scratch_memory_bytes, int)
+            or scratch_memory_bytes < 0
+        ):
+            raise RasterGridError("Raster scratch memory must be non-negative")
         self.root.mkdir(parents=True, exist_ok=True)
+        self._memory_files: dict[str, MemoryFile] = {}
+        self._working_paths: set[Path] = set()
+        self.reserved_scratch_bytes = 0
         self._sources: dict[str, Any] = {}
         self._mask_initialized: set[str] = set()
         self._exclusive_blocks: dict[str, set[tuple[int, int]]] = {
@@ -432,9 +452,19 @@ class RasterAssembler:
                     "nodata": None,
                     "BIGTIFF": "IF_SAFER",
                 }
-                if working_compression is not None:
-                    options["compress"] = working_compression
-                source = rasterio.open(path, "w+", **options)
+                estimate = math.ceil(
+                    1.25 * grid.width * grid.height * (np.dtype(spec.dtype).itemsize + 1)
+                ) + 8 * 1024**2
+                if self.reserved_scratch_bytes + estimate <= scratch_memory_bytes:
+                    memory = MemoryFile()
+                    self._memory_files[spec.name] = memory
+                    source = memory.open(**options)
+                    self.reserved_scratch_bytes += estimate
+                else:
+                    self._working_paths.add(path)
+                    if working_compression is not None:
+                        options["compress"] = working_compression
+                    source = rasterio.open(path, "w+", **options)
                 self._sources[spec.name] = source
         except Exception:
             self.close()
@@ -466,9 +496,10 @@ class RasterAssembler:
         existing = source.read(1, window=patch.window)
         existing[valid] = data.astype(source.dtypes[0], copy=False)[valid]
         source.write(existing, 1, window=patch.window)
-        source.write_mask(
-            ((existing_valid | valid) * 255).astype("uint8"), window=patch.window
-        )
+        with rasterio.Env(GDAL_TIFF_INTERNAL_MASK=True):
+            source.write_mask(
+                ((existing_valid | valid) * 255).astype("uint8"), window=patch.window
+            )
         self._mask_initialized.add(patch.product)
         self._nonexclusive_products.add(patch.product)
 
@@ -510,7 +541,8 @@ class RasterAssembler:
             )
         source = self._sources[patch.product]
         source.write(data.astype(source.dtypes[0], copy=False), 1, window=patch.window)
-        source.write_mask((valid * 255).astype("uint8"), window=patch.window)
+        with rasterio.Env(GDAL_TIFF_INTERNAL_MASK=True):
+            source.write_mask((valid * 255).astype("uint8"), window=patch.window)
         self._exclusive_blocks[patch.product].add(key)
         self._mask_initialized.add(patch.product)
 
@@ -537,7 +569,8 @@ class RasterAssembler:
             raise RasterGridError("Raster patch arrays do not match their window")
         source = self._sources[patch.product]
         source.write(data.astype(source.dtypes[0], copy=False), 1, window=patch.window)
-        source.write_mask((valid * 255).astype("uint8"), window=patch.window)
+        with rasterio.Env(GDAL_TIFF_INTERNAL_MASK=True):
+            source.write_mask((valid * 255).astype("uint8"), window=patch.window)
         self._mask_initialized.add(patch.product)
         self._nonexclusive_products.add(patch.product)
 
@@ -545,43 +578,43 @@ class RasterAssembler:
         if self._finished:
             raise RasterGridError("Raster assembler is already finalized")
         self._finished = True
-        working = {}
-        for name, source in self._sources.items():
-            if self.specs[name].tags:
-                source.update_tags(**self.specs[name].tags)
-                if units := self.specs[name].tags.get("units"):
-                    source.set_band_unit(1, units)
-            working[name] = Path(source.name)
-            source.close()
-        self._sources.clear()
         outputs = {}
         try:
+            working = {}
+            for name, source in self._sources.items():
+                if self.specs[name].tags:
+                    source.update_tags(**self.specs[name].tags)
+                    if units := self.specs[name].tags.get("units"):
+                        source.set_band_unit(1, units)
+                working[name] = source.name
+                source.close()
+            self._sources.clear()
             with rasterio.Env(GDAL_TIFF_INTERNAL_MASK=True):
                 for name, spec in self.specs.items():
                     output = self.root / f"{name}.tif"
                     copy_raster(
-                        working[name],
-                        output,
-                        driver="COG",
-                        BLOCKSIZE=self.block_size,
-                        COMPRESS="DEFLATE",
-                        BIGTIFF="IF_SAFER",
+                        working[name], output, driver="COG", BLOCKSIZE=self.block_size,
+                        COMPRESS="DEFLATE", BIGTIFF="IF_SAFER",
                         NUM_THREADS=str(self.compression_threads),
                         RESAMPLING=spec.overview_resampling.name.upper(),
                         OVERVIEW_RESAMPLING=spec.overview_resampling.name.upper(),
                     )
                     outputs[name] = output
+            return outputs
         finally:
-            for path in working.values():
-                path.unlink(missing_ok=True)
-        return outputs
+            self.close()
 
     def close(self) -> None:
         for source in self._sources.values():
-            path = Path(source.name)
             source.close()
-            path.unlink(missing_ok=True)
         self._sources.clear()
+        for memory in self._memory_files.values():
+            memory.close()
+        self._memory_files.clear()
+        for path in self._working_paths:
+            path.unlink(missing_ok=True)
+        self._working_paths.clear()
+        self.reserved_scratch_bytes = 0
         self._mask_initialized.clear()
         self._exclusive_blocks.clear()
         self._nonexclusive_products.clear()

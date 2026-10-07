@@ -90,7 +90,7 @@ class VectorTablePacketCodec:
 
     suffix = ".arrow"
 
-    def dump(self, value: VectorTable, path: Path) -> None:
+    def encode(self, value: VectorTable) -> pa.Table:
         metadata = dict(value.table.schema.metadata or {})
         metadata.update(
             {
@@ -101,13 +101,19 @@ class VectorTablePacketCodec:
                 b"mgb:geometry_type": value.geometry_type.encode(),
             }
         )
-        table = value.table.replace_schema_metadata(metadata)
+        return value.table.replace_schema_metadata(metadata)
+
+    def dump(self, value: VectorTable, path: Path) -> None:
+        table = self.encode(value)
         with path.open("wb") as stream, ipc.new_file(stream, table.schema) as writer:
             writer.write_table(table)
 
     def load(self, path: Path) -> VectorTable:
         with path.open("rb") as stream:
             table = ipc.open_file(stream).read_all()
+        return self.decode(table)
+
+    def decode(self, table: pa.Table) -> VectorTable:
         metadata = table.schema.metadata
         crs = CRS.from_wkt(metadata[b"mgb:crs_wkt"].decode())
         geometry_column = metadata[b"mgb:geometry_column"].decode()
@@ -257,12 +263,13 @@ def iter_provider_batches(
     if batch_size <= 0:
         raise InvalidInputSchemaError("Vector batch size must be positive")
     selected_fids = list(fids) if fids is not None else None
+    request_limit = len(selected_fids or ()) or 1 if provider.driver == "GPKG" else MAX_OGRSQL_ARROW_FIDS
     fid_chunks = (
         (None,)
         if selected_fids is None
         else (
-            selected_fids[offset : offset + MAX_OGRSQL_ARROW_FIDS]
-            for offset in range(0, len(selected_fids), MAX_OGRSQL_ARROW_FIDS)
+            selected_fids[offset : offset + request_limit]
+            for offset in range(0, len(selected_fids), request_limit)
         )
     )
     for fid_chunk in fid_chunks:

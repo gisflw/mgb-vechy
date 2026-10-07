@@ -398,7 +398,9 @@ def test_cell_area_calculation_handles_geographic_rows_and_projected_cells():
 
 
 def test_sampling_serial_and_parallel_runs_are_byte_deterministic(tmp_path, monkeypatch):
-    monkeypatch.setattr("mgb_vec_hydro.sampling.MAX_PACKET_UNITS", 1)
+    from mgb_vec_hydro.execution.memory import MemorySizing
+
+    monkeypatch.setattr(MemorySizing, "packet_bytes", property(lambda self: 1))
     minis, prepared, terrain = _sampling_inputs(tmp_path)
     paths = []
     for name, workers in (("serial", 1), ("parallel", 2)):

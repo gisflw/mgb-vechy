@@ -10,7 +10,8 @@ The implemented workflow selects raw vectors into a region of interest, aggregat
 source units into mini-basins, prepares aligned raster and mini-domain inputs,
 generates HAND and local terrain-to-drainage products, and samples terrain and
 existing HRU classes onto mini-basins. Each stage receives the files it needs
-explicitly and publishes a flat output directory. HRU class construction and
+explicitly and publishes flat output files. All steps can share one output
+folder; the CLI asks before running if that step would replace existing files. HRU class construction and
 final MGB file generation remain planned work.
 
 ## Installation

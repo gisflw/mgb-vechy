@@ -23,7 +23,7 @@ mgb-vec-hydro aggregate \
 | `--lmin` | Required | Non-negative number | Minimum evolving mini length used when short chains are iteratively merged; uses normalized length units (km). |
 | `--output-dir` | Required | Directory path | New directory where the mini vectors and `source_to_mini.csv` are published. |
 | `--workers` | Optional | Positive integer; default `4` | Number of worker processes used for bounded vector work. There is no upper limit imposed by the CLI or stage validator. |
-| `--memory-limit-mb` | Optional | Positive integer MB; default `512` | Memory budget used to size bounded processing packets. |
+| `--memory-limit-mb` | Optional | Positive integer MB; default `512` | Soft memory sizing hint; see [shared execution](shared_execution.md#local-execution). |
 | `--io-slots` | Optional | Positive integer; default `2` | Maximum number of concurrent vector-I/O operations. |
 | `--batch-size` | Optional | Positive integer rows; default `10000` | Number of rows processed per bounded vector batch. |
 
@@ -72,3 +72,13 @@ preserved.
 The files are staged privately, validated, and atomically published. Defaults
 are 512 MB, four workers, two I/O operations, and 10,000-row batches. Worker
 counts may be any positive integer.
+
+`--memory-limit-mb` is a soft sizing hint for task packets and retained
+intermediates, without separate quotas. Workers and a small queue bound
+concurrency; library caches have explicit sizes. Actual RSS can exceed the
+hint. See [shared memory sizing](shared_execution.md#local-execution).
+
+`--batch-size` bounds provider read batches, not geometry processing packets.
+Geometry packets use source-size estimates and the memory hint, distributed
+across workers. The shared reader splits OGRSQL FID requests at 4,997 IDs;
+GeoPackage uses its native SQL without that request cap.

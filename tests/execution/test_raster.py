@@ -302,3 +302,20 @@ def test_block_packets_charge_overlapping_blocks_once(prepared_execution_dataset
             bytes_per_cell=2,
             block_size=2,
         )
+
+
+def test_packet_target_allows_one_large_mini_and_no_eight_mini_cap(prepared_execution_dataset):
+    from dataclasses import replace
+
+    grid = grid_from_dem(prepared_execution_dataset / "dem.tif")
+    units = plan_raster_units(grid, [(str(i), (0, 10, 10, 20)) for i in range(12)], bytes_per_cell=4, block_size=2)
+    packets = packet_raster_units(units, memory_limit_bytes=100, target_bytes=60)
+    assert len(packets) == 1 and len(packets[0].units) == 12
+    large = replace(units[0], estimated_bytes=70)
+    assert packet_raster_units([large], memory_limit_bytes=100, target_bytes=60)[0].estimated_bytes == 70
+    with pytest.raises(WorkMemoryError):
+        packet_raster_units([large], memory_limit_bytes=60, target_bytes=30)
+    shared = packet_raster_units_by_block(grid, units, memory_limit_bytes=100, target_bytes=8, bytes_per_cell=2, block_size=2)
+    assert len(shared) == 1 and len(shared[0].units) == 12
+    own = packet_raster_units_by_block(grid, units[:1], memory_limit_bytes=100, target_bytes=1, bytes_per_cell=2, block_size=2)
+    assert len(own) == 1

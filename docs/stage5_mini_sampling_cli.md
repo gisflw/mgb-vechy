@@ -31,7 +31,7 @@ mgb-vec-hydro sample-minis \
 | `--hru` | Required | Existing raster path | Integer categorical HRU raster; sampled classes must be in `1..100`. |
 | `--output-dir` | Required | Directory path | New directory where `sampled_minis.csv` is published. |
 | `--workers` | Optional | Positive integer; default `4` | Number of worker processes used for bounded sampling packets. There is no upper limit imposed by the CLI or stage validator. |
-| `--memory-limit-mb` | Optional | Positive integer MB; default `512` | Memory budget used to size bounded raster sampling packets. |
+| `--memory-limit-mb` | Optional | Positive integer MB; default `512` | Soft memory sizing hint for sampling packets and retained statistics. |
 | `--io-slots` | Optional | Positive integer; default `2` | Maximum number of concurrent raster reads. |
 | `--batch-size` | Optional | Positive integer rows; default `10000` | Batch size used when reading vector metadata. |
 
@@ -75,7 +75,7 @@ percentage columns summing to 100%; and `flooded_area_<stage>` columns for
 stages 1 through 100, in that order. Column names omit units; lengths and
 elevations are metres, slopes are metres per kilometre, and areas are km².
 The CLI prints the concrete CSV path.
-Execution defaults are four workers, 512 MB of admitted task memory, two I/O
+Execution defaults are four workers, 512 MB as a soft memory hint, two I/O
 slots, and 10,000-row batches. Worker counts may be any positive integer.
 
 Reach elevation is the median DEM elevation of cells labeled for each
@@ -92,3 +92,8 @@ normalization and metric LTND supply their correct units.
 
 Measured preparation, terrain, and sampling costs and reproduction commands
 are in [the unit-correction performance report](sampling_units_performance.md).
+
+`--memory-limit-mb` is a soft sizing hint for task packets and retained
+intermediates, without separate quotas. Workers and a small queue bound
+concurrency; library caches have explicit sizes. Actual RSS can exceed the
+hint. See [shared memory sizing](shared_execution.md#local-execution).

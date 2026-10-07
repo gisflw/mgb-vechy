@@ -20,13 +20,13 @@ from affine import Affine
 from numba import njit
 from pyproj import CRS
 from rasterio.enums import Resampling
-from rasterio.env import get_gdal_config, set_gdal_config
 from rasterio.windows import Window
 
-from mgb_vec_hydro.exceptions import TerrainProductsError
 from mgb_vec_hydro.crs_utils import (
-geodetic_tools, require_metre_units,
+    geodetic_tools,
+    require_metre_units,
 )
+from mgb_vec_hydro.exceptions import TerrainProductsError
 from mgb_vec_hydro.execution.executor import (
     ExecutionConfig,
     ExecutionReport,
@@ -36,6 +36,7 @@ from mgb_vec_hydro.execution.executor import (
     WorkItem,
 )
 from mgb_vec_hydro.execution.manifest import write_manifest
+from mgb_vec_hydro.execution.memory import MemorySizing, raster_cache
 from mgb_vec_hydro.execution.publication import AtomicOutputDirectory
 from mgb_vec_hydro.execution.raster import (
     AlignedRasterReader,
@@ -44,12 +45,12 @@ from mgb_vec_hydro.execution.raster import (
     RasterPatch,
     RasterProductSpec,
     RasterUnit,
+    _require_grid,
+    grid_from_dem,
     packet_raster_units,
     plan_raster_units,
-    grid_from_dem,
-    _require_grid,
 )
-from mgb_vec_hydro.preparation import read_mini_index, GridSpec
+from mgb_vec_hydro.preparation import GridSpec, read_mini_index
 
 # Code, row delta, column delta. This order is also the final tie-break.
 _DIRECTIONS = (
@@ -68,7 +69,6 @@ _DR = np.array([-1, -1, 0, 1, 1, 1, 0, -1], dtype=np.int8)
 _DC = np.array([0, 1, 1, 1, 0, -1, -1, -1], dtype=np.int8)
 
 
-MAX_PACKET_UNITS = 8
 DOMAIN_BYTES_PER_CELL = 16
 DEM_BYTES_PER_CELL = 128
 D8_BYTES_PER_CELL = 80
@@ -98,6 +98,7 @@ class TerrainSpec:
     workers: int = 4
     memory_limit_mb: int = 512
     io_slots: int = 2
+    overwrite: bool = False
 
 
 @dataclass(frozen=True)
@@ -1044,15 +1045,9 @@ class _PacketValue:
 
 def create_terrain_dataset(spec: TerrainSpec) -> TerrainReport:
     """Build terrain products with a bounded coordinator GDAL block cache."""
-    previous = get_gdal_config("GDAL_CACHEMAX")
-    set_gdal_config(
-        "GDAL_CACHEMAX",
-        _gdal_cache_bytes(spec.memory_limit_mb * 1024 * 1024, 1),
-    )
-    try:
+    sizing = MemorySizing(spec.memory_limit_mb * 1024**2, spec.workers)
+    with raster_cache(sizing.coordinator_cache_bytes):
         return _create_terrain_dataset(spec)
-    finally:
-        set_gdal_config("GDAL_CACHEMAX", previous)
 
 
 def _create_terrain_dataset(spec: TerrainSpec) -> TerrainReport:
@@ -1072,17 +1067,18 @@ def _create_terrain_dataset(spec: TerrainSpec) -> TerrainReport:
 
     planning_started = time.perf_counter()
     mini_units = _plan_minis(Path(spec.mini_ownership), grid)
-    memory_bytes = spec.memory_limit_mb * 1024 * 1024
+    sizing = MemorySizing(spec.memory_limit_mb * 1024**2, spec.workers)
+    memory_bytes = sizing.limit_bytes
     planning_seconds = time.perf_counter() - planning_started
     config = ExecutionConfig(
         workers=spec.workers,
         memory_limit_bytes=memory_bytes,
-        max_in_flight=spec.workers,
+        max_in_flight=2 * spec.workers,
         io_slots=spec.io_slots,
     )
     domain_report = ExecutionReport(0, 0, 0, 0, 0, 0.0, {}, ())
 
-    publisher = AtomicOutputDirectory(spec.output_dir)
+    publisher = AtomicOutputDirectory(spec.output_dir, overwrite=spec.overwrite)
     compression_seconds = 0.0
     with publisher as staging:
         terrain_items = _terrain_work_items(
@@ -1119,7 +1115,8 @@ def _create_terrain_dataset(spec: TerrainSpec) -> TerrainReport:
         with RasterAssembler(
             staging,
             grid,
-            terrain_specs,
+            sorted(terrain_specs, key=lambda product: product.name),
+            scratch_memory_bytes=sizing.limit_bytes,
             compression_threads=min(spec.workers, 4),
         ) as terrain_assembler:
 
@@ -1275,11 +1272,12 @@ def _packet_units(
     bytes_per_cell: int,
     memory_limit_bytes: int,
     row_step_bytes: int = 0,
+    target_bytes: int | None = None,
 ) -> tuple[tuple[RasterPacket, tuple[_MiniUnit, ...]], ...]:
     packets = packet_raster_units(
         _reestimated_units(units, bytes_per_cell, row_step_bytes),
         memory_limit_bytes=memory_limit_bytes,
-        max_units=MAX_PACKET_UNITS,
+        target_bytes=target_bytes,
     )
     by_key = {unit.raster.key: unit for unit in units}
     return tuple(
@@ -1303,9 +1301,10 @@ def _terrain_work_items(
     row_step_bytes = 192 if _uses_row_steps(grid.crs) else 0
     if not row_step_bytes:
         bytes_per_cell += METRIC_BYTES_PER_CELL
+    sizing = MemorySizing(spec.memory_limit_mb * 1024**2, spec.workers)
     result = []
     for ordinal, (packet, packet_units) in enumerate(
-        _packet_units(units, bytes_per_cell, memory_limit_bytes, row_step_bytes)
+        _packet_units(units, bytes_per_cell, memory_limit_bytes, row_step_bytes, sizing.packet_bytes)
     ):
         result.append(
             WorkItem(
@@ -1321,7 +1320,7 @@ def _terrain_work_items(
                     spec.agree_sharp,
                     spec.agree_smooth,
                     spec.agree_buffer,
-                    _gdal_cache_bytes(memory_limit_bytes, spec.workers),
+                    sizing.worker_cache_bytes,
                 ),
             )
         )
@@ -1331,12 +1330,8 @@ def _terrain_work_items(
 def _terrain_worker(
     payload: _TerrainPayload, context: WorkerContext
 ) -> WorkerOutput[_PacketValue]:
-    previous = get_gdal_config("GDAL_CACHEMAX")
-    set_gdal_config("GDAL_CACHEMAX", payload.gdal_cache_bytes)
-    try:
+    with raster_cache(payload.gdal_cache_bytes):
         return _terrain_worker_with_cache(payload, context)
-    finally:
-        set_gdal_config("GDAL_CACHEMAX", previous)
 
 
 def _terrain_worker_with_cache(
@@ -1559,11 +1554,3 @@ def _terrain_timings(
         "compression": compression_seconds,
         "total": time.perf_counter() - overall_started,
     }
-
-
-def _gdal_cache_bytes(memory_limit_bytes: int, workers: int) -> int:
-    """Reserve a small bounded block cache within the task-memory envelope."""
-    return min(
-        64 * 1024 * 1024,
-        max(8 * 1024 * 1024, memory_limit_bytes // max(8, workers * 8)),
-    )

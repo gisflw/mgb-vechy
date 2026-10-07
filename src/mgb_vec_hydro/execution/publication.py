@@ -1,4 +1,4 @@
-"""Private staging and single-rename publication for output directories."""
+"""Private staging and rollback-safe publication of output files."""
 
 from __future__ import annotations
 
@@ -11,16 +11,15 @@ from mgb_vec_hydro.exceptions import PublicationError
 
 
 class AtomicOutputDirectory:
-    """Build a new output directory privately and publish it as one unit."""
+    """Stage outputs privately, preserving unrelated files in a shared directory."""
 
-    def __init__(self, target: str | Path):
+    def __init__(self, target: str | Path, *, overwrite: bool = False):
         self.target = Path(target)
+        self.overwrite = overwrite
         self.staging: Path | None = None
         self._published = False
 
     def __enter__(self) -> Path:
-        if self.target.exists():
-            raise PublicationError(f"Output directory already exists: {self.target}")
         self.target.parent.mkdir(parents=True, exist_ok=True)
         self.staging = Path(
             tempfile.mkdtemp(prefix=f".{self.target.name}.tmp-", dir=self.target.parent)
@@ -68,9 +67,40 @@ class AtomicOutputDirectory:
                 raise PublicationError(
                     "Staged output contains unexpected file(s): " + ", ".join(extras)
                 )
-        if self.target.exists():
-            raise PublicationError(f"Output directory already exists: {self.target}")
-        os.replace(self.staging, self.target)
+        if not self.target.exists():
+            os.replace(self.staging, self.target)
+        else:
+            files = list(self.staging.iterdir())
+            conflicts = [
+                self.target / path.name for path in files
+                if (self.target / path.name).exists()
+            ]
+            if conflicts and not self.overwrite:
+                raise PublicationError(
+                    "Output files already exist: " + ", ".join(map(str, conflicts))
+                )
+            if any(not path.is_file() for path in conflicts):
+                raise PublicationError("Output file path is occupied by a directory")
+            # Keep replaced files until the entire stage has been published.
+            with tempfile.TemporaryDirectory(dir=self.target.parent) as backup_dir:
+                backup = Path(backup_dir)
+                moved = []
+                published = []
+                try:
+                    for path in conflicts:
+                        os.replace(path, backup / path.name)
+                        moved.append(path)
+                    for path in files:
+                        destination = self.target / path.name
+                        os.replace(path, destination)
+                        published.append(destination)
+                except OSError as error:
+                    for path in published:
+                        path.unlink()
+                    for path in moved:
+                        os.replace(backup / path.name, path)
+                    raise PublicationError(f"Could not publish outputs: {error}") from error
+            self.staging.rmdir()
         self._published = True
         return self.target
 

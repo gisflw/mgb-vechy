@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import heapq
-import shutil
 import time
 from collections import defaultdict
 from collections.abc import Hashable
@@ -23,11 +22,11 @@ from mgb_vec_hydro.exceptions import (
 )
 from mgb_vec_hydro.execution.executor import ExecutionConfig, LocalExecutor, WorkItem
 from mgb_vec_hydro.execution.manifest import write_manifest
+from mgb_vec_hydro.execution.memory import ArrowPacketStore, MemorySizing, sqlite_cache
 from mgb_vec_hydro.execution.publication import AtomicOutputDirectory
 from mgb_vec_hydro.execution.vector import (
     VectorProvider,
     VectorTable,
-    VectorTablePacketCodec,
     conservative_geometry_packet_rows,
     geometry_column_name,
     inspect_vector_provider,
@@ -86,6 +85,7 @@ class AggregationSpec:
     memory_limit_mb: int = 512
     io_slots: int = 2
     batch_size: int = 10_000
+    overwrite: bool = False
 
 
 @dataclass(frozen=True)
@@ -107,6 +107,7 @@ class _AggregationPacket:
     fids: tuple[int, ...]
     assignment: dict[Hashable, Hashable]
     kind: str
+    batch_size: int = 10_000
 
 
 @dataclass(frozen=True)
@@ -548,18 +549,10 @@ def _geometry_packet_bytes(provider, row_count):
     return max(1, per_feature * row_count)
 
 
-def _mapping_from_packets(packet_dir, kinds, catchments):
-    codec = VectorTablePacketCodec()
+def _mapping_from_packets(store, catchments):
     frames = []
-    for ordinal, kind in kinds.items():
-        if kind != "catchments":
-            continue
-        packet = codec.load(packet_dir / f"{ordinal:012d}.arrow")
-        frames.append(
-            packet.table.select(
-                ["source_id", "mini_id", "longitude", "latitude"]
-            ).to_pandas()
-        )
+    for ordinal in sorted(store.keys):
+        frames.append(store.pop(ordinal).to_pandas())
     if not frames:
         raise InvalidInputSchemaError("Aggregation produced no catchment mapping")
     mapping = pd.concat(frames, ignore_index=True).rename(columns={"source_id": "id"})
@@ -573,6 +566,7 @@ def _mapping_from_packets(packet_dir, kinds, catchments):
 def aggregate_roi_dataset(spec: AggregationSpec) -> AggregationReport:
     overall_started = time.perf_counter()
     _validate_spec(spec)
+    sizing = MemorySizing(spec.memory_limit_mb * 1024**2, spec.workers)
     phase_started = time.perf_counter()
     catchment_provider = inspect_vector_provider(spec.roi_catchments)
     segment_provider = inspect_vector_provider(spec.roi_segments)
@@ -601,26 +595,39 @@ def aggregate_roi_dataset(spec: AggregationSpec) -> AggregationReport:
         segment_fids,
         plan,
         batch_size=spec.batch_size,
-        memory_limit_bytes=spec.memory_limit_mb * 1024 * 1024,
+        memory_limit_bytes=sizing.limit_bytes,
+        workers=spec.workers,
     )
     output = Path(spec.output_dir)
-    publisher = AtomicOutputDirectory(output)
+    publisher = AtomicOutputDirectory(output, overwrite=spec.overwrite)
     phase_started = time.perf_counter()
-    with publisher as staging:
-        packet_dir = staging / ".packets"
-        packet_dir.mkdir()
-        codec = VectorTablePacketCodec()
+    with (
+        publisher as staging,
+        ArrowPacketStore(staging / ".mapping-packets", sizing.limit_bytes) as store,
+        sqlite_cache(sizing.coordinator_cache_bytes),
+    ):
+        workspace = staging / ".aggregation.gpkg"
+        written = set()
 
         def reduce_packet(work_result):
-            codec.dump(
-                work_result.value,
-                packet_dir / f"{work_result.ordinal:012d}.arrow",
+            packet = work_result.value
+            kind = kinds[work_result.ordinal]
+            write_vector_table(
+                packet, workspace, driver="GPKG",
+                layer="catchment_sources" if kind == "catchments" else "segment_sources",
+                append=kind in written, spatial_index=False,
             )
+            written.add(kind)
+            if kind == "catchments":
+                store.put(work_result.ordinal, packet.table.select(
+                    ["source_id", "mini_id", "longitude", "latitude"]
+                ))
 
         execution = LocalExecutor(
             ExecutionConfig(
                 workers=spec.workers,
-                memory_limit_bytes=spec.memory_limit_mb * 1024 * 1024,
+                memory_limit_bytes=sizing.limit_bytes,
+                max_in_flight=2 * spec.workers,
                 io_slots=spec.io_slots,
             )
         ).run(
@@ -633,16 +640,14 @@ def aggregate_roi_dataset(spec: AggregationSpec) -> AggregationReport:
         mapping_path = staging / "source_to_mini.csv"
         _gdal_dissolve_outputs(
             staging,
-            packet_dir,
-            kinds,
             plan,
             expected_crs,
             catchment_path=catchment_path,
             segment_path=segment_path,
         )
-        mapping = _mapping_from_packets(packet_dir, kinds, catchments)
+        mapping = _mapping_from_packets(store, catchments)
         mapping.to_csv(mapping_path, index=False)
-        shutil.rmtree(packet_dir)
+        store.close()
         _validate_aggregation_outputs(
             catchment_path,
             segment_path,
@@ -680,6 +685,7 @@ def _aggregation_work_items(
     *,
     batch_size: int,
     memory_limit_bytes: int,
+    workers: int = 1,
 ) -> tuple[list[WorkItem[_AggregationPacket]], dict[int, str]]:
     """Plan bounded geometry reads after the attribute-only aggregation pass."""
     items: list[WorkItem[_AggregationPacket]] = []
@@ -690,8 +696,8 @@ def _aggregation_work_items(
     ):
         rows = conservative_geometry_packet_rows(
             provider,
-            memory_limit_bytes=memory_limit_bytes,
-            requested_rows=batch_size,
+            memory_limit_bytes=max(1, memory_limit_bytes // (2 * workers)),
+            requested_rows=max(1, int(np.ceil(len(assignment) / workers))),
         )
         source_ids = sorted(assignment, key=_stable_key)
         for packet_index, offset in enumerate(range(0, len(source_ids), rows)):
@@ -708,6 +714,7 @@ def _aggregation_work_items(
                         tuple(fids[value] for value in selected_ids),
                         {value: assignment[value] for value in selected_ids},
                         kind,
+                        batch_size,
                     ),
                 )
             )
@@ -720,7 +727,7 @@ def _prepare_aggregation_packet(payload: _AggregationPacket, context) -> VectorT
         iter_provider_batches(
             payload.provider,
             columns=("id",),
-            batch_size=len(payload.ids),
+            batch_size=payload.batch_size,
             read_geometry=True,
             fids=payload.fids,
             context=context,
@@ -766,8 +773,6 @@ def _prepare_aggregation_packet(payload: _AggregationPacket, context) -> VectorT
 
 def _gdal_dissolve_outputs(
     staging: Path,
-    packet_dir: Path,
-    kinds: dict[int, str],
     plan: _AggregationPlan,
     crs: CRS,
     *,
@@ -781,24 +786,6 @@ def _gdal_dissolve_outputs(
         ("segment_sources", "segment_attrs", segment_path),
     )
     try:
-        codec = VectorTablePacketCodec()
-        first = {"catchments": True, "segments": True}
-        source_layers = {
-            "catchments": "catchment_sources",
-            "segments": "segment_sources",
-        }
-        for ordinal in range(len(kinds)):
-            kind = kinds[ordinal]
-            packet = codec.load(packet_dir / f"{ordinal:012d}.arrow")
-            write_vector_table(
-                packet,
-                workspace,
-                driver="GPKG",
-                layer=source_layers[kind],
-                append=not first[kind],
-                spatial_index=False,
-            )
-            first[kind] = False
         attrs = pa.Table.from_pandas(plan.attributes, preserve_index=False)
         for _, attrs_layer, _ in layers:
             pyogrio.write_arrow(attrs, workspace, layer=attrs_layer, driver="GPKG")

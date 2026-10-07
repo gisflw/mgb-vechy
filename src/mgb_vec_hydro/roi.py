@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import shutil
 import time
 from collections import defaultdict
 from collections.abc import Hashable, Iterable
@@ -15,9 +14,10 @@ import pandas as pd
 import pyarrow as pa
 import pyarrow.compute as pc
 import pyogrio
-from pyproj import CRS, Transformer
 import shapely
+from pyproj import CRS, Transformer
 
+from mgb_vec_hydro.crs_utils import geodetic_tools, parse_crs
 from mgb_vec_hydro.exceptions import (
     DuplicateSegmentIdError,
     InvalidInputSchemaError,
@@ -27,15 +27,17 @@ from mgb_vec_hydro.exceptions import (
 )
 from mgb_vec_hydro.execution.executor import ExecutionConfig, LocalExecutor, WorkItem
 from mgb_vec_hydro.execution.manifest import write_manifest
+from mgb_vec_hydro.execution.memory import ArrowPacketStore, MemorySizing
 from mgb_vec_hydro.execution.publication import AtomicOutputDirectory
 from mgb_vec_hydro.execution.vector import (
+    VectorProvider,
     VectorTable,
     VectorTablePacketCodec,
+    conservative_geometry_packet_rows,
+    geometry_column_name,
     inspect_vector_provider,
-    vector_table_from_arrow,
-    write_vector_table,
+    iter_provider_batches,
 )
-from mgb_vec_hydro.crs_utils import geodetic_tools, parse_crs
 
 DEFAULT_STRAHLER_ORDER_COL = "strahler_order"
 ROI_COLUMNS = [
@@ -70,6 +72,7 @@ class RoiSpec:
     memory_limit_mb: int = 512
     io_slots: int = 2
     batch_size: int = 10_000
+    overwrite: bool = False
 
 
 @dataclass(frozen=True)
@@ -98,6 +101,7 @@ class _GeometryPacket:
     fids: tuple[int, ...]
     kind: str
     target_crs_wkt: str
+    batch_size: int = 10_000
 
 
 def define_roi_dataset(spec: RoiSpec) -> RoiReport:
@@ -131,10 +135,13 @@ def define_roi_dataset(spec: RoiSpec) -> RoiReport:
     _validate_selected_attributes(selected)
     provider_topology_seconds = time.perf_counter() - phase_started
 
-    memory_bytes = spec.memory_limit_mb * 1024 * 1024
+    sizing = MemorySizing(spec.memory_limit_mb * 1024 * 1024, spec.workers)
     output = Path(spec.output_dir)
-    publisher = AtomicOutputDirectory(output)
-    with publisher as staging:
+    publisher = AtomicOutputDirectory(output, overwrite=spec.overwrite)
+    with (
+        publisher as staging,
+        ArrowPacketStore(staging / ".packets", sizing.limit_bytes) as store,
+    ):
         phase_started = time.perf_counter()
         catchment_fids = _scan_fids(catchment_provider, spec.batch_size)
         missing = selected_ids - set(catchment_fids)
@@ -151,34 +158,31 @@ def define_roi_dataset(spec: RoiSpec) -> RoiReport:
             catchment_fids,
             target_crs,
             batch_size=spec.batch_size,
-            memory_bytes=memory_bytes,
+            memory_bytes=sizing.limit_bytes,
             workers=spec.workers,
         )
-        packet_dir = staging / ".packets"
-        packet_dir.mkdir()
         codec = VectorTablePacketCodec()
+        metrics: dict[Hashable, dict[str, float]] = {}
 
         def reduce_packet(result):
-            codec.dump(result.value, packet_dir / f"{result.ordinal:012d}.arrow")
-            return None
-
-        execution = LocalExecutor(
-            ExecutionConfig(
-                workers=spec.workers,
-                memory_limit_bytes=memory_bytes,
-                io_slots=spec.io_slots,
-            )
-        ).run(items, _process_geometry_packet, reduce_packet)
-        metrics: dict[Hashable, dict[str, float]] = {}
-        for ordinal in range(len(items)):
-            packet = codec.load(packet_dir / f"{ordinal:012d}.arrow")
-            key = "unit_length" if kinds[ordinal] == "segments" else "unit_area"
+            packet = result.value
+            key = "unit_length" if kinds[result.ordinal] == "segments" else "unit_area"
             for segment_id, value in zip(
                 packet.table["id"].to_pylist(),
                 packet.table["unit_metric"].to_pylist(),
                 strict=True,
             ):
                 metrics.setdefault(segment_id, {})[key] = float(value)
+            store.put(result.ordinal, codec.encode(packet))
+
+        execution = LocalExecutor(
+            ExecutionConfig(
+                workers=spec.workers,
+                memory_limit_bytes=sizing.limit_bytes,
+                max_in_flight=2 * spec.workers,
+                io_slots=spec.io_slots,
+            )
+        ).run(items, _process_geometry_packet, reduce_packet)
         if set(metrics) != selected_ids or any(
             "unit_length" not in value or "unit_area" not in value
             for value in metrics.values()
@@ -197,7 +201,7 @@ def define_roi_dataset(spec: RoiSpec) -> RoiReport:
         catchments_path = staging / "roi_catchments.fgb"
         segments_path = staging / "roi_segments.fgb"
         _write_cached_outputs(
-            packet_dir,
+            store,
             kinds,
             selected,
             sub_by_id,
@@ -209,7 +213,7 @@ def define_roi_dataset(spec: RoiSpec) -> RoiReport:
             catchments_path=catchments_path,
             segments_path=segments_path,
         )
-        shutil.rmtree(packet_dir)
+        store.close()
         _validate_roi_outputs(
             catchments_path,
             segments_path,
@@ -249,25 +253,34 @@ def _geometry_work_items(
     workers: int,
 ) -> tuple[list[WorkItem[_GeometryPacket]], dict[int, str]]:
     ordered = sorted(ids, key=lambda value: (type(value).__name__, str(value)))
-    packet_rows = max(1, min(batch_size, memory_bytes // max(1, workers) // 4096))
     items: list[WorkItem[_GeometryPacket]] = []
     kinds: dict[int, str] = {}
     for provider, fid_by_id, kind in (
         (segment_provider, segment_fids, "segments"),
         (catchment_provider, catchment_fids, "catchments"),
     ):
+        source = _shared_provider(provider)
+        packet_rows = conservative_geometry_packet_rows(
+            source,
+            memory_limit_bytes=max(1, memory_bytes // (2 * workers)),
+            requested_rows=max(1, (len(ordered) + workers - 1) // workers),
+        )
+        per_feature = max(
+            4096,
+            int(np.ceil(source.path.stat().st_size / max(1, source.feature_count))) * 4,
+        )
         for start in range(0, len(ordered), packet_rows):
             ordinal = len(items)
             packet_ids = tuple(ordered[start : start + packet_rows])
             fids = tuple(fid_by_id[value] for value in packet_ids)
-            estimate = max(1, min(memory_bytes // max(1, workers), len(fids) * 4096))
+            estimate = max(1, len(fids) * per_feature)
             items.append(
                 WorkItem(
                     f"{kind}-{start:012d}",
                     ordinal,
                     estimate,
                     _GeometryPacket(
-                        provider, packet_ids, fids, kind, target_crs.to_wkt()
+                        provider, packet_ids, fids, kind, target_crs.to_wkt(), batch_size
                     ),
                 )
             )
@@ -277,15 +290,22 @@ def _geometry_work_items(
 
 def _process_geometry_packet(payload: _GeometryPacket, context) -> VectorTable:
     provider = payload.provider
-    with context.io_bound():
-        metadata, table = pyogrio.read_arrow(
-            provider.path,
-            layer=provider.layer,
+    batches = list(
+        iter_provider_batches(
+            _shared_provider(provider),
             columns=list(dict.fromkeys(provider.fields.values())),
-            fids=list(payload.fids),
+            fids=payload.fids,
+            batch_size=payload.batch_size,
+            read_geometry=True,
+            context=context,
         )
+    )
+    if not batches:
+        raise InvalidInputSchemaError("Provider geometry packet is empty")
+    table = pa.Table.from_batches(batches)
     frame = _normalize_vector_table(
-        _provider_vector(metadata, table, provider), provider
+        VectorTable(table, provider.crs, geometry_column_name(table), provider.info["geometry_type"]),
+        provider,
     )
     returned = frame.table["id"].to_pylist()
     if len(returned) != len(set(returned)) or set(returned) != set(payload.ids):
@@ -316,8 +336,16 @@ def _process_geometry_packet(payload: _GeometryPacket, context) -> VectorTable:
     return VectorTable(result, target_crs, "geometry", frame.geometry_type)
 
 
+def _shared_provider(provider: _Provider) -> VectorProvider:
+    return VectorProvider(
+        provider.path, provider.layer, provider.info["driver"],
+        tuple(provider.info["fields"]), provider.info["geometry_type"],
+        provider.info["features"], provider.crs, provider.info["fid_column"],
+    )
+
+
 def _write_cached_outputs(
-    packet_dir: Path,
+    store: ArrowPacketStore,
     kinds: dict[int, str],
     attrs: pd.DataFrame,
     sub_by_id,
@@ -333,35 +361,54 @@ def _write_cached_outputs(
     lookup = attrs.set_index("id").to_dict("index")
     id_type = pa.array(attrs["id"].tolist()).type
     codec = VectorTablePacketCodec()
-    first = {"segments": True, "catchments": True}
-    paths = {"segments": segments_path, "catchments": catchments_path}
-    for ordinal in range(len(kinds)):
-        kind = kinds[ordinal]
-        packet = codec.load(packet_dir / f"{ordinal:012d}.arrow")
-        rows = []
-        for segment_id, geometry in zip(
-            packet.table["id"].to_pylist(),
-            packet.table["geometry"].to_pylist(),
-            strict=True,
-        ):
-            item = lookup[segment_id]
-            rows.append(
-                {
-                    "id": segment_id,
-                    "id_down": item["id_down"],
-                    "sub": sub_by_id[segment_id],
-                    "strahler_order": int(item["strahler_order"]),
-                    "unit_length": metrics[segment_id]["unit_length"],
-                    "upstream_length": upstream_length[segment_id],
-                    "unit_area": metrics[segment_id]["unit_area"],
-                    "upstream_area": upstream_area[segment_id],
-                    "water_course": water_course[segment_id],
-                    "geometry": geometry,
-                }
-            )
-        output = _rows_to_vector(rows, id_type, target_crs, packet.geometry_type)
-        _write_fgb(output, paths[kind], append=not first[kind])
-        first[kind] = False
+    def vectors(kind):
+        for ordinal in range(len(kinds)):
+            if kinds[ordinal] != kind:
+                continue
+            packet = codec.decode(store.pop(ordinal))
+            rows = []
+            for segment_id, geometry in zip(
+                packet.table["id"].to_pylist(),
+                packet.table["geometry"].to_pylist(),
+                strict=True,
+            ):
+                item = lookup[segment_id]
+                rows.append(
+                    {
+                        "id": segment_id,
+                        "id_down": item["id_down"],
+                        "sub": sub_by_id[segment_id],
+                        "strahler_order": int(item["strahler_order"]),
+                        "unit_length": metrics[segment_id]["unit_length"],
+                        "upstream_length": upstream_length[segment_id],
+                        "unit_area": metrics[segment_id]["unit_area"],
+                        "upstream_area": upstream_area[segment_id],
+                        "water_course": water_course[segment_id],
+                        "geometry": geometry,
+                    }
+                )
+            output = _rows_to_vector(rows, id_type, target_crs, packet.geometry_type)
+            yield output
+
+    for kind, path in (("segments", segments_path), ("catchments", catchments_path)):
+        values = vectors(kind)
+        first = next(values)
+
+        def batches(first=first, values=values):
+            yield from first.table.to_batches()
+            for vector in values:
+                yield from vector.table.to_batches()
+
+        reader = pa.RecordBatchReader.from_batches(first.table.schema, batches())
+        pyogrio.write_arrow(
+            reader,
+            path,
+            driver="FlatGeobuf",
+            geometry_name="geometry",
+            geometry_type=first.geometry_type,
+            crs=target_crs.to_wkt(version="WKT2_2019", pretty=False),
+            layer_options={"SPATIAL_INDEX": "YES"},
+        )
 
 
 def define_roi(spec: RoiSpec) -> RoiReport:
@@ -661,10 +708,6 @@ def _water_course_by_segment(segments: pd.DataFrame) -> dict[Hashable, Hashable]
     return result
 
 
-def _write_fgb(frame: VectorTable, path: Path, *, append: bool = False) -> None:
-    write_vector_table(frame, path, driver="FlatGeobuf", append=append)
-
-
 def _normalize_vector_table(frame: VectorTable, provider: _Provider) -> VectorTable:
     rename = {actual: normalized for normalized, actual in provider.fields.items()}
     names = [
@@ -676,14 +719,6 @@ def _normalize_vector_table(frame: VectorTable, provider: _Provider) -> VectorTa
     return VectorTable(
         table.select(columns), provider.crs, "geometry", frame.geometry_type
     )
-
-
-def _provider_vector(
-    metadata: dict[str, Any], table: pa.Table, provider: _Provider
-) -> VectorTable:
-    if metadata.get("crs") is None:
-        metadata = {**metadata, "crs": provider.crs.to_wkt()}
-    return vector_table_from_arrow(metadata, table)
 
 
 def _rows_to_vector(

@@ -353,7 +353,7 @@ class LocalExecutor:
                     event("reduced", item)
                     made_progress = True
 
-                while len(admitted) + len(buffered) < self.config.in_flight_limit:
+                while len(admitted) < self.config.in_flight_limit:
                     if next_item is None and not source_done:
                         try:
                             planning_started = time.perf_counter()

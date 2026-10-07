@@ -96,3 +96,25 @@ def test_flatgeobuf_arrow_reads_split_large_fid_selections(tmp_path):
 
     assert len(ids) == count
     assert set(ids) == set(range(count))
+
+
+def test_geopackage_large_fid_selection_uses_one_native_request(tmp_path, monkeypatch):
+    from contextlib import contextmanager
+
+    import pyarrow as pa
+
+    import mgb_vec_hydro.execution.vector as module
+
+    calls = []
+
+    @contextmanager
+    def open_arrow(*args, **kwargs):
+        calls.append(kwargs["fids"])
+        yield {}, [pa.record_batch({"id": kwargs["fids"]})]
+
+    monkeypatch.setattr(module.pyogrio, "open_arrow", open_arrow)
+    provider = module.VectorProvider(tmp_path / "source.gpkg", None, "GPKG", ("id",), "Point", 5000, "EPSG:3857", "fid")
+    batches = list(iter_provider_batches(provider, columns=("id",), fids=range(5000)))
+    assert len(calls) == 1
+    assert len(calls[0]) == 5000
+    assert sum(batch.num_rows for batch in batches) == 5000
