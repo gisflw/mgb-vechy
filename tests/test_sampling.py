@@ -1,4 +1,5 @@
 import json
+import warnings
 from dataclasses import replace
 
 import numpy as np
@@ -8,21 +9,23 @@ import rasterio
 from affine import Affine
 from pyproj import CRS, Transformer
 from rasterio.shutil import copy as copy_raster
-from shapely.geometry import LineString, Polygon
 from shapely import point_on_surface
+from shapely.geometry import LineString, Polygon
 
 from mgb_vec_hydro.crs_utils import CrsError
-from mgb_vec_hydro.exceptions import WorkMemoryError
+from mgb_vec_hydro.exceptions import (
+    MiniSamplingError,
+    WorkerExecutionError,
+    WorkMemoryError,
+)
 from mgb_vec_hydro.execution.vector import VectorTable, write_vector_table
 from mgb_vec_hydro.preparation import (
-    GridSpec,
     NamedRaster,
     PreparationSpec,
     prepare_dataset,
 )
 from mgb_vec_hydro.sampling import (
     MiniSamplingSpec,
-    _cell_areas_km2,
     sample_minibasins,
 )
 from mgb_vec_hydro.terrain import TerrainSpec, create_terrain_dataset
@@ -205,13 +208,15 @@ def _sampling_spec(
     )
 
 
-def _rewrite_raster(path, output, edit):
+def _rewrite_raster(path, output, edit, mask_edit=None):
     with rasterio.open(path) as source:
         values = source.read(1)
         mask = source.dataset_mask()
         profile = source.profile.copy()
         tags = source.tags()
     edit(values)
+    if mask_edit is not None:
+        mask_edit(mask)
     profile["driver"] = "GTiff"
     working = output.with_name(output.stem + "-working.tif")
     with rasterio.open(working, "w", **profile) as target:
@@ -222,27 +227,14 @@ def _rewrite_raster(path, output, edit):
     return output
 
 
-def _direct_cell_areas_km2(crs, transform, rows, cols):
-    source_crs = CRS.from_user_input(crs)
-    geodetic = source_crs.geodetic_crs
-    transformer = Transformer.from_crs(source_crs, geodetic, always_xy=True)
-    geod = source_crs.get_geod()
-    areas = []
-    for row, col in zip(rows, cols, strict=True):
-        x0 = transform.c + col * transform.a
-        x1 = x0 + transform.a
-        y1 = transform.f + row * transform.e
-        y0 = y1 + transform.e
-        lon, lat = transformer.transform([x0, x1, x1, x0], [y0, y0, y1, y1])
-        areas.append(abs(geod.polygon_area_perimeter(lon, lat)[0]) / 1e6)
-    return np.asarray(areas)
-
-
 def test_sampling_pipeline_is_exact_block_reusing_and_atomic(tmp_path):
     minis, prepared, terrain = _sampling_inputs(tmp_path)
     output = tmp_path / "sampled"
     spec = _sampling_spec(minis, prepared, terrain, output)
-    report = sample_minibasins(spec)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        report = sample_minibasins(spec)
+    assert not caught  # Masked cells outside mini ownership are not findings.
 
     frame = pd.read_csv(report.sampled_minis)
     assert frame["id"].tolist() == [1, 2]
@@ -304,7 +296,7 @@ def test_sampling_pipeline_is_exact_block_reusing_and_atomic(tmp_path):
     np.testing.assert_allclose(frame["latitude"], [value[1] for value in expected])
 
 
-def test_sampling_flooded_areas_use_hand_thresholds_and_cell_areas(tmp_path):
+def test_sampling_flooded_areas_use_hand_thresholds_and_catchment_area(tmp_path):
     minis, prepared, terrain = _sampling_inputs(tmp_path)
     with rasterio.open(prepared.mini_ownership) as source:
         labels = source.read(1)
@@ -361,40 +353,219 @@ def test_sampling_flooded_areas_use_hand_thresholds_and_cell_areas(tmp_path):
             assert row.reach_elevation == p50
             assert row.reach_slope == (p85 - p10) / 0.75
 
-            catchment = labels == label
-            cell_rows, cell_cols = np.nonzero(catchment)
-            areas = _direct_cell_areas_km2(
-                dem.crs, dem.transform, cell_rows, cell_cols
-            )
-            catchment_hand = hand_values[catchment]
+            catchment_hand = hand_values[labels == label]
             expected = [
-                areas[catchment_hand <= stage].sum() for stage in range(1, 101)
+                row.unit_area * np.count_nonzero(catchment_hand <= stage) / len(catchment_hand)
+                for stage in range(1, 101)
             ]
             np.testing.assert_allclose(
                 frame.loc[label - 1, area_columns].to_numpy(dtype=float), expected
             )
 
 
-def test_cell_area_calculation_handles_geographic_rows_and_projected_cells():
-    cases = (
-        ("EPSG:4326", Affine(0.01, 0, -45, 0, -0.01, -10)),
-        ("EPSG:3857", Affine(1000, 0, 0, 0, -1000, 1_000_000)),
+
+def test_fully_flooded_area_equals_vector_catchment_area(tmp_path):
+    minis, prepared, terrain = _sampling_inputs(tmp_path)
+    with rasterio.open(prepared.mini_ownership) as source:
+        labels = source.read(1)
+    hand_path = _rewrite_raster(
+        terrain.hand,
+        tmp_path / "fully-flooded-hand.tif",
+        lambda values: values.__setitem__(labels > 0, 50),
     )
-    for crs, transform in cases:
-        grid = GridSpec(CRS.from_user_input(crs), transform, 2, 2)
-        selected = np.ones((2, 2), dtype=bool)
-        actual = _cell_areas_km2(grid, rasterio.windows.Window(0, 0, 2, 2), selected)
-        expected = _direct_cell_areas_km2(
-            grid.crs,
-            transform,
-            np.array([0, 0, 1, 1]),
-            np.array([0, 1, 0, 1]),
+    report = sample_minibasins(
+        replace(
+            _sampling_spec(minis, prepared, terrain, tmp_path / "sampled"),
+            hand=hand_path,
         )
-        np.testing.assert_allclose(actual, expected)
-        if crs == "EPSG:4326":
-            assert actual[0] > actual[2]
-        else:
-            assert actual[0] != actual[2]
+    )
+    frame = pd.read_csv(report.sampled_minis)
+    for row in frame.itertuples(index=False):
+        assert row.flooded_area_100 == row.unit_area
+
+
+def test_sampling_warns_for_partial_nodata_and_uses_valid_cells(tmp_path, monkeypatch):
+    from mgb_vec_hydro.execution.memory import MemorySizing
+
+    monkeypatch.setattr(MemorySizing, "packet_bytes", property(lambda self: 1))
+    minis, prepared, terrain = _sampling_inputs(tmp_path)
+    with rasterio.open(prepared.mini_ownership) as source:
+        labels = source.read(1)
+    mini_one = np.argwhere(labels == 1)
+    mini_two = np.argwhere(labels == 2)
+    nodata_paths = {
+        "dem": _rewrite_raster(
+            prepared.dem,
+            tmp_path / "dem-with-nan.tif",
+            lambda values: values.__setitem__(tuple(mini_one[0]), np.nan),
+        ),
+        "hand": _rewrite_raster(
+            terrain.hand,
+            tmp_path / "hand-with-nan.tif",
+            lambda values: values.__setitem__(tuple(mini_one[1]), np.nan),
+        ),
+        "ltnd": _rewrite_raster(
+            terrain.ltnd,
+            tmp_path / "ltnd-with-mask.tif",
+            lambda values: None,
+            lambda mask: mask.__setitem__(tuple(mini_one[2]), 0),
+        ),
+        "hru": _rewrite_raster(
+            prepared.rasters["hru"],
+            tmp_path / "hru-with-mask.tif",
+            lambda values: None,
+            lambda mask: (
+                mask.__setitem__(tuple(mini_one[3]), 0),
+                mask.__setitem__(tuple(mini_two[0]), 0),
+            ),
+        ),
+        "drainage": _rewrite_raster(
+            prepared.drainage,
+            tmp_path / "drainage-with-mask.tif",
+            lambda values: None,
+            lambda mask: mask.__setitem__(tuple(mini_one[4]), 0),
+        ),
+    }
+    spec = replace(
+        _sampling_spec(minis, prepared, terrain, tmp_path / "sampled", workers=2),
+        **nodata_paths,
+    )
+    with pytest.warns(RuntimeWarning) as caught:
+        report = sample_minibasins(spec)
+
+    messages = [str(value.message) for value in caught]
+    assert report.execution.task_count > 1
+    assert messages == [
+        (
+            "Nodata cells were found within the domain for raster(s): "
+            "--dem, --drainage, --hand, --hru, --ltnd. Statistics exclude these cells; "
+            "substantial missing coverage can produce unrealistic results. Please verify "
+            "whether the affected results are suitable."
+        )
+    ]
+    assert {path.name for path in report.nodata_reports} == {
+        f"nodata_{name}.csv" for name in nodata_paths
+    }
+    for name in nodata_paths:
+        frame = pd.read_csv(report.output_dir / f"nodata_{name}.csv")
+        assert frame.columns.tolist() == [
+            "mini_id",
+            "nodata_cells",
+            "total_cells",
+            "percentage_nodata",
+        ]
+        expected_minis = [1, 2] if name == "hru" else [1]
+        assert frame["mini_id"].tolist() == expected_minis
+        assert frame["nodata_cells"].tolist() == [1] * len(expected_minis)
+        assert frame["total_cells"].tolist() == [12] * len(expected_minis)
+        np.testing.assert_allclose(frame["percentage_nodata"], 100 / 12)
+    frame = pd.read_csv(report.sampled_minis)
+    np.testing.assert_allclose(frame.filter(regex=r"^hru_").sum(axis=1), 100)
+    with (
+        rasterio.open(spec.hand) as hand_source,
+        rasterio.open(spec.ltnd) as ltnd_source,
+    ):
+        hand = hand_source.read(1, masked=True)
+        ltnd = ltnd_source.read(1, masked=True)
+        valid_hand = (
+            (labels == 1)
+            & ~np.ma.getmaskarray(hand)
+            & ~np.isnan(hand.data)
+        )
+        expected_areas = [
+            frame.loc[0, "unit_area"]
+            * np.count_nonzero(valid_hand & (hand.data <= stage))
+            / np.count_nonzero(valid_hand)
+            for stage in range(1, 101)
+        ]
+        paired = (
+            (labels == 1)
+            & ~np.ma.getmaskarray(hand)
+            & ~np.ma.getmaskarray(ltnd)
+            & ~np.isnan(hand.data)
+            & ~np.isnan(ltnd.data)
+        )
+        maximum = float(ltnd.data[paired].max())
+        expected_slope = hand.data[paired & np.isclose(ltnd.data, maximum)].mean() / (
+            maximum / 1000
+        )
+    assert frame.loc[0, "tributary_length"] == pytest.approx(maximum / 1000)
+    assert frame.loc[0, "tributary_slope"] == pytest.approx(expected_slope)
+    np.testing.assert_allclose(
+        frame.loc[0, [f"flooded_area_{stage}" for stage in range(1, 101)]],
+        expected_areas,
+    )
+
+
+@pytest.mark.parametrize(
+    ("dataset", "statistic"),
+    (
+        ("hru", "HRU percentages"),
+        ("hand", "flooded area"),
+        ("dem", "DEM reach statistics"),
+        ("ltnd", "paired HAND/LTND statistics"),
+    ),
+)
+def test_sampling_fails_when_required_statistic_has_only_nodata(
+    tmp_path, dataset, statistic
+):
+    minis, prepared, terrain = _sampling_inputs(tmp_path)
+    with rasterio.open(prepared.mini_ownership) as source:
+        labels = source.read(1)
+    missing = labels == 1
+    path = {
+        "hru": prepared.rasters["hru"],
+        "hand": terrain.hand,
+        "dem": prepared.dem,
+        "ltnd": terrain.ltnd,
+    }[dataset]
+    nodata_path = _rewrite_raster(
+        path,
+        tmp_path / f"{dataset}-all-nodata.tif",
+        lambda values: values.__setitem__(missing, np.nan)
+        if dataset == "hand"
+        else None,
+        None
+        if dataset == "hand"
+        else lambda mask: mask.__setitem__(missing, 0),
+    )
+    spec = replace(
+        _sampling_spec(minis, prepared, terrain, tmp_path / "sampled"),
+        **{dataset: nodata_path},
+    )
+    spec.output_dir.mkdir()
+    previous_sample = spec.output_dir / "sampled_minis.csv"
+    previous_sample.write_text("previous successful sample\n")
+    with (
+        pytest.warns(RuntimeWarning, match="Nodata cells were found"),
+        pytest.raises(
+            MiniSamplingError,
+            match=f"Mini 1.*{statistic}.*Nodata reports saved in",
+        ),
+    ):
+        sample_minibasins(spec)
+    assert (spec.output_dir / f"nodata_{dataset}.csv").is_file()
+    assert previous_sample.read_text() == "previous successful sample\n"
+    assert not (spec.output_dir / "manifest-sample-minis.json").exists()
+
+
+def test_sampling_rejects_infinite_values_within_the_mini_domain(tmp_path):
+    minis, prepared, terrain = _sampling_inputs(tmp_path)
+    with rasterio.open(prepared.mini_ownership) as source:
+        ownership = source.read(1)
+    cell = tuple(np.argwhere(ownership == 1)[0])
+    dem_path = _rewrite_raster(
+        prepared.dem,
+        tmp_path / "dem-with-infinity.tif",
+        lambda values: values.__setitem__(cell, np.inf),
+    )
+    spec = replace(
+        _sampling_spec(minis, prepared, terrain, tmp_path / "sampled"),
+        dem=dem_path,
+    )
+    with pytest.raises(WorkerExecutionError, match="infinite DEM values"):
+        sample_minibasins(spec)
+    assert not spec.output_dir.exists()
 
 
 def test_sampling_serial_and_parallel_runs_are_byte_deterministic(tmp_path, monkeypatch):

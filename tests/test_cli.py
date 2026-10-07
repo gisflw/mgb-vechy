@@ -1,9 +1,10 @@
-from click.testing import CliRunner
 from types import SimpleNamespace
 
 import pytest
+from click.testing import CliRunner
 
 from mgb_vec_hydro.cli import main
+from mgb_vec_hydro.sampling import NODATA_REPORT_FILENAMES, _SamplingNodataWarning
 
 
 def test_public_stage_commands_expose_their_primary_inputs():
@@ -118,6 +119,10 @@ def test_agree_cli_defaults_are_unchanged():
     ("terrain-products", "create_terrain_dataset", "flow_direction.tif", ["--write-flow-direction"]),
     ("sample-minis", "sample_minibasins", "sampled_minis.csv", []),
     ("sample-minis", "sample_minibasins", "manifest-sample-minis.json", []),
+    *[
+        ("sample-minis", "sample_minibasins", name, [])
+        for name in NODATA_REPORT_FILENAMES
+    ],
 ])
 def test_output_confirmation_precedes_execution(tmp_path, monkeypatch, command, function, output_name, extra):
     import click
@@ -164,3 +169,57 @@ def test_output_confirmation_precedes_execution(tmp_path, monkeypatch, command, 
     assert str(existing) in result.output
     assert str(unrelated) not in result.output
     assert unrelated.read_text() == "keep"
+
+
+def test_sample_cli_renders_one_clean_nodata_warning_and_lists_reports(
+    tmp_path, monkeypatch
+):
+    import warnings
+
+    message = (
+        "Nodata cells were found within the domain for raster(s): --hru. "
+        "Statistics exclude these cells; substantial missing coverage can produce "
+        "unrealistic results. Please verify whether the affected results are suitable."
+    )
+    report_path = tmp_path / "out" / "nodata_hru.csv"
+
+    def sample(spec):
+        warnings.warn(message, _SamplingNodataWarning)
+        warnings.warn("ordinary warning", UserWarning)
+        return SimpleNamespace(
+            sampled_minis=tmp_path / "out" / "sampled_minis.csv",
+            output_dir=tmp_path / "out",
+            mini_count=1,
+            catchment_cells=12,
+            reach_cells=3,
+            hru_class_ids=(1,),
+            timings={},
+            nodata_reports=(report_path,),
+        )
+
+    monkeypatch.setattr("mgb_vec_hydro.cli.sample_minibasins", sample)
+    args = ["sample-minis"]
+    for option in (
+        "mini-catchments",
+        "mini-segments",
+        "dem",
+        "cells",
+        "drainage",
+        "hand",
+        "ltnd",
+        "hru",
+    ):
+        path = tmp_path / option
+        path.touch()
+        args.extend([f"--{option}", str(path)])
+    args.extend(["--output-dir", str(tmp_path / "out")])
+
+    result = CliRunner().invoke(main, args)
+    assert result.exit_code == 0, result.output
+    assert f"RuntimeWarning: {message}" in result.output
+    assert "tests/test_cli.py:" in result.output
+    assert "UserWarning: ordinary warning" in result.output
+    assert "sampling.py:" not in result.output
+    assert "Mini 1:" not in result.output
+    assert "1 / 12 cells" not in result.output
+    assert f"Wrote {report_path}" in result.output

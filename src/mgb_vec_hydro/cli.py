@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import sys
+import warnings
 from pathlib import Path
 
 import click
@@ -7,7 +9,12 @@ import click
 from mgb_vec_hydro.aggregation import AggregationSpec, aggregate_roi_dataset
 from mgb_vec_hydro.preparation import NamedRaster, PreparationSpec, prepare_dataset
 from mgb_vec_hydro.roi import RoiSpec, define_roi_dataset
-from mgb_vec_hydro.sampling import MiniSamplingSpec, sample_minibasins
+from mgb_vec_hydro.sampling import (
+    NODATA_REPORT_FILENAMES,
+    MiniSamplingSpec,
+    _SamplingNodataWarning,
+    sample_minibasins,
+)
 from mgb_vec_hydro.terrain import TerrainSpec, create_terrain_dataset
 
 
@@ -493,28 +500,52 @@ def sample_minis_command(
     """Sample explicit canonical rasters and mini vectors into one CSV."""
     overwrite = _confirm_replacement(
         output_dir,
-        ("sampled_minis.csv", "manifest-sample-minis.json"),
+        (
+            "sampled_minis.csv",
+            "manifest-sample-minis.json",
+            *NODATA_REPORT_FILENAMES,
+        ),
     )
-    report = sample_minibasins(
-        MiniSamplingSpec(
-            mini_catchments=mini_catchments,
-            mini_segments=mini_segments,
-            dem=dem,
-            mini_ownership=cells,
-            drainage=drainage,
-            hand=hand,
-            ltnd=ltnd,
-            hru=hru,
-            output_dir=output_dir,
-            overwrite=overwrite,
-            workers=workers,
-            memory_limit_mb=memory_limit_mb,
-            io_slots=io_slots,
-            batch_size=batch_size,
-        )
-    )
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always", _SamplingNodataWarning)
+        try:
+            report = sample_minibasins(
+                MiniSamplingSpec(
+                    mini_catchments=mini_catchments,
+                    mini_segments=mini_segments,
+                    dem=dem,
+                    mini_ownership=cells,
+                    drainage=drainage,
+                    hand=hand,
+                    ltnd=ltnd,
+                    hru=hru,
+                    output_dir=output_dir,
+                    overwrite=overwrite,
+                    workers=workers,
+                    memory_limit_mb=memory_limit_mb,
+                    io_slots=io_slots,
+                    batch_size=batch_size,
+                )
+            )
+        finally:
+            for value in caught:
+                if isinstance(value.message, _SamplingNodataWarning):
+                    click.echo(f"RuntimeWarning: {value.message}", err=True)
+                else:
+                    stream = value.file or sys.stderr
+                    stream.write(
+                        warnings.formatwarning(
+                            value.message,
+                            value.category,
+                            value.filename,
+                            value.lineno,
+                            value.line,
+                        )
+                    )
     click.echo(f"Wrote {report.sampled_minis}")
     click.echo(f"Wrote {report.output_dir / 'manifest-sample-minis.json'}")
+    for path in report.nodata_reports:
+        click.echo(f"Wrote {path}")
     click.echo(
         f"Sampled {report.mini_count} minis; "
         f"{report.catchment_cells} catchment cells and "

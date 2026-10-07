@@ -26,7 +26,12 @@ class AtomicOutputDirectory:
         )
         return self.staging
 
-    def publish(self, expected: tuple[str | Path, ...] = ()) -> Path:
+    def publish(
+        self,
+        expected: tuple[str | Path, ...] = (),
+        *,
+        remove: tuple[str | Path, ...] = (),
+    ) -> Path:
         if self.staging is None:
             raise PublicationError("Output staging directory is not open")
         safe_expected = []
@@ -35,6 +40,16 @@ class AtomicOutputDirectory:
             candidate = (self.staging / relative).resolve()
             candidate.relative_to(self.staging.resolve())
             safe_expected.append((relative, candidate))
+        safe_remove = []
+        for path in remove:
+            relative = Path(path)
+            if relative.is_absolute() or ".." in relative.parts:
+                raise PublicationError("Removed output paths must stay within the output directory")
+            candidate = self.target / relative
+            candidate.resolve().relative_to(self.target.resolve())
+            safe_remove.append((relative, candidate))
+        if {path for path, _ in safe_expected} & {path for path, _ in safe_remove}:
+            raise PublicationError("An output cannot be published and removed together")
         missing = [
             str(path) for path, candidate in safe_expected if not candidate.is_file()
         ]
@@ -75,11 +90,13 @@ class AtomicOutputDirectory:
                 self.target / path.name for path in files
                 if (self.target / path.name).exists()
             ]
-            if conflicts and not self.overwrite:
+            removals = [path for _, path in safe_remove if path.exists()]
+            if (conflicts or removals) and not self.overwrite:
                 raise PublicationError(
-                    "Output files already exist: " + ", ".join(map(str, conflicts))
+                    "Output files already exist: "
+                    + ", ".join(map(str, (*conflicts, *removals)))
                 )
-            if any(not path.is_file() for path in conflicts):
+            if any(not path.is_file() for path in (*conflicts, *removals)):
                 raise PublicationError("Output file path is occupied by a directory")
             # Keep replaced files until the entire stage has been published.
             with tempfile.TemporaryDirectory(dir=self.target.parent) as backup_dir:
@@ -87,7 +104,7 @@ class AtomicOutputDirectory:
                 moved = []
                 published = []
                 try:
-                    for path in conflicts:
+                    for path in (*conflicts, *removals):
                         os.replace(path, backup / path.name)
                         moved.append(path)
                     for path in files:

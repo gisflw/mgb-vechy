@@ -51,6 +51,13 @@ Each mini is an indivisible work unit. Workers use the shared aligned COG reader
 strict ownership without buffering, and the coordinator alone assembles final
 COGs.
 
+## Nodata policy
+
+Every owned cell must have valid DEM and drainage data. D8 mode also requires
+valid directions for every owned cell; invalid coverage or routes fail before
+publication. Terrain products keep validity masks, and sampling applies its
+own partial-nodata rules. See [shared raster nodata policy](shared_execution.md#nodata-policy).
+
 DEM mode applies catchment-confined AGREE conditioning, deterministic flat
 handling, and targeted shallow breaching to matching drainage. HAND always
 uses the unmodified DEM. D8 mode terminalizes matching drainage cells; every

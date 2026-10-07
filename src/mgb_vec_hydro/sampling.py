@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import csv
 import time
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -13,7 +15,7 @@ import shapely
 from pyproj import CRS, Transformer
 
 from mgb_vec_hydro.aggregation import AGGREGATION_COLUMNS
-from mgb_vec_hydro.crs_utils import geodetic_tools, require_metre_units
+from mgb_vec_hydro.crs_utils import require_metre_units
 from mgb_vec_hydro.exceptions import MiniSamplingError
 from mgb_vec_hydro.execution.executor import (
     ExecutionConfig,
@@ -44,6 +46,12 @@ from mgb_vec_hydro.preparation import BLOCK_SIZE, GridSpec, read_mini_index
 
 SAMPLING_BYTES_PER_CELL = 96
 TASK_FIXED_BYTES = 8 * 1024 * 1024
+NODATA_DATASETS = ("dem", "drainage", "hand", "hru", "ltnd")
+NODATA_REPORT_FILENAMES = tuple(f"nodata_{name}.csv" for name in NODATA_DATASETS)
+
+
+class _SamplingNodataWarning(RuntimeWarning):
+    pass
 
 
 @dataclass(frozen=True)
@@ -74,6 +82,7 @@ class MiniSamplingReport:
     hru_class_ids: tuple[int, ...]
     execution: ExecutionReport
     timings: dict[str, float]
+    nodata_reports: tuple[Path, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -98,6 +107,7 @@ class _SamplingPayload:
 class _PacketResult:
     rows: tuple[dict[str, Any], ...]
     classes: tuple[int, ...]
+    nodata: tuple[tuple[int, str, int, int], ...]
 
 
 def sample_minibasins(spec: MiniSamplingSpec) -> MiniSamplingReport:
@@ -162,6 +172,7 @@ def _sample_minibasins(spec: MiniSamplingSpec) -> MiniSamplingReport:
     classes: set[int] = set()
     catchment_cells = 0
     reach_cells = 0
+    nodata_findings = []
     csv_seconds = 0.0
     publication_started = time.perf_counter()
 
@@ -177,8 +188,9 @@ def _sample_minibasins(spec: MiniSamplingSpec) -> MiniSamplingReport:
             classes.update(value.classes)
             catchment_cells += sum(int(row["_catchment_cells"]) for row in value.rows)
             reach_cells += sum(int(row["_reach_cells"]) for row in value.rows)
-            table = pa.Table.from_pylist(list(value.rows))
-            store.put(result.ordinal, table)
+            nodata_findings.extend(value.nodata)
+            if value.rows:
+                store.put(result.ordinal, pa.Table.from_pylist(list(value.rows)))
             return {"packet_staging": time.perf_counter() - started}
 
         execution = LocalExecutor(config).run(
@@ -186,6 +198,30 @@ def _sample_minibasins(spec: MiniSamplingSpec) -> MiniSamplingReport:
             _sampling_worker,
             reduce_packet,
         )
+
+        failures = [
+            message
+            for diagnostics in execution.worker_diagnostics
+            for message in diagnostics.get("sampling_failures", ())
+        ]
+        nodata_filenames = _write_nodata_reports(staging, nodata_findings)
+        _warn_nodata(nodata_findings)
+        nodata_reports = tuple(Path(spec.output_dir) / name for name in nodata_filenames)
+        if failures:
+            store.close()
+            if nodata_filenames:
+                publisher.publish(
+                    nodata_filenames,
+                    remove=tuple(
+                        name
+                        for name in NODATA_REPORT_FILENAMES
+                        if name not in nodata_filenames
+                    ),
+                )
+            message = "; ".join(failures)
+            if nodata_filenames:
+                message += f". Nodata reports saved in {spec.output_dir}"
+            raise MiniSamplingError(message)
 
         csv_started = time.perf_counter()
         class_ids = tuple(sorted(classes))
@@ -196,7 +232,13 @@ def _sample_minibasins(spec: MiniSamplingSpec) -> MiniSamplingReport:
         if execution.reduced != len(items) or not output.is_file():
             raise MiniSamplingError("Sampling output is incomplete")
         manifest = write_manifest(staging, "sample-minis", spec)
-        publisher.publish((output.name, manifest))
+        published = (output.name, manifest, *nodata_filenames)
+        publisher.publish(
+            published,
+            remove=tuple(
+                name for name in NODATA_REPORT_FILENAMES if name not in nodata_filenames
+            ),
+        )
 
     publication_seconds = (
         time.perf_counter() - publication_started - execution.wall_seconds - csv_seconds
@@ -222,6 +264,7 @@ def _sample_minibasins(spec: MiniSamplingSpec) -> MiniSamplingReport:
         tuple(sorted(classes)),
         execution,
         timings,
+        nodata_reports,
     )
 
 
@@ -420,6 +463,10 @@ def _sampling_worker_with_cache(
             "hru": np.zeros(101, dtype=np.int64),
             "catchment_cells": 0,
             "reach_cells": 0,
+            "hru_valid_cells": 0,
+            "nodata": {
+                name: 0 for name in payload.raster_assets if name != "cells"
+            },
         }
         for label in minis
     }
@@ -450,75 +497,83 @@ def _sampling_worker_with_cache(
                 continue
             selected = owner_valid & (ownership == label)
             acc = accumulators[label]
-            _require_valid(arrays["hand"], selected, label, "HAND")
-            _require_valid(arrays["ltnd"], selected, label, "LTND")
-            _require_valid(arrays["hru"], selected, label, "HRU")
-            _require_valid(arrays["drainage"], selected, label, "drainage")
-            hand_values = np.asarray(arrays["hand"].data[selected], dtype=np.float64)
-            ltnd_values = np.asarray(arrays["ltnd"].data[selected], dtype=np.float64)
-            hru_values = np.asarray(arrays["hru"].data[selected])
-            if (
-                not np.isfinite(hand_values).all()
-                or not np.isfinite(ltnd_values).all()
-                or not np.issubdtype(hru_values.dtype, np.integer)
-                or (
-                    hru_values.size and (hru_values.min() < 1 or hru_values.max() > 100)
-                )
+            acc["catchment_cells"] += int(selected.sum())
+            valid = {
+                name: _valid_cells(arrays[name], selected, label, name.upper())
+                for name in ("dem", "hand", "ltnd", "hru", "drainage")
+            }
+            for name, valid_cells in valid.items():
+                acc["nodata"][name] += int((selected & ~valid_cells).sum())
+
+            hru_values = np.asarray(arrays["hru"].data[valid["hru"]])
+            if not np.issubdtype(hru_values.dtype, np.integer) or (
+                hru_values.size and (hru_values.min() < 1 or hru_values.max() > 100)
             ):
                 raise MiniSamplingError(
                     f"Mini {minis[label].mini_id} contains invalid sampled values"
                 )
-            flooded = hand_values <= 100
-            areas = _cell_areas_km2(
-                payload.grid,
-                window,
-                selected & (np.asarray(arrays["hand"].data) <= 100),
+            hand_values = np.asarray(
+                arrays["hand"].data[valid["hand"]], dtype=np.float64
             )
-            if not np.isfinite(areas).all() or np.any(areas <= 0):
-                raise MiniSamplingError(
-                    f"Mini {minis[label].mini_id} has invalid geodesic cell areas"
-                )
-            bins = np.searchsorted(np.arange(1, 101), hand_values[flooded], side="left")
-            acc["flooded_area"] += np.bincount(
-                bins, weights=areas, minlength=101
+            bins = np.searchsorted(np.arange(1, 101), hand_values, side="left")
+            acc["flooded_area"] += np.bincount(bins, minlength=101)
+
+            paired = valid["hand"] & valid["ltnd"]
+            acc["hand"].append(
+                np.asarray(arrays["hand"].data[paired], dtype=np.float64)
             )
-            drainage = np.asarray(arrays["drainage"].data) != 0
-            reach = selected & drainage
-            _require_valid(arrays["dem"], reach, label, "DEM")
+            acc["ltnd"].append(
+                np.asarray(arrays["ltnd"].data[paired], dtype=np.float64)
+            )
+            reach = (
+                valid["drainage"]
+                & (np.asarray(arrays["drainage"].data) != 0)
+                & valid["dem"]
+            )
             dem_values = np.asarray(arrays["dem"].data[reach], dtype=np.float64)
-            if not np.isfinite(dem_values).all():
-                raise MiniSamplingError(
-                    f"Mini {minis[label].mini_id} contains non-finite DEM values"
-                )
-            acc["hand"].append(hand_values)
-            acc["ltnd"].append(ltnd_values)
             if dem_values.size:
                 acc["dem"].append(dem_values)
-            acc["hru"] += np.bincount(hru_values, minlength=101)[:101]
-            acc["catchment_cells"] += int(selected.sum())
+            if hru_values.size:
+                acc["hru"] += np.bincount(hru_values, minlength=101)[:101]
+                acc["hru_valid_cells"] += int(hru_values.size)
             acc["reach_cells"] += int(reach.sum())
         computation_seconds += time.perf_counter() - started
 
     rows = []
     classes: set[int] = set()
+    nodata = []
+    failures = []
     for value in payload.minis:
         acc = accumulators[value.mini_id]
-        if not acc["hand"]:
-            raise MiniSamplingError(
-                f"Mini {value.mini_id} has no sampled catchment raster cells"
+        for name, count in acc["nodata"].items():
+            if count:
+                nodata.append((value.mini_id, name, count, acc["catchment_cells"]))
+        missing_statistics = [
+            statistic
+            for has_values, statistic in (
+                (acc["hru_valid_cells"], "HRU percentages"),
+                (acc["flooded_area"].sum(), "flooded area (HAND)"),
+                (sum(values.size for values in acc["dem"]), "DEM reach statistics"),
+                (
+                    sum(values.size for values in acc["hand"]),
+                    "paired HAND/LTND statistics",
+                ),
             )
-        if not acc["dem"]:
-            raise MiniSamplingError(
-                f"Mini {value.mini_id} has no sampled DEM reach cells"
+            if not has_values
+        ]
+        if missing_statistics:
+            failures.extend(
+                f"Mini {value.mini_id} has no valid data for {statistic}"
+                for statistic in missing_statistics
             )
+            continue
         hand = np.concatenate(acc["hand"])
         ltnd = np.concatenate(acc["ltnd"])
         dem = np.concatenate(acc["dem"])
         maximum_ltnd = float(np.max(ltnd))
         if maximum_ltnd <= 0:
-            raise MiniSamplingError(
-                f"Mini {value.mini_id} has non-positive maximum LTND"
-            )
+            failures.append(f"Mini {value.mini_id} has non-positive maximum LTND")
+            continue
         length_km = value.unit_length
         row = {
             column: value.attributes[column]
@@ -538,13 +593,15 @@ def _sampling_worker_with_cache(
                 np.mean(hand[np.isclose(ltnd, maximum_ltnd)]) / (maximum_ltnd / 1000.0)
             ),
             _catchment_cells=int(acc["catchment_cells"]),
+            _hru_valid_cells=int(acc["hru_valid_cells"]),
             _reach_cells=int(acc["reach_cells"]),
         )
         row.update(
             {
                 f"flooded_area_{stage}": float(area)
                 for stage, area in enumerate(
-                    np.cumsum(acc["flooded_area"])[:100], start=1
+                    _flooded_areas(acc["flooded_area"], value.attributes["unit_area"]),
+                    start=1,
                 )
             }
         )
@@ -557,76 +614,81 @@ def _sampling_worker_with_cache(
         rows.append(row)
 
     return WorkerOutput(
-        _PacketResult(tuple(rows), tuple(sorted(classes))),
+        _PacketResult(tuple(rows), tuple(sorted(classes)), tuple(nodata)),
         timings={"raster_reads": read_seconds, "computation": computation_seconds},
         diagnostics={
             "blocks_read": blocks_read,
             "minis": len(rows),
             "catchment_cells": sum(row["_catchment_cells"] for row in rows),
             "reach_cells": sum(row["_reach_cells"] for row in rows),
+            **({"sampling_failures": tuple(failures)} if failures else {}),
         },
     )
 
 
-def _cell_areas_km2(grid: GridSpec, window, selected: np.ndarray) -> np.ndarray:
-    """Measure selected raster cells on the grid CRS ellipsoid in km²."""
-    rows, cols = np.nonzero(selected)
-    if not rows.size:
-        return np.empty(0, dtype=np.float64)
-    transform = grid.transform
-    transformer, geod = geodetic_tools(grid.crs.to_wkt())
-    if grid.crs.is_geographic:
-        # Ellipsoidal cell area is longitude-invariant, so one area per row suffices.
-        unique_rows, inverse = np.unique(rows, return_inverse=True)
-        x0 = transform.c + window.col_off * transform.a
-        x1 = x0 + transform.a
-        y1 = transform.f + (window.row_off + unique_rows) * transform.e
-        y0 = y1 + transform.e
-        xs = np.column_stack(
-            (
-                np.full(len(unique_rows), x0),
-                np.full(len(unique_rows), x1),
-                np.full(len(unique_rows), x1),
-                np.full(len(unique_rows), x0),
-            )
-        )
-        ys = np.column_stack((y0, y0, y1, y1))
-        lon, lat = transformer.transform(xs, ys)
-        row_areas = np.array(
-            [
-                abs(geod.polygon_area_perimeter(cell_lon, cell_lat)[0]) / 1e6
-                for cell_lon, cell_lat in zip(lon, lat, strict=True)
-            ]
-        )
-        return np.asarray(row_areas[inverse], dtype=np.float64)
-
-    areas = np.empty(rows.size, dtype=np.float64)
-    for start in range(0, rows.size, 4096):
-        stop = min(start + 4096, rows.size)
-        cell_rows = rows[start:stop] + window.row_off
-        cell_cols = cols[start:stop] + window.col_off
-        x0 = transform.c + cell_cols * transform.a
-        x1 = x0 + transform.a
-        y1 = transform.f + cell_rows * transform.e
-        y0 = y1 + transform.e
-        xs = np.column_stack((x0, x1, x1, x0))
-        ys = np.column_stack((y0, y0, y1, y1))
-        lon, lat = transformer.transform(xs, ys)
-        areas[start:stop] = [
-            abs(geod.polygon_area_perimeter(cell_lon, cell_lat)[0]) / 1e6
-            for cell_lon, cell_lat in zip(lon, lat, strict=True)
-        ]
-    return areas
-
-
-def _require_valid(
+def _valid_cells(
     array: np.ma.MaskedArray,
     selected: np.ndarray,
     label: int,
     name: str,
-) -> None:
-    if np.ma.getmaskarray(array)[selected].any():
-        raise MiniSamplingError(f"Mini {label} contains {name} nodata")
+) -> np.ndarray:
+    data = np.asarray(array.data)
+    valid = selected & ~np.ma.getmaskarray(array)
+    if np.issubdtype(data.dtype, np.floating):
+        values = data[valid]
+        if np.isinf(values).any():
+            raise MiniSamplingError(f"Mini {label} contains infinite {name} values")
+        nan = np.isnan(values)
+        if nan.any():
+            positions = np.flatnonzero(valid)
+            valid.flat[positions[nan]] = False
+    return valid
+
+
+def _flooded_areas(counts: np.ndarray, unit_area: float) -> np.ndarray:
+    total = int(counts.sum())
+    cumulative = np.cumsum(counts)[:100]
+    areas = unit_area * cumulative / total
+    areas[cumulative == total] = unit_area
+    return areas
+
+
+def _write_nodata_reports(
+    directory: Path,
+    findings: list[tuple[int, str, int, int]],
+) -> tuple[str, ...]:
+    by_dataset: dict[str, list[tuple[int, int, int]]] = {}
+    for mini_id, name, count, total in findings:
+        by_dataset.setdefault(name, []).append((mini_id, count, total))
+    filenames = []
+    for name in NODATA_DATASETS:
+        values = by_dataset.get(name)
+        if not values:
+            continue
+        filename = f"nodata_{name}.csv"
+        with (directory / filename).open("w", newline="", encoding="utf-8") as stream:
+            writer = csv.writer(stream, lineterminator="\n")
+            writer.writerow(("mini_id", "nodata_cells", "total_cells", "percentage_nodata"))
+            writer.writerows(
+                (mini_id, count, total, 100 * count / total)
+                for mini_id, count, total in sorted(values)
+            )
+        filenames.append(filename)
+    return tuple(filenames)
+
+
+def _warn_nodata(findings: list[tuple[int, str, int, int]]) -> None:
+    if not findings:
+        return
+    flags = sorted({f"{name}" for _, name, _, _ in findings})
+    warnings.warn(
+        "Nodata cells were found within the domain for raster(s): "
+        + ", ".join(flags)
+        + ". Statistics exclude these cells; substantial missing coverage can produce "
+        "unrealistic results. Please verify whether the affected results are suitable.",
+        _SamplingNodataWarning,
+        stacklevel=2,
+    )
 
 
 def _validate_row(row: dict[str, Any]) -> None:
@@ -662,9 +724,9 @@ def _assemble_csv(store: ArrowPacketStore, output: Path, classes: tuple[int, ...
         raise MiniSamplingError("Sampling produced no packet results")
     for key in keys:
         frame = store.pop(key).to_pandas()
-        denominators = frame["_catchment_cells"].to_numpy(dtype=float)
+        denominators = frame["_hru_valid_cells"].to_numpy(dtype=float)
         if np.any(denominators <= 0):
-            raise MiniSamplingError("Sampling produced an empty catchment")
+            raise MiniSamplingError("Sampling produced no valid HRU cells")
         for class_id in classes:
             frame[f"hru_{class_id}"] = (
                 100.0 * frame[f"_hru_{class_id}"].to_numpy(dtype=float) / denominators

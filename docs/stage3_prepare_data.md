@@ -46,6 +46,14 @@ magnitude, and raster scale/offset metadata is not applied implicitly: the
 factor multiplies the stored source values. Prepared DEM metadata records
 `units=m` and `dem_scale`; its values already include that conversion.
 
+## Nodata policy
+
+Preparation preserves source validity masks in its outputs. Non-finite values
+in continuous rasters are treated as invalid cells, and cells outside mini
+ownership are masked. Categorical rasters retain their validity masks and
+valid category values are checked before publication. Terrain and sampling
+then apply their stage-specific rules; see [shared raster nodata policy](shared_execution.md#nodata-policy).
+
 For a centimetre DEM, add `--dem-scale 0.01` to the command above. Library
 callers use `PreparationSpec(dem_scale=0.01, ...)`. Regenerate preparation,
 terrain products, and sampling into new output directories when migrating

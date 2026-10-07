@@ -51,6 +51,8 @@ before starting any processing (default: no). Python callers must explicitly
 set `overwrite=True` on the stage spec to replace existing output files. A
 published stage output is the documented flat root-level file set,
 including one `manifest-<step>.json` audit file with the inputs and parameters.
+Stages may retire known stale output files in the same rollback-safe publish
+operation; unrelated files remain untouched.
 
 ## Vector access
 
@@ -71,6 +73,21 @@ Stage 2 deliberately omits the index to preserve processing order. All
 published vector files are root-level files.
 
 ## Raster access
+
+### Nodata policy
+
+Raster validity masks are part of the data contract. Preparation carries source
+masks into prepared rasters and treats non-finite continuous values as invalid;
+cells outside mini ownership are masked. Terrain requires DEM and drainage
+coverage for every owned cell, plus valid D8 coverage for every owned cell in
+D8 mode. HAND and LTND outputs retain validity masks. Sampling excludes
+ownership-exterior cells, warns with per-mini missing-cell counts for DEM,
+HAND, LTND, HRU, and drainage, and omits missing values from each statistic's
+denominator. It fails when a mini has no valid values for a required statistic.
+See the [preparation](stage3_prepare_data.md#nodata-policy),
+[terrain](stage4_terrain_cli.md#nodata-policy), and
+[sampling](stage5_mini_sampling_cli.md#nodata-policy) guides for stage-specific
+behavior.
 
 `grid_from_dem` discovers the canonical grid directly from the explicit DEM.
 `plan_raster_units` maps complete mini bounds to covering grid windows and

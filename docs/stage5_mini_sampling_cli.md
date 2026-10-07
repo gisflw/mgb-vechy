@@ -29,7 +29,7 @@ mgb-vec-hydro sample-minis \
 | `--hand` | Required | Existing raster path | Terrain height-above-drainage raster used for reach and tributary statistics. |
 | `--ltnd` | Required | Existing raster path | Local terrain-to-drainage distance raster used for tributary statistics. |
 | `--hru` | Required | Existing raster path | Integer categorical HRU raster; sampled classes must be in `1..100`. |
-| `--output-dir` | Required | Directory path | New directory where `sampled_minis.csv` is published. |
+| `--output-dir` | Required | Directory path | Directory where `sampled_minis.csv` and any nodata reports are published. |
 | `--workers` | Optional | Positive integer; default `4` | Number of worker processes used for bounded sampling packets. There is no upper limit imposed by the CLI or stage validator. |
 | `--memory-limit-mb` | Optional | Positive integer MB; default `512` | Soft memory sizing hint for sampling packets and retained statistics. |
 | `--io-slots` | Optional | Positive integer; default `2` | Maximum number of concurrent raster reads. |
@@ -67,6 +67,8 @@ sampled/
 └── sampled_minis.csv
 ```
 
+The output also contains `nodata_<raster>.csv` for each affected raster.
+
 Rows preserve the aggregation attributes (`id`, `id_down`, `sub`, `p_order`,
 `unit_length`, `upstream_length`, `unit_area`, and `upstream_area`) without
 geometry. The output includes longitude/latitude, `reach_slope`,
@@ -82,13 +84,36 @@ Reach elevation is the median DEM elevation of cells labeled for each
 mini and marked as drainage, in metres. Reach slope is the difference between
 the 85th and 10th percentiles of those same reach elevations (metres), divided
 by `0.75 * unit_length` (kilometres). Each flooded-area column is the cumulative
-sum of full owned-cell geodesic areas in km² where HAND is at or below its stage
-in metres; negative HAND is included at every stage. Stage 1 computes
+fraction of valid HAND cells in each mini at or below its stage in metres,
+multiplied by the vector catchment area; negative HAND is included at every
+stage. Stage 1 computes
 `unit_length` geodesically and aggregation preserves those kilometre metrics.
 Tributary length is maximum LTND divided by 1000; tributary slope is
-mean HAND at cells tied for that maximum divided by tributary length. These
-formulas and the six-raster block-read pattern are unchanged; elevation
-normalization and metric LTND supply their correct units.
+mean HAND at cells tied for that maximum divided by tributary length. Tributary
+statistics use only cells where both HAND and LTND are valid.
+
+## Nodata policy
+
+The ownership mask defines each mini's domain; masked cells outside ownership
+are excluded. Within a mini, masked cells and NaNs in DEM, HAND, LTND, HRU, and
+drainage are excluded from the corresponding statistics. Sampling emits one
+warning per run listing only affected flags, such as `--hand` and `--hru`. For
+each affected raster, it writes a `nodata_<raster>.csv` with columns `mini_id`,
+`nodata_cells`, `total_cells`, and `percentage_nodata`; rows include only
+affected minis and are ordered by mini ID. Reports are saved when a completed
+scan fails because a required statistic has no valid data. Infinities and
+invalid HRU classes still fail. A mini fails sampling if it has no valid HRU
+cells, HAND cells, DEM reach cells, or paired HAND/LTND cells, or if its
+maximum usable LTND is not positive.
+
+HRU percentages divide each class count by the mini's valid HRU-cell count, so
+the emitted class percentages sum to 100%. Flooded-area columns remain HAND
+thresholds in metres. Each column multiplies the fraction of valid HAND cells
+at or below its threshold by vector `unit_area`; missing HAND cells are omitted
+from the fraction's denominator, while values above 100 metres remain in it.
+Therefore, when all valid HAND cells are flooded, the area equals `unit_area`.
+This count-based calculation avoids per-cell geodesic area work. For pipeline
+behavior beyond sampling, see the [shared raster nodata policy](shared_execution.md#nodata-policy).
 
 Measured preparation, terrain, and sampling costs and reproduction commands
 are in [the unit-correction performance report](sampling_units_performance.md).

@@ -87,6 +87,7 @@ def test_worker_failure_discards_staged_output(tmp_path):
 
 def test_publication_reuses_directory_and_rolls_back_replacements(tmp_path, monkeypatch):
     import os
+
     from mgb_vec_hydro.exceptions import PublicationError
 
     target = tmp_path / "output"
@@ -127,6 +128,44 @@ def test_publication_reuses_directory_and_rolls_back_replacements(tmp_path, monk
     assert (target / "result.txt").read_text() == "replacement"
     assert (target / "other-stage.txt").read_text() == "keep"
     assert not list(tmp_path.glob(".output.tmp-*"))
+
+
+def test_publication_retires_stale_files_and_rolls_back_removals(tmp_path, monkeypatch):
+    import os
+
+    from mgb_vec_hydro.exceptions import PublicationError
+
+    target = tmp_path / "output"
+    target.mkdir()
+    stale = target / "nodata_hru.csv"
+    stale.write_text("old report")
+    (target / "other-stage.txt").write_text("keep")
+
+    publication = AtomicOutputDirectory(target, overwrite=True)
+    with publication as staging:
+        (staging / "sampled_minis.csv").write_text("new sample")
+        publication.publish(("sampled_minis.csv",), remove=(stale.name,))
+    assert not stale.exists()
+    assert (target / "sampled_minis.csv").read_text() == "new sample"
+    assert (target / "other-stage.txt").read_text() == "keep"
+
+    stale.write_text("restore on failure")
+    replace = os.replace
+
+    def fail_new_file(source, destination):
+        if str(destination) == str(target / "new.csv"):
+            raise OSError("publication failed")
+        return replace(source, destination)
+
+    monkeypatch.setattr(os, "replace", fail_new_file)
+    with pytest.raises(PublicationError, match="publication failed"):
+        publication = AtomicOutputDirectory(target, overwrite=True)
+        with publication as staging:
+            (staging / "new.csv").write_text("partial")
+            publication.publish(("new.csv",), remove=(stale.name,))
+    assert stale.read_text() == "restore on failure"
+    assert not (target / "new.csv").exists()
+    assert (target / "sampled_minis.csv").read_text() == "new sample"
 
 
 def test_buffered_results_are_admitted_only_once():
