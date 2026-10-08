@@ -177,6 +177,7 @@ def test_terrain_outputs_custom_agree_profile_and_strict_domain(tmp_path):
     prepared, _minis = _terrain_inputs(tmp_path)
     output_dir = tmp_path / "out"
 
+    updates = []
     report = create_terrain_dataset(
         TerrainSpec(
             dem=prepared.dem,
@@ -188,8 +189,15 @@ def test_terrain_outputs_custom_agree_profile_and_strict_domain(tmp_path):
             agree_buffer=2,
             workers=1,
 
-        )
+        ),
+        progress=updates.append,
     )
+    operations = {update.operation for update in updates}
+    assert "Validating raster inputs" in operations
+    assert "Planning minis" in operations
+    assert "Compressing hand.tif" in operations
+    assert "Validating staged rasters" in operations
+    assert "Publishing outputs" in operations
     phase_times = [report.timings[f"{phase}_wall"] for phase in ("preparing", "processing", "finalizing")]
     assert all(seconds >= 0 for seconds in phase_times)
     assert sum(phase_times) == pytest.approx(report.timings["total"])

@@ -240,6 +240,7 @@ def test_dataset_defers_geometry_and_preserves_physical_sort(tmp_path, monkeypat
         yield from original(*args, **kwargs)
 
     monkeypatch.setattr(aggregation_module, "iter_provider_batches", recording_reader)
+    updates = []
     report = aggregate_roi_dataset(
         AggregationSpec(
             roi_catchments=catchment_path,
@@ -249,8 +250,15 @@ def test_dataset_defers_geometry_and_preserves_physical_sort(tmp_path, monkeypat
             output_dir=tmp_path / "output",
             workers=1,
             batch_size=2,
-        )
+        ),
+        progress=updates.append,
     )
+    operations = {update.operation for update in updates}
+    assert "Reading catchment attributes" in operations
+    assert "Assigning minis and processing order" in operations
+    assert "Dissolving and writing mini_catchments.fgb" in operations
+    assert "Writing source-to-mini mapping" in operations
+    assert "Publishing outputs" in operations
     phase_times = [report.timings[f"{phase}_wall"] for phase in ("preparing", "processing", "finalizing")]
     assert all(seconds >= 0 for seconds in phase_times)
     assert sum(phase_times) == pytest.approx(report.timings["total"])

@@ -149,7 +149,17 @@ def test_sampling_geographic_centimetre_dem_has_metric_slopes(tmp_path):
         expected_distances.append(2 * geod.inv(lon, lat, lon + transform.a, lat)[2])
     maximum_m = max(expected_distances)
     # Existing unit_length=1 km attributes are the authoritative reach metric.
-    report = sample_minibasins(_sampling_spec(minis, prepared, terrain, tmp_path / "sampled"))
+    updates = []
+    report = sample_minibasins(
+        _sampling_spec(minis, prepared, terrain, tmp_path / "sampled"),
+        progress=updates.append,
+    )
+    operations = {update.operation for update in updates}
+    assert "Validating raster inputs" in operations
+    assert "Planning sampling packets" in operations
+    assert "Assembling sampled CSV" in operations
+    assert "Validating sampled output" in operations
+    assert "Publishing outputs" in operations
     frame = pd.read_csv(report.sampled_minis)
     np.testing.assert_allclose(frame.reach_slope, (22.4 - 4.4) / 0.75)
     np.testing.assert_allclose(frame.tributary_length, maximum_m / 1000, rtol=1e-6)

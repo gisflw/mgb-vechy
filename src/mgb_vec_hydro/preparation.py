@@ -8,6 +8,7 @@ import os
 import re
 import shutil
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
@@ -167,6 +168,7 @@ def _prepare_dataset(spec: PreparationSpec, reporter: StageReporter) -> Preparat
     _validate_spec(spec)
     output = Path(spec.output_dir)
     phase_started = time.perf_counter()
+    reporter.operation("Reading mini inputs")
     mini_catchment_vector, mini_segment_vector = _read_mini_inputs(
         Path(spec.mini_catchments), Path(spec.mini_segments)
     )
@@ -229,6 +231,7 @@ def _prepare_dataset(spec: PreparationSpec, reporter: StageReporter) -> Preparat
         io_slots=spec.io_slots,
         resource_cache_size=max(8, len(rasters)),
     )
+    reporter.operation("Planning raster blocks")
     items = _preparation_work_items(
         grid,
         rasters,
@@ -249,7 +252,10 @@ def _prepare_dataset(spec: PreparationSpec, reporter: StageReporter) -> Preparat
         ((grid.width + BLOCK_SIZE - 1) // BLOCK_SIZE)
         * ((grid.height + BLOCK_SIZE - 1) // BLOCK_SIZE)
     )
-    reporter.enter("processing", block_count)
+    reporter.enter(
+        "processing", block_count, operation="Processing raster blocks",
+        unit="blocks",
+    )
     execution = ExecutionReport(0, 0, 0, 0, 0, 0.0, {}, ())
     correction_seconds = compression_seconds = 0.0
     publisher = AtomicOutputDirectory(output, overwrite=spec.overwrite)
@@ -311,6 +317,7 @@ def _prepare_dataset(spec: PreparationSpec, reporter: StageReporter) -> Preparat
                 )
 
                 reporter.enter("finalizing")
+                reporter.operation("Correcting raster connectivity")
                 correction_started = time.perf_counter()
                 _correct_connectivity(
                     assembler,
@@ -324,25 +331,42 @@ def _prepare_dataset(spec: PreparationSpec, reporter: StageReporter) -> Preparat
                     RasterPatch,
                 )
                 correction_seconds = time.perf_counter() - correction_started
+                reporter.operation(
+                    "Building mini ownership index", total=block_count, unit="blocks"
+                )
                 assembler.specs["cells"].tags["mini_index"] = json.dumps(
-                    _ownership_index(assembler, grid, len(ordered)),
+                    _ownership_index(
+                        assembler, grid, len(ordered), progress=reporter.advance
+                    ),
                     separators=(",", ":"),
                 )
                 compression_started = time.perf_counter()
-                output_paths = assembler.finish()
+                reporter.operation(
+                    "Compressing raster outputs", total=len(product_specs), unit="rasters"
+                )
+                output_paths = assembler.finish(
+                    progress=lambda name, completed, total: reporter.operation(
+                        f"Compressing {name}.tif", completed=completed,
+                        total=total, unit="rasters",
+                    )
+                )
                 compression_seconds = time.perf_counter() - compression_started
         finally:
             shutil.rmtree(correction_root, ignore_errors=True)
 
         validation_started = time.perf_counter()
+        reporter.operation("Validating staged rasters")
         _validate_prepared_outputs(
             output_paths,
             grid,
             raster_kinds=raster_kinds,
         )
         expected_names = tuple(path.name for path in output_paths.values())
+        reporter.operation("Writing output manifest")
         expected_names += (write_manifest(staging, "prepare", spec),)
+        reporter.operation("Publishing outputs", total=1, unit="steps")
         publisher.publish(expected_names)
+        reporter.advance(1)
         validation_publication_seconds = time.perf_counter() - validation_started
 
     return PreparationReport(
@@ -621,7 +645,13 @@ def read_mini_index(cells: Path) -> list[list[int | float]]:
         return json.loads(source.tags()["mini_index"])
 
 
-def _ownership_index(assembler, grid: GridSpec, mini_count: int):
+def _ownership_index(
+    assembler,
+    grid: GridSpec,
+    mini_count: int,
+    *,
+    progress: Callable[[int], None] | None = None,
+):
     """Accumulate tight final ownership bounds using one bounded block scan."""
     from mgb_vec_hydro.execution.raster import plan_raster_blocks
 
@@ -629,7 +659,7 @@ def _ownership_index(assembler, grid: GridSpec, mini_count: int):
     min_cols = np.full(mini_count + 1, grid.width, dtype="int64")
     max_rows = np.full(mini_count + 1, -1, dtype="int64")
     max_cols = np.full(mini_count + 1, -1, dtype="int64")
-    for window in plan_raster_blocks(grid):
+    for completed, window in enumerate(plan_raster_blocks(grid), start=1):
         cells = assembler.read("cells", window)
         rows, cols = np.nonzero(~np.ma.getmaskarray(cells))
         ids = cells.data[rows, cols]
@@ -639,6 +669,8 @@ def _ownership_index(assembler, grid: GridSpec, mini_count: int):
         np.minimum.at(min_cols, ids, cols)
         np.maximum.at(max_rows, ids, rows)
         np.maximum.at(max_cols, ids, cols)
+        if progress is not None:
+            progress(completed)
     records = []
     for mini_id in range(1, mini_count + 1):
         if max_rows[mini_id] < 0:

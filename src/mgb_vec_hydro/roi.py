@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import time
 from collections import defaultdict
-from collections.abc import Hashable, Iterable
+from collections.abc import Callable, Hashable, Iterable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -121,6 +121,7 @@ def _define_roi_dataset(spec: RoiSpec, reporter: StageReporter) -> RoiReport:
     _validate_spec(spec)
     target_crs = parse_crs(spec.crs)
     phase_started = time.perf_counter()
+    reporter.operation("Inspecting vector inputs")
     segment_provider = _provider(
         spec.segments,
         spec.segments_layer,
@@ -139,9 +140,20 @@ def _define_roi_dataset(spec: RoiSpec, reporter: StageReporter) -> RoiReport:
         {"id": spec.id_col},
         "catchments",
     )
-    topology, segment_fids = _read_topology(segment_provider, spec.batch_size)
+    segment_total = segment_provider.info.get("features")
+    reporter.operation(
+        "Reading segment topology",
+        total=segment_total if segment_total is not None and segment_total >= 0 else None,
+        unit="features",
+    )
+    topology, segment_fids = _read_topology(
+        segment_provider, spec.batch_size, progress=reporter.advance
+    )
     outlet_ids = _coerce_outlets(spec.outlet_ids, topology["id"])
-    selected_ids, sub_by_id = _select_topology(topology, outlet_ids)
+    reporter.operation("Selecting upstream segments", unit="segments")
+    selected_ids, sub_by_id = _select_topology(
+        topology, outlet_ids, progress=reporter.advance
+    )
     selected = topology.loc[topology["id"].isin(selected_ids)].copy()
     _validate_selected_attributes(selected)
     provider_topology_seconds = time.perf_counter() - phase_started
@@ -154,8 +166,16 @@ def _define_roi_dataset(spec: RoiSpec, reporter: StageReporter) -> RoiReport:
         ArrowPacketStore(staging / ".packets", sizing.limit_bytes) as store,
     ):
         phase_started = time.perf_counter()
+        catchment_total = catchment_provider.info.get("features")
+        reporter.operation(
+            "Scanning catchment IDs",
+            total=catchment_total
+            if catchment_total is not None and catchment_total >= 0 else None,
+            unit="features",
+        )
         catchment_fids = _scan_fids(
-            catchment_provider, selected_ids, spec.batch_size
+            catchment_provider, selected_ids, spec.batch_size,
+            progress=reporter.advance,
         )
         missing = selected_ids - set(catchment_fids)
         if missing:
@@ -163,6 +183,7 @@ def _define_roi_dataset(spec: RoiSpec, reporter: StageReporter) -> RoiReport:
                 "Selected catchment ID(s) are missing: "
                 + ", ".join(map(str, sorted(missing, key=str)))
             )
+        reporter.operation("Planning selected geometry batches")
         items, kinds = _geometry_work_items(
             selected_ids,
             segment_provider,
@@ -188,7 +209,10 @@ def _define_roi_dataset(spec: RoiSpec, reporter: StageReporter) -> RoiReport:
                 metrics.setdefault(segment_id, {})[key] = float(value)
             store.put(result.ordinal, codec.encode(packet))
 
-        reporter.enter("processing", len(items))
+        reporter.enter(
+            "processing", len(items), operation="Processing geometry batches",
+            unit="batches",
+        )
         execution = LocalExecutor(
             ExecutionConfig(
                 workers=spec.workers,
@@ -207,7 +231,13 @@ def _define_roi_dataset(spec: RoiSpec, reporter: StageReporter) -> RoiReport:
             raise InvalidInputSchemaError(
                 "Selected segment and catchment IDs do not match"
             )
-        upstream_length, upstream_area = _upstream_metrics(selected, metrics)
+        reporter.operation(
+            "Calculating upstream metrics", total=len(metrics), unit="segments"
+        )
+        upstream_length, upstream_area = _upstream_metrics(
+            selected, metrics, progress=reporter.advance
+        )
+        reporter.operation("Preparing ROI output attributes")
         metric_attributes = _metric_attributes(
             selected, sub_by_id, metrics, upstream_length, upstream_area
         )
@@ -230,16 +260,23 @@ def _define_roi_dataset(spec: RoiSpec, reporter: StageReporter) -> RoiReport:
             target_crs,
             catchments_path=catchments_path,
             segments_path=segments_path,
+            progress=lambda name, completed, total: reporter.operation(
+                f"Writing {name}", completed=completed, total=total, unit="outputs"
+            ),
         )
         store.close()
+        reporter.operation("Validating staged outputs")
         _validate_roi_outputs(
             catchments_path,
             segments_path,
             target_crs=target_crs,
             feature_count=len(selected_ids),
         )
+        reporter.operation("Writing output manifest")
         manifest = write_manifest(staging, "define-roi", spec)
+        reporter.operation("Publishing outputs", total=1, unit="steps")
         publisher.publish((catchments_path.name, segments_path.name, manifest))
+        reporter.advance(1)
     output_publication_seconds = time.perf_counter() - phase_started
 
     return RoiReport(
@@ -375,6 +412,7 @@ def _write_cached_outputs(
     *,
     catchments_path: Path,
     segments_path: Path,
+    progress: Callable[[str, int, int], None] | None = None,
 ) -> None:
     lookup = attrs.set_index("id").to_dict("index")
     id_type = pa.array(attrs["id"].tolist()).type
@@ -408,7 +446,10 @@ def _write_cached_outputs(
             output = _rows_to_vector(rows, id_type, target_crs, packet.geometry_type)
             yield output
 
-    for kind, path in (("segments", segments_path), ("catchments", catchments_path)):
+    outputs = (("segments", segments_path), ("catchments", catchments_path))
+    for index, (kind, path) in enumerate(outputs):
+        if progress is not None:
+            progress(path.name, index, len(outputs))
         values = vectors(kind)
         first = next(values)
 
@@ -427,6 +468,8 @@ def _write_cached_outputs(
             crs=target_crs.to_wkt(version="WKT2_2019", pretty=False),
             layer_options={"SPATIAL_INDEX": "YES"},
         )
+        if progress is not None:
+            progress(path.name, index + 1, len(outputs))
 
 
 def define_roi(spec: RoiSpec) -> RoiReport:
@@ -477,10 +520,12 @@ def _resolve_field(info: dict[str, Any], requested: str, label: str) -> str:
 
 
 def _read_topology(
-    provider: _Provider, batch_size: int
+    provider: _Provider, batch_size: int,
+    *, progress: Callable[[int], None] | None = None,
 ) -> tuple[pd.DataFrame, dict[Hashable, int]]:
     columns = list(provider.fields.values())
     batches: list[pa.RecordBatch] = []
+    scanned = 0
     with pyogrio.open_arrow(
         provider.path,
         layer=provider.layer,
@@ -491,6 +536,9 @@ def _read_topology(
         use_pyarrow=True,
     ) as (_, stream):
         for batch in stream:
+            scanned += batch.num_rows
+            if progress is not None:
+                progress(scanned)
             order = batch[provider.fields["strahler_order"]]
             numeric = pc.cast(order, pa.float64())
             mask = pc.fill_null(
@@ -533,7 +581,9 @@ def _coerce_outlets(values: Iterable[str], ids: pd.Series) -> list[Hashable]:
 
 
 def _select_topology(
-    frame: pd.DataFrame, outlets: list[Hashable]
+    frame: pd.DataFrame,
+    outlets: list[Hashable],
+    *, progress: Callable[[int], None] | None = None,
 ) -> tuple[set[Hashable], dict[Hashable, int]]:
     ids = set(frame["id"].tolist())
     missing = [value for value in outlets if value not in ids]
@@ -550,6 +600,7 @@ def _select_topology(
     selected: set[Hashable] = set()
     sub_by_id: dict[Hashable, int] = {}
     count = len(outlets)
+    visited = 0
     for outlet_index, outlet in enumerate(outlets):
         stack = [outlet]
         domain: set[Hashable] = set()
@@ -558,10 +609,15 @@ def _select_topology(
             if current in domain:
                 continue
             domain.add(current)
+            visited += 1
+            if progress is not None and visited % 256 == 0:
+                progress(visited)
             stack.extend(upstream.get(current, ()))
         sub = count - outlet_index
         selected.update(domain)
         sub_by_id.update(dict.fromkeys(domain, sub))
+    if progress is not None:
+        progress(visited)
     _topological_order(selected, downstream)
     outlet_set = set(outlets)
     for segment_id in selected - outlet_set:
@@ -610,9 +666,13 @@ def _validate_selected_attributes(frame: pd.DataFrame) -> None:
 
 
 def _scan_fids(
-    provider: _Provider, selected_ids: set[Hashable], batch_size: int
+    provider: _Provider,
+    selected_ids: set[Hashable],
+    batch_size: int,
+    *, progress: Callable[[int], None] | None = None,
 ) -> dict[Hashable, int]:
     result: dict[Hashable, int] = {}
+    scanned = 0
     with pyogrio.open_arrow(
         provider.path,
         layer=provider.layer,
@@ -624,6 +684,9 @@ def _scan_fids(
     ) as (metadata, batches):
         fid_name = metadata.get("fid_column") or "fid"
         for batch in batches:
+            scanned += batch.num_rows
+            if progress is not None:
+                progress(scanned)
             fid_index = batch.schema.get_field_index(fid_name)
             fid_index = max(fid_index, 0)
             values = zip(
@@ -656,15 +719,23 @@ def _geometry_metric(geometry, provider: _Provider, kind: str) -> float:
     return float(value)
 
 
-def _upstream_metrics(attrs, metrics):
+def _upstream_metrics(
+    attrs, metrics, *, progress: Callable[[int], None] | None = None
+):
     downstream = dict(attrs[["id", "id_down"]].itertuples(index=False, name=None))
     length = {key: value["unit_length"] for key, value in metrics.items()}
     area = {key: value["unit_area"] for key, value in metrics.items()}
-    for segment_id in _topological_order(set(metrics), downstream):
+    for completed, segment_id in enumerate(
+        _topological_order(set(metrics), downstream), start=1
+    ):
         target = downstream.get(segment_id)
         if target in length:
             length[target] += length[segment_id]
             area[target] += area[segment_id]
+        if progress is not None and completed % 256 == 0:
+            progress(completed)
+    if progress is not None:
+        progress(len(metrics))
     return length, area
 
 

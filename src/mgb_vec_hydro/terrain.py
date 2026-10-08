@@ -1061,6 +1061,7 @@ def _create_terrain_dataset(spec: TerrainSpec, reporter: StageReporter) -> Terra
 
     overall_started = time.perf_counter()
     _validate_terrain_spec(spec)
+    reporter.operation("Inspecting DEM grid")
     grid = grid_from_dem(spec.dem)
     raster_assets = {
         "dem": Path(spec.dem),
@@ -1069,9 +1070,11 @@ def _create_terrain_dataset(spec: TerrainSpec, reporter: StageReporter) -> Terra
     }
     if spec.d8 is not None:
         raster_assets["d8"] = Path(spec.d8)
+    reporter.operation("Validating raster inputs")
     _validate_terrain_inputs(raster_assets, grid)
 
     planning_started = time.perf_counter()
+    reporter.operation("Planning minis")
     mini_units = _plan_minis(Path(spec.mini_ownership), grid)
     sizing = MemorySizing(spec.memory_limit_mb * 1024**2, spec.workers)
     memory_bytes = sizing.limit_bytes
@@ -1087,6 +1090,7 @@ def _create_terrain_dataset(spec: TerrainSpec, reporter: StageReporter) -> Terra
     publisher = AtomicOutputDirectory(spec.output_dir, overwrite=spec.overwrite)
     compression_seconds = 0.0
     with publisher as staging:
+        reporter.operation("Planning terrain batches")
         terrain_items = _terrain_work_items(
             mini_units,
             spec,
@@ -1094,7 +1098,10 @@ def _create_terrain_dataset(spec: TerrainSpec, reporter: StageReporter) -> Terra
             raster_assets,
             memory_bytes,
         )
-        reporter.enter("processing", len(terrain_items))
+        reporter.enter(
+            "processing", len(terrain_items), operation="Processing terrain batches",
+            unit="batches",
+        )
         terrain_specs = [
             RasterProductSpec(
                 "hand",
@@ -1155,12 +1162,24 @@ def _create_terrain_dataset(spec: TerrainSpec, reporter: StageReporter) -> Terra
             )
             reporter.enter("finalizing")
             started = time.perf_counter()
-            terrain_paths = terrain_assembler.finish()
+            reporter.operation(
+                "Compressing raster outputs", total=len(terrain_specs), unit="rasters"
+            )
+            terrain_paths = terrain_assembler.finish(
+                progress=lambda name, completed, total: reporter.operation(
+                    f"Compressing {name}.tif", completed=completed,
+                    total=total, unit="rasters",
+                )
+            )
             compression_seconds += time.perf_counter() - started
 
+        reporter.operation("Validating staged rasters")
         _validate_terrain_outputs(terrain_paths, grid)
+        reporter.operation("Writing output manifest")
         manifest = write_manifest(staging, "terrain-products", spec)
+        reporter.operation("Publishing outputs", total=1, unit="steps")
         publisher.publish((*tuple(path.name for path in terrain_paths.values()), manifest))
+        reporter.advance(1)
 
 
     diagnostics = tuple(terrain_report.worker_diagnostics)

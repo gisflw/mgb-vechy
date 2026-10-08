@@ -52,7 +52,14 @@ def _inputs(tmp_path, *, orders=(3, 2, 1), downstream=(None, 1, 2)):
 
 def test_roi_publishes_flat_normalized_fgb_and_provider_area(tmp_path):
     spec = replace(_inputs(tmp_path), outlet_ids=("1", "1"))
-    report = define_roi_dataset(spec)
+    updates = []
+    report = define_roi_dataset(spec, progress=updates.append)
+    operations = {update.operation for update in updates}
+    assert "Reading segment topology" in operations
+    assert "Selecting upstream segments" in operations
+    assert "Calculating upstream metrics" in operations
+    assert "Writing roi_segments.fgb" in operations
+    assert "Publishing outputs" in operations
     phase_times = [report.timings[f"{phase}_wall"] for phase in ("preparing", "processing", "finalizing")]
     assert all(seconds >= 0 for seconds in phase_times)
     assert sum(phase_times) == pytest.approx(report.timings["total"])

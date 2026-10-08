@@ -223,7 +223,13 @@ def test_prepare_pipeline_publishes_valid_canonical_dataset(tmp_path):
     phase_times = [report.timings[f"{phase}_wall"] for phase in ("preparing", "processing", "finalizing")]
     assert all(seconds >= 0 for seconds in phase_times)
     assert sum(phase_times) == pytest.approx(report.timings["total"])
-    assert [update.phase for update in updates if update.completed == 0] == ["preparing", "processing", "finalizing"]
+    phases = list(dict.fromkeys(update.phase for update in updates))
+    assert phases == ["preparing", "processing", "finalizing"]
+    operations = {update.operation for update in updates}
+    assert "Reading mini inputs" in operations
+    assert "Building mini ownership index" in operations
+    assert "Compressing cells.tif" in operations
+    assert "Publishing outputs" in operations
     processing = [update for update in updates if update.phase == "processing"]
     assert processing[-1].completed == processing[-1].total == report.execution.reduced
 
@@ -452,9 +458,11 @@ def test_connectivity_keeps_drainage_component_reassigns_enclosed_and_drops_exte
     assert targets[np.ravel_multi_index((0, 6), values.shape)] == 0
     ownership.data.ravel()[correction["flat"]] = correction["targets"]
     ownership.mask.ravel()[correction["flat"]] = correction["targets"] == 0
-    assert _ownership_index(assembler, grid, 2) == [
+    scanned_blocks = []
+    assert _ownership_index(assembler, grid, 2, progress=scanned_blocks.append) == [
         [1, 1, 3, 3, 4], [2, 3, 0, 6, 3],
     ]
+    assert scanned_blocks == [1]
 
 
 def test_connectivity_selects_by_drainage_then_size_then_first_cell():

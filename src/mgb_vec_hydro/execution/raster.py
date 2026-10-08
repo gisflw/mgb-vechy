@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from collections.abc import Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -574,7 +574,11 @@ class RasterAssembler:
         self._mask_initialized.add(patch.product)
         self._nonexclusive_products.add(patch.product)
 
-    def finish(self) -> dict[str, Path]:
+    def finish(
+        self,
+        *,
+        progress: Callable[[str, int, int], None] | None = None,
+    ) -> dict[str, Path]:
         if self._finished:
             raise RasterGridError("Raster assembler is already finalized")
         self._finished = True
@@ -590,7 +594,10 @@ class RasterAssembler:
                 source.close()
             self._sources.clear()
             with rasterio.Env(GDAL_TIFF_INTERNAL_MASK=True):
-                for name, spec in self.specs.items():
+                total = len(self.specs)
+                for index, (name, spec) in enumerate(self.specs.items()):
+                    if progress is not None:
+                        progress(name, index, total)
                     output = self.root / f"{name}.tif"
                     copy_raster(
                         working[name], output, driver="COG", BLOCKSIZE=self.block_size,
@@ -600,6 +607,8 @@ class RasterAssembler:
                         OVERVIEW_RESAMPLING=spec.overview_resampling.name.upper(),
                     )
                     outputs[name] = output
+                    if progress is not None:
+                        progress(name, index + 1, total)
             return outputs
         finally:
             self.close()

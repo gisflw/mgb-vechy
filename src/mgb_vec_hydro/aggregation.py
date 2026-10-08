@@ -3,7 +3,7 @@ from __future__ import annotations
 import heapq
 import time
 from collections import defaultdict
-from collections.abc import Hashable
+from collections.abc import Callable, Hashable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -504,10 +504,13 @@ def _mini_metric_attributes(source, groups, *, unit_column, upstream_column):
     }
 
 
-def _read_aggregation_attributes(provider, name, batch_size):
+def _read_aggregation_attributes(
+    provider, name, batch_size, *, progress: Callable[[int], None] | None = None
+):
     expected = tuple(INPUT_COLUMNS[:-1])
     batches = []
     fids = {}
+    scanned = 0
     for batch in iter_provider_batches(
         provider,
         columns=expected,
@@ -515,6 +518,9 @@ def _read_aggregation_attributes(provider, name, batch_size):
         read_geometry=False,
         return_fids=True,
     ):
+        scanned += batch.num_rows
+        if progress is not None:
+            progress(scanned)
         extra = [column for column in batch.schema.names if column not in expected]
         if len(extra) != 1:
             raise InvalidInputSchemaError("Cannot identify vector feature IDs")
@@ -579,19 +585,35 @@ def _aggregate_roi_dataset(spec: AggregationSpec, reporter: StageReporter) -> Ag
     _validate_spec(spec)
     sizing = MemorySizing(spec.memory_limit_mb * 1024**2, spec.workers)
     phase_started = time.perf_counter()
+    reporter.operation("Inspecting input vectors")
     catchment_provider = inspect_vector_provider(spec.roi_catchments)
     segment_provider = inspect_vector_provider(spec.roi_segments)
     expected_crs = catchment_provider.crs
     if segment_provider.crs != expected_crs:
         raise InvalidInputSchemaError("ROI catchment and segment CRS values differ")
+    catchment_total = catchment_provider.feature_count
+    reporter.operation(
+        "Reading catchment attributes",
+        total=catchment_total if catchment_total >= 0 else None,
+        unit="features",
+    )
     catchments, catchment_fids = _read_aggregation_attributes(
-        catchment_provider, "roi_catchments", spec.batch_size
+        catchment_provider, "roi_catchments", spec.batch_size,
+        progress=reporter.advance,
+    )
+    segment_total = segment_provider.feature_count
+    reporter.operation(
+        "Reading segment attributes",
+        total=segment_total if segment_total >= 0 else None,
+        unit="features",
     )
     segments, segment_fids = _read_aggregation_attributes(
-        segment_provider, "roi_segments", spec.batch_size
+        segment_provider, "roi_segments", spec.batch_size,
+        progress=reporter.advance,
     )
     roi_input_seconds = time.perf_counter() - phase_started
     phase_started = time.perf_counter()
+    reporter.operation("Assigning minis and processing order")
     plan = _plan_aggregation(
         catchments,
         segments,
@@ -599,6 +621,7 @@ def _aggregate_roi_dataset(spec: AggregationSpec, reporter: StageReporter) -> Ag
         lmin=spec.lmin,
     )
     aggregation_seconds = time.perf_counter() - phase_started
+    reporter.operation("Planning geometry batches")
     items, kinds = _aggregation_work_items(
         catchment_provider,
         segment_provider,
@@ -609,7 +632,10 @@ def _aggregate_roi_dataset(spec: AggregationSpec, reporter: StageReporter) -> Ag
         memory_limit_bytes=sizing.limit_bytes,
         workers=spec.workers,
     )
-    reporter.enter("processing", len(items))
+    reporter.enter(
+        "processing", len(items), operation="Processing geometry batches",
+        unit="batches",
+    )
     output = Path(spec.output_dir)
     publisher = AtomicOutputDirectory(output, overwrite=spec.overwrite)
     phase_started = time.perf_counter()
@@ -658,10 +684,16 @@ def _aggregate_roi_dataset(spec: AggregationSpec, reporter: StageReporter) -> Ag
             expected_crs,
             catchment_path=catchment_path,
             segment_path=segment_path,
+            progress=lambda name, completed, total: reporter.operation(
+                f"Dissolving and writing {name}", completed=completed,
+                total=total, unit="outputs",
+            ),
         )
         mapping = _mapping_from_packets(store, catchments)
+        reporter.operation("Writing source-to-mini mapping")
         mapping.to_csv(mapping_path, index=False)
         store.close()
+        reporter.operation("Validating staged outputs")
         _validate_aggregation_outputs(
             catchment_path,
             segment_path,
@@ -669,8 +701,11 @@ def _aggregate_roi_dataset(spec: AggregationSpec, reporter: StageReporter) -> Ag
             expected_crs=expected_crs,
             source_ids=set(catchments["id"]),
         )
+        reporter.operation("Writing output manifest")
         manifest = write_manifest(staging, "aggregate", spec)
+        reporter.operation("Publishing outputs", total=1, unit="steps")
         publisher.publish((catchment_path.name, segment_path.name, mapping_path.name, manifest))
+        reporter.advance(1)
     output_publication_seconds = time.perf_counter() - phase_started
     return AggregationReport(
         output,
@@ -792,6 +827,7 @@ def _gdal_dissolve_outputs(
     *,
     catchment_path: Path,
     segment_path: Path,
+    progress: Callable[[str, int, int], None] | None = None,
 ) -> None:
     """Dissolve assigned WKB with GDAL's SQLite engine and stream to FGB."""
     workspace = staging / ".aggregation.gpkg"
@@ -804,7 +840,9 @@ def _gdal_dissolve_outputs(
         for _, attrs_layer, _ in layers:
             pyogrio.write_arrow(attrs, workspace, layer=attrs_layer, driver="GPKG")
 
-        for source_layer, attrs_layer, output in layers:
+        for index, (source_layer, attrs_layer, output) in enumerate(layers):
+            if progress is not None:
+                progress(output.name, index, len(layers))
             geometry_name = pyogrio.read_info(workspace, layer=source_layer)[
                 "geometry_name"
             ]
@@ -829,6 +867,8 @@ def _gdal_dissolve_outputs(
                     crs=crs.to_wkt(version="WKT2_2019", pretty=False),
                     layer_options={"SPATIAL_INDEX": "NO"},
                 )
+            if progress is not None:
+                progress(output.name, index + 1, len(layers))
     finally:
         workspace.unlink(missing_ok=True)
 

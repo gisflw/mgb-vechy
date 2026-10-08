@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import time
 import warnings
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -128,6 +129,7 @@ def _sample_minibasins(spec: MiniSamplingSpec, reporter: StageReporter) -> MiniS
     overall_started = time.perf_counter()
 
     planning_started = time.perf_counter()
+    reporter.operation("Inspecting DEM grid")
     grid = grid_from_dem(spec.dem)
     raster_assets = {
         "dem": Path(spec.dem),
@@ -137,7 +139,9 @@ def _sample_minibasins(spec: MiniSamplingSpec, reporter: StageReporter) -> MiniS
         "hand": Path(spec.hand),
         "ltnd": Path(spec.ltnd),
     }
+    reporter.operation("Validating raster inputs")
     _validate_sampling_rasters(raster_assets, grid)
+    reporter.operation("Planning sampling packets")
     metadata, units = _plan_sampling(spec, grid)
     sizing = MemorySizing(spec.memory_limit_mb * 1024**2, spec.workers)
     memory_bytes = sizing.limit_bytes
@@ -168,7 +172,10 @@ def _sample_minibasins(spec: MiniSamplingSpec, reporter: StageReporter) -> MiniS
     planning_seconds = time.perf_counter() - planning_started
 
 
-    reporter.enter("processing", len(items))
+    reporter.enter(
+        "processing", len(items), operation="Processing sampling packets",
+        unit="packets",
+    )
     config = ExecutionConfig(
         workers=spec.workers,
         memory_limit_bytes=memory_bytes,
@@ -213,12 +220,20 @@ def _sample_minibasins(spec: MiniSamplingSpec, reporter: StageReporter) -> MiniS
             for diagnostics in execution.worker_diagnostics
             for message in diagnostics.get("sampling_failures", ())
         ]
-        nodata_filenames = _write_nodata_reports(staging, nodata_findings)
+        reporter.operation("Writing nodata reports")
+        nodata_filenames = _write_nodata_reports(
+            staging,
+            nodata_findings,
+            progress=lambda name, completed, total: reporter.operation(
+                f"Writing {name}", completed=completed, total=total, unit="reports"
+            ),
+        )
         _warn_nodata(nodata_findings)
         nodata_reports = tuple(Path(spec.output_dir) / name for name in nodata_filenames)
         if failures:
             store.close()
             if nodata_filenames:
+                reporter.operation("Publishing nodata reports", total=1, unit="steps")
                 publisher.publish(
                     nodata_filenames,
                     remove=tuple(
@@ -227,6 +242,7 @@ def _sample_minibasins(spec: MiniSamplingSpec, reporter: StageReporter) -> MiniS
                         if name not in nodata_filenames
                     ),
                 )
+                reporter.advance(1)
             message = "; ".join(failures)
             if nodata_filenames:
                 message += f". Nodata reports saved in {spec.output_dir}"
@@ -235,19 +251,24 @@ def _sample_minibasins(spec: MiniSamplingSpec, reporter: StageReporter) -> MiniS
         csv_started = time.perf_counter()
         class_ids = tuple(sorted(classes))
         output = staging / "sampled_minis.csv"
-        _assemble_csv(store, output, class_ids)
+        reporter.operation("Assembling sampled CSV")
+        _assemble_csv(store, output, class_ids, progress=reporter.advance)
         csv_seconds = time.perf_counter() - csv_started
         store.close()
+        reporter.operation("Validating sampled output")
         if execution.reduced != len(items) or not output.is_file():
             raise MiniSamplingError("Sampling output is incomplete")
+        reporter.operation("Writing output manifest")
         manifest = write_manifest(staging, "sample-minis", spec)
         published = (output.name, manifest, *nodata_filenames)
+        reporter.operation("Publishing outputs", total=1, unit="steps")
         publisher.publish(
             published,
             remove=tuple(
                 name for name in NODATA_REPORT_FILENAMES if name not in nodata_filenames
             ),
         )
+        reporter.advance(1)
 
     publication_seconds = (
         time.perf_counter() - publication_started - execution.wall_seconds - csv_seconds
@@ -665,16 +686,19 @@ def _flooded_areas(counts: np.ndarray, unit_area: float) -> np.ndarray:
 def _write_nodata_reports(
     directory: Path,
     findings: list[tuple[int, str, int, int]],
+    *,
+    progress: Callable[[str, int, int], None] | None = None,
 ) -> tuple[str, ...]:
     by_dataset: dict[str, list[tuple[int, int, int]]] = {}
     for mini_id, name, count, total in findings:
         by_dataset.setdefault(name, []).append((mini_id, count, total))
     filenames = []
-    for name in NODATA_DATASETS:
+    datasets = [name for name in NODATA_DATASETS if by_dataset.get(name)]
+    for index, name in enumerate(datasets):
         values = by_dataset.get(name)
-        if not values:
-            continue
         filename = f"nodata_{name}.csv"
+        if progress is not None:
+            progress(filename, index, len(datasets))
         with (directory / filename).open("w", newline="", encoding="utf-8") as stream:
             writer = csv.writer(stream, lineterminator="\n")
             writer.writerow(("mini_id", "nodata_cells", "total_cells", "percentage_nodata"))
@@ -683,6 +707,8 @@ def _write_nodata_reports(
                 for mini_id, count, total in sorted(values)
             )
         filenames.append(filename)
+        if progress is not None:
+            progress(filename, index + 1, len(datasets))
     return tuple(filenames)
 
 
@@ -710,7 +736,13 @@ def _validate_row(row: dict[str, Any]) -> None:
             )
 
 
-def _assemble_csv(store: ArrowPacketStore, output: Path, classes: tuple[int, ...]) -> None:
+def _assemble_csv(
+    store: ArrowPacketStore,
+    output: Path,
+    classes: tuple[int, ...],
+    *,
+    progress: Callable[[int, int], None] | None = None,
+) -> None:
     if not classes:
         raise MiniSamplingError("Sampled mini domain contains no valid HRU classes")
     first = True
@@ -731,7 +763,7 @@ def _assemble_csv(store: ArrowPacketStore, output: Path, classes: tuple[int, ...
     keys = sorted(store.keys)
     if not keys:
         raise MiniSamplingError("Sampling produced no packet results")
-    for key in keys:
+    for index, key in enumerate(keys, start=1):
         frame = store.pop(key).to_pandas()
         denominators = frame["_hru_valid_cells"].to_numpy(dtype=float)
         if np.any(denominators <= 0):
@@ -742,6 +774,8 @@ def _assemble_csv(store: ArrowPacketStore, output: Path, classes: tuple[int, ...
             )
         if not np.allclose(frame[percentage_columns].sum(axis=1), 100.0):
             raise MiniSamplingError("HRU percentages do not sum to 100%")
+        if progress is not None:
+            progress(index - 1, len(keys))
         frame[output_columns].to_csv(
             output,
             mode="w" if first else "a",
@@ -750,3 +784,5 @@ def _assemble_csv(store: ArrowPacketStore, output: Path, classes: tuple[int, ...
             lineterminator="\n",
         )
         first = False
+        if progress is not None:
+            progress(index, len(keys))

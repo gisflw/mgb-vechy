@@ -212,7 +212,9 @@ def test_raster_assembler_rejects_overlap_and_publishes_cog_atomically(
             assembler.write(second)
             with pytest.raises(RasterWriteConflictError, match="overlaps"):
                 assembler.write(first)
-            outputs = assembler.finish()
+            updates = []
+            outputs = assembler.finish(progress=lambda *update: updates.append(update))
+            assert updates == [("hand", 0, 1), ("hand", 1, 1)]
         assert outputs["hand"] == staging / "hand.tif"
         publication.publish(("hand.tif",))
 

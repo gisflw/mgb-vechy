@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import sys
+import threading
+import time
 import warnings
 from pathlib import Path
 
@@ -58,28 +60,72 @@ def _run_stage(stage, spec):
         "processing": "Processing batches",
         "finalizing": "Finalizing outputs",
     }
+    if not sys.stderr.isatty():
+        return stage(spec, progress=lambda _: None)
+
+    state = {
+        "operation": labels["preparing"],
+        "completed": 0,
+        "total": None,
+        "unit": None,
+        "started": time.monotonic(),
+        "frame": 0,
+    }
+    lock = threading.Lock()
+    stop = threading.Event()
+    spinner = "|/-\\"
+
+    def item_show_func(_item):
+        elapsed = time.monotonic() - state["started"]
+        status = f"{spinner[state['frame'] % len(spinner)]} {elapsed:.1f}s"
+        total = state["total"]
+        if total is None:
+            if state["completed"]:
+                status += f"  {state['completed']:,} {state['unit'] or 'items'}"
+        else:
+            status += f"  {state['completed']:,}/{total:,} {state['unit'] or 'items'}"
+            if total > 0:
+                percent = min(100, int(100 * state["completed"] / total))
+                status += f" ({percent}%)"
+        return status
+
     with click.progressbar(
-        length=1, label=labels["preparing"], file=sys.stderr,
-        show_eta=False, show_percent=False, show_pos=False,
+        length=1,
+        label=state["operation"],
+        file=sys.stderr,
+        bar_template="%(label)s  %(info)s",
+        item_show_func=item_show_func,
+        show_eta=False,
+        show_percent=False,
+        show_pos=False,
     ) as bar:
-        phase = "preparing"
+        def refresh() -> None:
+            while not stop.wait(0.25):
+                with lock:
+                    state["frame"] += 1
+                    bar.label = state["operation"]
+                    bar.render_progress()
 
         def progress(update: StageProgress) -> None:
-            nonlocal phase
-            if update.phase != phase:
-                phase = update.phase
-                bar.label = labels[phase]
-                bar.length = update.total if update.total is not None else 1
-                bar.pos = 0
-                bar.finished = False
-                bar.show_percent = bar.show_pos = phase == "processing"
-                bar.render_progress()
-            if phase == "processing":
-                bar.update(update.completed - bar.pos)
+            operation = update.operation or labels[update.phase]
+            with lock:
+                if operation != state["operation"]:
+                    state["operation"] = operation
+                    state["started"] = time.monotonic()
+                state["completed"] = update.completed
+                state["total"] = update.total
+                state["unit"] = update.unit
 
-        report = stage(spec, progress=progress)
-        bar.update(max(0, (bar.length or 0) - bar.pos))
-        return report
+        thread = threading.Thread(target=refresh, name="mgb-progress", daemon=True)
+        thread.start()
+        try:
+            return stage(spec, progress=progress)
+        finally:
+            stop.set()
+            thread.join()
+            with lock:
+                bar.label = state["operation"]
+                bar.render_progress()
 
 
 @main.command("prepare")

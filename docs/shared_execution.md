@@ -150,13 +150,12 @@ shared infrastructure remains independent of those rules.
 
 ## Progress and elapsed time
 
-All five CLI commands show three broad phases on stderr: **Preparing inputs**,
-**Processing batches**, and **Finalizing outputs**. In a terminal, one changing
-progress line shows completed/total batches and a percentage during processing.
-A batch advances after its result has been incorporated, even when workers finish
-out of order. The percentage measures processing batches, not total runtime;
-finalization may still take time. Redirected output contains only the three
-phase labels, without repeated batch updates or terminal control sequences.
+All five CLI commands show the current operation on one updating stderr line.
+Operations with known counts show completed/total and a percentage; opaque
+library calls show a spinner and elapsed time. A batch advances after its result
+has been incorporated, even when workers finish out of order. The spinner only
+indicates that the operation is active. Redirected stderr receives no progress
+output or terminal control sequences.
 
 The final `Elapsed:` line prints preparing, processing, finalizing, and total
 wall-clock durations to one decimal second. These phases cover the complete
@@ -168,7 +167,7 @@ must not be added together as elapsed time.
 Python stage functions remain silent by default and accept an optional
 keyword-only `progress` callback. It receives `StageProgress` updates from
 `execution.progress`, with a `phase` (`preparing`, `processing`, or `finalizing`),
-`completed` batch count, and `total` batch count during processing. Report
-`timings` dictionaries add `preparing_wall`, `processing_wall`, and
+`completed` and optional `total` counts, plus optional `operation` and `unit`
+labels. Report `timings` dictionaries add `preparing_wall`, `processing_wall`, and
 `finalizing_wall`; `total` measures the complete call. Exceptions close the CLI
 progress display without marking the operation successful.

@@ -1,4 +1,6 @@
 from io import StringIO
+import threading
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -28,6 +30,25 @@ def test_phase_timings_cover_the_entire_run(monkeypatch):
                        StageProgress('finalizing')]
 
 
+def test_operation_counts_and_labels_do_not_change_phase_timings(monkeypatch):
+    ticks = iter((1.0, 4.0, 9.0))
+    monkeypatch.setattr('mgb_vec_hydro.execution.progress.time.perf_counter', lambda: next(ticks))
+    updates = []
+    reporter = StageReporter(updates.append)
+    reporter.operation('Reading rows', total=10, unit='features')
+    reporter.advance(7)
+    reporter.enter('processing', 3, operation='Processing batches', unit='batches')
+    timings = {}
+    reporter.finish(timings)
+    assert updates == [
+        StageProgress('preparing'),
+        StageProgress('preparing', 0, 10, 'Reading rows', 'features'),
+        StageProgress('preparing', 7, 10, 'Reading rows', 'features'),
+        StageProgress('processing', 0, 3, 'Processing batches', 'batches'),
+    ]
+    assert timings == {'preparing_wall': 3.0, 'processing_wall': 5.0, 'total': 8.0}
+
+
 @pytest.mark.parametrize('terminal', [False, True])
 @pytest.mark.parametrize('fail', [False, True])
 def test_progress_output_and_failure_cleanup(monkeypatch, terminal, fail):
@@ -39,14 +60,21 @@ def test_progress_output_and_failure_cleanup(monkeypatch, terminal, fail):
     monkeypatch.setattr('mgb_vec_hydro.cli.sys.stderr', stream)
 
     def stage(spec, *, progress):
-        progress(StageProgress('preparing'))
-        progress(StageProgress('processing', 0, 3))
-        progress(StageProgress('processing', 1, 3))
+        progress(StageProgress('preparing', operation='Checking inputs'))
+        progress(StageProgress(
+            'processing', 0, 3, 'Processing geometry batches', 'batches'
+        ))
+        progress(StageProgress(
+            'processing', 1, 3, 'Processing geometry batches', 'batches'
+        ))
         if fail:
             raise RuntimeError('worker failed')
-        progress(StageProgress('processing', 2, 3))
-        progress(StageProgress('processing', 3, 3))
-        progress(StageProgress('finalizing'))
+        progress(StageProgress(
+            'processing', 2, 3, 'Processing geometry batches', 'batches'
+        ))
+        progress(StageProgress(
+            'processing', 3, 3, 'Processing geometry batches', 'batches'
+        ))
         return SimpleNamespace(timings={})
 
     if fail:
@@ -56,13 +84,53 @@ def test_progress_output_and_failure_cleanup(monkeypatch, terminal, fail):
         _run_stage(stage, None)
     output = stream.getvalue()
     if terminal:
-        assert '33%' in output and '1/3' in output
-        if fail:
-            assert '100%' not in output and 'Finalizing outputs' not in output
-        assert output.endswith('\n')
+        assert 'Processing geometry batches' in output
+        assert ('33%' in output and '1/3' in output) if fail else '100%' in output
+        assert output.count('\n') == 1
     else:
-        assert output.splitlines() == ['Preparing inputs', 'Processing batches'] + (
-            [] if fail else ['Finalizing outputs'])
+        assert output == ''
+
+
+def test_terminal_refresh_is_throttled_and_animates_without_stage_events(monkeypatch):
+    class TerminalStream(StringIO):
+        def isatty(self):
+            return True
+
+    stream = TerminalStream()
+    monkeypatch.setattr('mgb_vec_hydro.cli.sys.stderr', stream)
+
+    def stage(spec, *, progress):
+        for completed in range(101):
+            progress(StageProgress(
+                'preparing', completed, 100, 'Scanning vector rows', 'features'
+            ))
+        time.sleep(0.55)
+        return SimpleNamespace(timings={})
+
+    _run_stage(stage, None)
+    output = stream.getvalue()
+    assert 'Scanning vector rows' in output and '100/100 features (100%)' in output
+    assert 3 <= output.count('\r') <= 5
+    assert output.count('\n') == 1
+
+
+@pytest.mark.parametrize('failure', [RuntimeError, KeyboardInterrupt])
+def test_terminal_refresh_thread_stops_after_failure(monkeypatch, failure):
+    class TerminalStream(StringIO):
+        def isatty(self):
+            return True
+
+    monkeypatch.setattr('mgb_vec_hydro.cli.sys.stderr', TerminalStream())
+
+    def stage(spec, *, progress):
+        raise failure('stage failed')
+
+    with pytest.raises(failure, match='stage failed'):
+        _run_stage(stage, None)
+    assert not any(
+        thread.name == 'mgb-progress' and thread.is_alive()
+        for thread in threading.enumerate()
+    )
 
 
 def test_cli_prints_only_elapsed_phase_timings(capsys):
@@ -83,15 +151,20 @@ def test_publication_failure_does_not_complete_finalization(monkeypatch):
         return bar
 
     monkeypatch.setattr(click, 'progressbar', recording_bar)
-    monkeypatch.setattr('mgb_vec_hydro.cli.sys.stderr', StringIO())
+    class TerminalStream(StringIO):
+        def isatty(self):
+            return True
+
+    monkeypatch.setattr('mgb_vec_hydro.cli.sys.stderr', TerminalStream())
 
     def stage(spec, *, progress):
-        progress(StageProgress('processing', 0, 1))
-        progress(StageProgress('processing', 1, 1))
-        progress(StageProgress('finalizing'))
+        progress(StageProgress(
+            'finalizing', 0, 1, 'Publishing outputs', 'steps'
+        ))
         raise RuntimeError('publication failed')
 
     with pytest.raises(RuntimeError, match='publication failed'):
         _run_stage(stage, None)
-    assert bars[0].label == 'Finalizing outputs'
+    assert bars[0].label == 'Publishing outputs'
     assert bars[0].pos == 0 and not bars[0].finished
+    assert '100%' not in bars[0].file.getvalue()
