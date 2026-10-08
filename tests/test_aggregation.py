@@ -1,5 +1,6 @@
 import pandas as pd
 import pytest
+import shapely
 from shapely.geometry import LineString, Polygon
 
 import mgb_vec_hydro.aggregation as aggregation_module
@@ -278,6 +279,50 @@ def test_dataset_defers_geometry_and_preserves_physical_sort(tmp_path, monkeypat
     mapping_frame = pd.read_csv(report.source_to_mini)
     mapping = dict(zip(mapping_frame["id"], mapping_frame["mini_id"]))
     assert mapping == {"large-head": 3, "mouth": 4, "other-mouth": 1, "small-head": 2}
+
+
+def test_dataset_dissolves_mini_groups_in_parallel(tmp_path):
+    ids = tuple(range(1, 9))
+    catchments, segments = _inputs(
+        ids=ids,
+        id_down=(None,) * len(ids),
+        sub=ids,
+        unit_length=(1.0,) * len(ids),
+        upstream_area=tuple(float(value) for value in ids),
+        water_course=ids,
+    )
+    expected = aggregate_minibasins(catchments, segments, uparea_min=0, lmin=0)
+    catchment_path = tmp_path / "catchments.fgb"
+    segment_path = tmp_path / "segments.fgb"
+    write_vector_table(catchments, catchment_path, driver="FlatGeobuf")
+    write_vector_table(segments, segment_path, driver="FlatGeobuf")
+
+    report = aggregate_roi_dataset(
+        AggregationSpec(
+            roi_catchments=catchment_path,
+            roi_segments=segment_path,
+            uparea_min=0,
+            lmin=0,
+            output_dir=tmp_path / "output",
+            workers=2,
+        )
+    )
+
+    for path, expected_vector in (
+        (report.mini_catchments, expected.catchments),
+        (report.mini_segments, expected.segments),
+    ):
+        actual = read_vector_table(path)
+        pd.testing.assert_frame_equal(
+            actual.to_pandas(decode_geometry=False).drop(
+                columns=[actual.geometry_column]
+            ),
+            expected_vector.to_pandas(decode_geometry=False).drop(
+                columns=[expected_vector.geometry_column]
+            ),
+            check_dtype=False,
+        )
+        assert shapely.equals(actual.geometries(), expected_vector.geometries()).all()
 
 
 def test_rejects_a_short_mini_without_an_eligible_target():

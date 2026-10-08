@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import heapq
+import sqlite3
 import time
 from collections import defaultdict
 from collections.abc import Callable, Hashable
@@ -109,6 +110,17 @@ class _AggregationPacket:
     assignment: dict[Hashable, Hashable]
     kind: str
     batch_size: int = 10_000
+
+
+@dataclass(frozen=True)
+class _DissolvePacket:
+    workspace: Path
+    source_layer: str
+    attrs_layer: str
+    geometry_column: str
+    spatial_index: str
+    mini_ids: tuple[int, ...]
+    attributes: pa.Table
 
 
 @dataclass(frozen=True)
@@ -641,7 +653,7 @@ def _aggregate_roi_dataset(spec: AggregationSpec, reporter: StageReporter) -> Ag
     phase_started = time.perf_counter()
     with (
         publisher as staging,
-        ArrowPacketStore(staging / ".mapping-packets", sizing.limit_bytes) as store,
+        ArrowPacketStore(staging / ".mapping-packets", sizing.limit_bytes) as mapping_store,
         sqlite_cache(sizing.coordinator_cache_bytes),
     ):
         workspace = staging / ".aggregation.gpkg"
@@ -657,7 +669,7 @@ def _aggregate_roi_dataset(spec: AggregationSpec, reporter: StageReporter) -> Ag
             )
             written.add(kind)
             if kind == "catchments":
-                store.put(work_result.ordinal, packet.table.select(
+                mapping_store.put(work_result.ordinal, packet.table.select(
                     ["source_id", "mini_id", "longitude", "latitude"]
                 ))
 
@@ -678,21 +690,28 @@ def _aggregate_roi_dataset(spec: AggregationSpec, reporter: StageReporter) -> Ag
         catchment_path = staging / "mini_catchments.fgb"
         segment_path = staging / "mini_segments.fgb"
         mapping_path = staging / "source_to_mini.csv"
+        dissolve_started = time.perf_counter()
         _gdal_dissolve_outputs(
             staging,
             plan,
             expected_crs,
+            catchment_provider=catchment_provider,
+            segment_provider=segment_provider,
+            workers=spec.workers,
+            memory_limit_bytes=sizing.limit_bytes,
+            io_slots=spec.io_slots,
             catchment_path=catchment_path,
             segment_path=segment_path,
-            progress=lambda name, completed, total: reporter.operation(
+            progress=lambda name, completed, total, unit: reporter.operation(
                 f"Dissolving and writing {name}", completed=completed,
-                total=total, unit="outputs",
+                total=total, unit=unit,
             ),
         )
-        mapping = _mapping_from_packets(store, catchments)
+        dissolution_seconds = time.perf_counter() - dissolve_started
+        mapping = _mapping_from_packets(mapping_store, catchments)
         reporter.operation("Writing source-to-mini mapping")
         mapping.to_csv(mapping_path, index=False)
-        store.close()
+        mapping_store.close()
         reporter.operation("Validating staged outputs")
         _validate_aggregation_outputs(
             catchment_path,
@@ -719,6 +738,7 @@ def _aggregate_roi_dataset(spec: AggregationSpec, reporter: StageReporter) -> Ag
             "roi_input": roi_input_seconds,
             "aggregation": aggregation_seconds,
             "geometry_execution": execution.wall_seconds,
+            "dissolution": dissolution_seconds,
             "output_publication": output_publication_seconds,
             "total": time.perf_counter() - overall_started,
         },
@@ -825,52 +845,208 @@ def _gdal_dissolve_outputs(
     plan: _AggregationPlan,
     crs: CRS,
     *,
+    catchment_provider: VectorProvider,
+    segment_provider: VectorProvider,
+    workers: int,
+    memory_limit_bytes: int,
+    io_slots: int,
     catchment_path: Path,
     segment_path: Path,
-    progress: Callable[[str, int, int], None] | None = None,
+    progress: Callable[[str, int, int, str], None] | None = None,
 ) -> None:
-    """Dissolve assigned WKB with GDAL's SQLite engine and stream to FGB."""
+    """Dissolve complete mini groups from staged WKB and stream to FlatGeobuf."""
     workspace = staging / ".aggregation.gpkg"
+    dissolve_workspace = staging / ".dissolved.gpkg"
     layers = (
-        ("catchment_sources", "catchment_attrs", catchment_path),
-        ("segment_sources", "segment_attrs", segment_path),
+        ("catchments", "catchment_sources", "catchment_attrs", catchment_path,
+         catchment_provider, plan.catchment_assignment),
+        ("segments", "segment_sources", "segment_attrs", segment_path,
+         segment_provider, plan.reach_assignment),
     )
     try:
         attrs = pa.Table.from_pandas(plan.attributes, preserve_index=False)
-        for _, attrs_layer, _ in layers:
+        for _, _, attrs_layer, _, _, _ in layers:
             pyogrio.write_arrow(attrs, workspace, layer=attrs_layer, driver="GPKG")
 
-        for index, (source_layer, attrs_layer, output) in enumerate(layers):
-            if progress is not None:
-                progress(output.name, index, len(layers))
+        if workers <= 1 or len(plan.attributes) < 4 * workers:
+            for index, (_, source_layer, attrs_layer, output, _, _) in enumerate(layers):
+                if progress is not None:
+                    progress(output.name, index, len(layers), "outputs")
+                _serial_dissolve_layer(
+                    workspace, source_layer, attrs_layer, output, plan, crs
+                )
+                if progress is not None:
+                    progress(output.name, index + 1, len(layers), "outputs")
+            return
+
+        items = []
+        kinds = {}
+        output_by_kind = {layer[0]: layer[3] for layer in layers}
+        task_totals = {layer[0]: 0 for layer in layers}
+        for kind, source_layer, attrs_layer, _, provider, assignment in layers:
             geometry_name = pyogrio.read_info(workspace, layer=source_layer)[
                 "geometry_name"
             ]
-            attribute_names = list(plan.attributes.columns)
-            select = ", ".join(f'a."{name}"' for name in attribute_names)
-            group_by = ", ".join(f'a."{name}"' for name in attribute_names)
-            sql = (
-                f'SELECT {select}, ST_Union(s."{geometry_name}") AS geometry '
-                f'FROM "{source_layer}" s JOIN "{attrs_layer}" a '
-                f'ON s."mini_id" = a."id" GROUP BY {group_by} '
-                'ORDER BY a."id"'
-            )
-            with pyogrio.open_arrow(
-                workspace, sql=sql, sql_dialect="SQLITE", use_pyarrow=True
-            ) as (metadata, batches):
-                pyogrio.write_arrow(
-                    batches,
-                    output,
-                    driver="FlatGeobuf",
-                    geometry_name=metadata.get("geometry_name") or "geometry",
-                    geometry_type="Unknown",
-                    crs=crs.to_wkt(version="WKT2_2019", pretty=False),
-                    layer_options={"SPATIAL_INDEX": "NO"},
+            spatial_index = f"idx_{source_layer}_mini_id"
+            with sqlite3.connect(workspace) as connection:
+                connection.execute(
+                    f'CREATE INDEX "{spatial_index}" '
+                    f'ON "{source_layer}" ("mini_id")'
                 )
+            source_counts = defaultdict(int)
+            for mini_id in assignment.values():
+                source_counts[mini_id] += 1
+            mini_ids = plan.attributes["id"].tolist()
+            minis_per_item = max(1, int(np.ceil(len(mini_ids) / (2 * workers))))
+            source_bytes_per_feature = _geometry_packet_bytes(provider, 1)
+            for offset in range(0, len(mini_ids), minis_per_item):
+                batch_mini_ids = tuple(mini_ids[offset : offset + minis_per_item])
+                source_count = sum(source_counts[mini_id] for mini_id in batch_mini_ids)
+                ordinal = len(items)
+                # ponytail: keep mini groups intact; split oversized groups only if real inputs exceed the memory hint.
+                items.append(
+                    WorkItem(
+                        f"dissolve-{kind}-{ordinal:012d}",
+                        ordinal,
+                        max(1, source_bytes_per_feature * source_count),
+                        _DissolvePacket(
+                            workspace,
+                            source_layer,
+                            attrs_layer,
+                            geometry_name,
+                            spatial_index,
+                            batch_mini_ids,
+                            attrs.slice(offset, len(batch_mini_ids)),
+                        ),
+                    )
+                )
+                kinds[ordinal] = kind
+                task_totals[kind] += 1
+
+        written = set()
+        completed = dict.fromkeys(task_totals, 0)
+        active_kind = "catchments"
+        if progress is not None:
+            progress(
+                output_by_kind[active_kind].name,
+                0,
+                task_totals[active_kind],
+                "batches",
+            )
+
+        def reduce_packet(work_result):
+            nonlocal active_kind
+            kind = kinds[work_result.ordinal]
+            if kind != active_kind:
+                active_kind = kind
+                if progress is not None:
+                    progress(output_by_kind[kind].name, 0, task_totals[kind], "batches")
+            table = work_result.value
+            if table["id"].to_pylist() != list(items[work_result.ordinal].payload.mini_ids):
+                raise InvalidInputSchemaError(
+                    "Dissolve output IDs do not match the requested mini groups"
+                )
+            output_layer = f"mini_{kind}"
+            write_vector_table(
+                VectorTable(table, crs, "geometry", "Unknown"),
+                dissolve_workspace,
+                driver="GPKG",
+                layer=output_layer,
+                append=output_layer in written,
+                spatial_index=False,
+            )
+            written.add(output_layer)
+            completed[kind] += 1
+            if completed[kind] == task_totals[kind]:
+                output = output_by_kind[kind]
+                with pyogrio.open_arrow(
+                    dissolve_workspace, layer=output_layer, use_pyarrow=True
+                ) as (metadata, batches):
+                    pyogrio.write_arrow(
+                        batches,
+                        output,
+                        driver="FlatGeobuf",
+                        geometry_name=metadata.get("geometry_name") or "geometry",
+                        geometry_type="Unknown",
+                        crs=crs.to_wkt(version="WKT2_2019", pretty=False),
+                        layer_options={"SPATIAL_INDEX": "NO"},
+                    )
             if progress is not None:
-                progress(output.name, index + 1, len(layers))
+                progress(
+                    output_by_kind[kind].name,
+                    completed[kind],
+                    task_totals[kind],
+                    "batches",
+                )
+
+        LocalExecutor(
+            ExecutionConfig(
+                workers=workers,
+                memory_limit_bytes=memory_limit_bytes,
+                max_in_flight=2 * workers,
+                io_slots=io_slots,
+            )
+        ).run(items, _prepare_dissolve_packet, reduce_packet)
     finally:
         workspace.unlink(missing_ok=True)
+        dissolve_workspace.unlink(missing_ok=True)
+
+
+def _serial_dissolve_layer(workspace, source_layer, attrs_layer, output, plan, crs):
+    geometry_name = pyogrio.read_info(workspace, layer=source_layer)["geometry_name"]
+    attribute_names = list(plan.attributes.columns)
+    select = ", ".join(f'a."{name}"' for name in attribute_names)
+    group_by = ", ".join(f'a."{name}"' for name in attribute_names)
+    sql = (
+        f'SELECT {select}, ST_Union(s."{geometry_name}") AS geometry '
+        f'FROM "{source_layer}" s JOIN "{attrs_layer}" a '
+        f'ON s."mini_id" = a."id" GROUP BY {group_by} '
+        'ORDER BY a."id"'
+    )
+    with pyogrio.open_arrow(
+        workspace, sql=sql, sql_dialect="SQLITE", use_pyarrow=True
+    ) as (metadata, batches):
+        pyogrio.write_arrow(
+            batches,
+            output,
+            driver="FlatGeobuf",
+            geometry_name=metadata.get("geometry_name") or "geometry",
+            geometry_type="Unknown",
+            crs=crs.to_wkt(version="WKT2_2019", pretty=False),
+            layer_options={"SPATIAL_INDEX": "NO"},
+        )
+
+
+def _prepare_dissolve_packet(payload: _DissolvePacket, context):
+    mini_ids = ", ".join(map(str, payload.mini_ids))
+    sql = (
+        f'SELECT a."id" AS mini_id, '
+        f's."{payload.geometry_column}" AS source_geometry '
+        f'FROM "{payload.attrs_layer}" a '
+        f'JOIN "{payload.source_layer}" AS s INDEXED BY "{payload.spatial_index}" '
+        f'ON s."mini_id" = a."id" WHERE a."id" IN ({mini_ids}) '
+        'ORDER BY a."id"'
+    )
+    with context.io_bound(), pyogrio.open_arrow(
+        payload.workspace, sql=sql, sql_dialect="SQLITE", use_pyarrow=True
+    ) as (_, batches):
+        batches = list(batches)
+    if not batches:
+        raise InvalidInputSchemaError("Dissolve geometry packet is empty")
+    sources = pa.Table.from_batches(batches).combine_chunks()
+    mini_ids = sources["mini_id"].to_numpy(zero_copy_only=False)
+    if set(mini_ids.tolist()) != set(payload.mini_ids):
+        raise InvalidInputSchemaError(
+            "Dissolve geometry packet does not contain every requested mini"
+        )
+    geometries = shapely.from_wkb(
+        sources["source_geometry"].to_numpy(zero_copy_only=False), on_invalid="raise"
+    )
+    groups = np.split(geometries, np.flatnonzero(np.diff(mini_ids)) + 1)
+    dissolved = [shapely.union_all(group) for group in groups]
+    return payload.attributes.append_column(
+        "geometry", pa.array(shapely.to_wkb(dissolved), type=pa.binary())
+    )
 
 
 def _validate_spec(spec):
