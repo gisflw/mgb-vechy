@@ -20,7 +20,7 @@ mgb-vec-hydro prepare \
 | `--dem` | Required | Existing raster path | DEM defining the canonical CRS, resolution, orientation, and raster grid. |
 | `--dem-scale` | Optional | Finite positive number; default `1.0` | Multiply stored DEM elevations by this factor to normalize them to metres. Use `0.01` for centimetres. |
 | `--mini-catchments` | Required | Existing vector path | Aggregated mini-catchment polygons used to define ownership and the prepared domain. |
-| `--mini-segments` | Required | Existing vector path | Aggregated mini-segment lines used to create drainage and validate the mini domain. |
+| `--mini-segments` | Required | Existing vector path | Aggregated mini-segment lines with `id_down`, used to overlay segment IDs and validate the mini domain. |
 | `--continuous-raster` | Optional; repeatable | `NAME PATH` | Named single-band continuous raster to clip and publish as `<name>.tif`; names must be valid and non-reserved. |
 | `--categorical-raster` | Optional; repeatable | `NAME PATH` | Named single-band categorical raster to clip and publish as `<name>.tif`; names must be valid and non-reserved. |
 | `--d8` | Optional; conditional | Existing raster path | Optional D8 raster to normalize and publish as `d8.tif`; must be supplied together with `--d8-encoding`. |
@@ -28,12 +28,12 @@ mgb-vec-hydro prepare \
 | `--memory-limit-mb` | Optional | Positive integer MB; default `4096` | Soft memory sizing hint for raster tasks and working storage. |
 | `--workers` | Optional | Positive integer; default `4` | Number of worker processes used for bounded block processing. There is no upper limit imposed by the CLI or stage validator. |
 | `--io-slots` | Optional | Positive integer; default `2` | Maximum number of concurrent source-raster reads. |
-| `--output-dir` | Required | Directory path | New directory where prepared COGs, cells with embedded mini bounds, and drainage are published. |
+| `--output-dir` | Required | Directory path | New directory where prepared COGs and catchment/segment ID grids with embedded mini bounds are published. |
 
 Click also provides `--help` to display the command’s generated option list.
 
 The DEM defines the native resolution and orientation. Source rasters must
-already be aligned, cover the buffered mini-catchment domain, and use a single
+already be aligned, cover the buffered polygon/segment domain, and use a single
 band. No implicit reprojection or resampling is performed. Optional D8 input
 requires `--d8-encoding canonical|esri` and is normalized to canonical
 clockwise codes. COGs use 512-pixel tiles and internal validity masks.
@@ -60,28 +60,36 @@ terrain products, and sampling into new output directories when migrating
 existing centimetre-based datasets; downstream stages do not scale a second
 time. Prepared elevations and distances must declare `units=m`.
 
-Source clipping, domain masking, cell and drainage rasterization, and
-local connectivity labeling run as bounded 512-pixel block tasks through the
+Source clipping, domain masking, catchment and segment rasterization, and
+segment collision resolution run as bounded 512-pixel block tasks through the
 shared process executor. Results may finish out of order, but the coordinator
 reduces them in row-major order and is the only process that writes working
 rasters. Use `--workers` and `--io-slots` to control CPU and concurrent source
 reads.
 
-Preparation derives its raster domain from the explicit mini-catchment file.
-Catchments and matching segments are jointly rasterized in deterministic
-512-pixel blocks. Cells exactly cover the center-of-pixel catchment union;
-shared boundary cells use the lowest mini ID, while true cell
-overlaps are rejected. Connectivity validation keeps one drainage-bearing
-8-connected component per mini, deterministically reassigning enclosed
-discarded components and masking exterior fragments. Drainage always has the
-ownership validity mask.
+Preparation rounds the combined polygon and segment bounds outward to DEM pixels
+and adds a one-cell halo, clipping only the halo at DEM edges. Geometry outside
+DEM coverage is rejected; all aligned source rasters must cover this grid.
+Polygons use center-of-pixel ownership with stable shared boundaries and reject
+true interior overlaps. Segments use `all_touched=True` and override polygon
+ownership everywhere, including gaps and exterior stream corridors. At shared
+pixels, downstream contenders win; unrelated survivors use the lowest ID.
+The `id_down` graph must have valid targets and no cycles; null and `-1` are sinks.
+Disconnected components are preserved in preparation. Terrain processing masks
+components without matching drainage in HAND and LTND and records their counts
+in `undrained_cells.csv`, without changing prepared ownership.
+
+Both grids store mini IDs as `int32`, with zero segment background and identical
+final ownership masks. Source masks include the overlay domain. When replacing
+old preparation outputs, atomic publication retires `cells.tif` and `drainage.tif`.
+Regenerate stages 3–5; binary drainage inputs and old CLI options are unsupported.
 
 Preparation requires dense integer mini IDs `1..N`, matching aggregation
-output. `cells.tif` stores those IDs directly as `int32` values. Its dataset
+output. `grid_catchments.tif` stores those IDs directly as `int32` values. Its dataset
 metadata contains a compact JSON tag named `mini_index`: ordered records
 `[mini_id, minx, miny, maxx, maxy]` in the raster CRS. Bounds are tight
-pixel-edge rectangles derived from final ownership after connectivity
-corrections, using a bounded block scan.
+pixel-edge rectangles derived from final ownership after segment overlays,
+using a bounded block scan.
 
 Terrain and sampling read this tag directly. There is no separate index file,
 version, or compatibility reader. Previously prepared rasters must be
@@ -94,8 +102,8 @@ prepared/
 ├── dem.tif
 ├── <name>.tif
 ├── d8.tif                  # optional
-├── cells.tif
-└── drainage.tif
+├── grid_catchments.tif
+└── grid_segments.tif
 ```
 
 There is no nested output directory. All files are validated before the
@@ -103,7 +111,8 @@ staged files are published into the output folder. Defaults are four
 workers, 4096 MB (4 GB) as a soft memory hint, two I/O
 slots, and one native DEM-cell buffer; worker counts may be any positive integer.
 Existing output folders are reused. The CLI asks before processing if any
-requested output files already exist. Staging-only working files are removed
+requested output files or legacy `cells.tif` / `drainage.tif` already exist.
+Staging-only working files are removed
 before publication. The CLI prints
 every concrete file path written.
 

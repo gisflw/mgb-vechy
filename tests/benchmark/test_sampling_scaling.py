@@ -46,8 +46,8 @@ def test_sampling_reports_serial_and_parallel_throughput(tmp_path, record_proper
                 mini_segments=paths["BHAE_MINI_SEGMENTS"],
 
                 dem=paths["BHAE_DEM"],
-                mini_ownership=paths["BHAE_MINI_OWNERSHIP"],
-                drainage=paths["BHAE_DRAINAGE"],
+                grid_catchments=paths["BHAE_MINI_OWNERSHIP"],
+                grid_segments=paths["BHAE_DRAINAGE"],
                 hand=paths["BHAE_HAND"],
                 ltnd=paths["BHAE_LTND"],
                 hru=paths["BHAE_HRU"],

@@ -7,6 +7,7 @@ drainage. HAND elevations continue to use the unmodified DEM.
 
 from __future__ import annotations
 
+import csv
 import heapq
 import math
 import time
@@ -51,7 +52,9 @@ from mgb_vec_hydro.execution.raster import (
     packet_raster_units,
     plan_raster_units,
 )
-from mgb_vec_hydro.preparation import GridSpec, read_mini_index
+from mgb_vec_hydro.preparation import (
+    GridSpec, read_mini_index, validate_segment_ownership,
+)
 
 # Code, row delta, column delta. This order is also the final tie-break.
 _DIRECTIONS = (
@@ -87,8 +90,8 @@ TASK_FIXED_BYTES = 8 * 1024 * 1024
 @dataclass(frozen=True)
 class TerrainSpec:
     dem: Path
-    mini_ownership: Path
-    drainage: Path
+    grid_catchments: Path
+    grid_segments: Path
     output_dir: Path
     d8: Path | None = None
     direction_source: Literal["dem", "d8"] = "dem"
@@ -118,6 +121,8 @@ class TerrainReport:
     domain_execution: ExecutionReport
     terrain_execution: ExecutionReport
     timings: dict[str, float]
+    undrained_cells_csv: Path
+    undrained_cells: int
 
 
 def _pixel_sizes(transform: Affine) -> tuple[float, float]:
@@ -292,14 +297,14 @@ def compute_flow_directions(
         pixel_height,
     )
     selected = _basin_paths_to_stream(basin_count, stream_basin, edge_data)
-    if np.any((~stream_basin) & (selected < 0)):
-        trapped = (~stream_basin) & (selected < 0)
-        cells = int(np.isin(basin, np.flatnonzero(trapped)).sum())
-        raise TerrainProductsError(
-            f"{cells} owned cells in trapped basin(s) cannot connect to matching drainage"
-        )
-    del basin, cut_max, cut_sum, corridor_length, order, rank, stream_basin, terminal
+    trapped = (~stream_basin) & (selected < 0)
+    undrained = np.zeros(basin.shape, dtype=bool)
+    basin_cells = basin >= 0
+    undrained[basin_cells] = trapped[basin[basin_cells]]
+    del basin_cells, cut_max, cut_sum, corridor_length, order, rank, stream_basin, terminal
     direction = _reverse_selected_corridors(direction, edge_data, selected)
+    direction[undrained] = -1
+    del undrained
     del edge_data, selected
     rank = _rank_only(direction)
     return direction, rank
@@ -602,6 +607,38 @@ def _rank_order(rank):
             order[position] = i
             offsets[value] += 1
     return order
+
+
+@njit(cache=True)
+def _drainage_connected_cells(owned, drainage):
+    """Keep owned cells in 8-connected components containing matching drainage."""
+    rows, cols = owned.shape
+    connected = np.zeros((rows, cols), np.bool_)
+    queue = np.empty(rows * cols, np.int64)
+    tail = 0
+    for row in range(rows):
+        for col in range(cols):
+            if owned[row, col] and drainage[row, col]:
+                connected[row, col] = 1
+                queue[tail] = row * cols + col
+                tail += 1
+    head = 0
+    while head < tail:
+        cell = queue[head]
+        head += 1
+        row, col = cell // cols, cell % cols
+        for k in range(8):
+            nr, nc = row + _DR[k], col + _DC[k]
+            if (
+                0 <= nr < rows
+                and 0 <= nc < cols
+                and owned[nr, nc]
+                and not connected[nr, nc]
+            ):
+                connected[nr, nc] = 1
+                queue[tail] = nr * cols + nc
+                tail += 1
+    return connected
 
 
 @njit(cache=True)
@@ -1032,11 +1069,14 @@ class _TerrainPayload:
 
 @dataclass(frozen=True)
 class _TerrainPatch:
+    mini_id: int
     window: Window
     valid: np.ndarray
     hand: np.ndarray
     ltnd: np.ndarray
     direction: np.ndarray | None
+    owned_cells: int
+    undrained_cells: int
 
 
 @dataclass(frozen=True)
@@ -1065,8 +1105,8 @@ def _create_terrain_dataset(spec: TerrainSpec, reporter: StageReporter) -> Terra
     grid = grid_from_dem(spec.dem)
     raster_assets = {
         "dem": Path(spec.dem),
-        "cells": Path(spec.mini_ownership),
-        "drainage": Path(spec.drainage),
+        "grid_catchments": Path(spec.grid_catchments),
+        "grid_segments": Path(spec.grid_segments),
     }
     if spec.d8 is not None:
         raster_assets["d8"] = Path(spec.d8)
@@ -1075,7 +1115,7 @@ def _create_terrain_dataset(spec: TerrainSpec, reporter: StageReporter) -> Terra
 
     planning_started = time.perf_counter()
     reporter.operation("Planning minis")
-    mini_units = _plan_minis(Path(spec.mini_ownership), grid)
+    mini_units = _plan_minis(Path(spec.grid_catchments), grid)
     sizing = MemorySizing(spec.memory_limit_mb * 1024**2, spec.workers)
     memory_bytes = sizing.limit_bytes
     planning_seconds = time.perf_counter() - planning_started
@@ -1152,14 +1192,21 @@ def _create_terrain_dataset(spec: TerrainSpec, reporter: StageReporter) -> Terra
                                 patch.valid,
                             )
                         )
+                    undrained_by_mini[patch.mini_id] = (
+                        patch.undrained_cells,
+                        patch.owned_cells,
+                    )
                 return {"output_write": time.perf_counter() - started}
 
+            undrained_by_mini = {}
             terrain_report = LocalExecutor(config).run(
                 terrain_items,
                 _terrain_worker,
                 reduce_terrain,
                 progress=reporter.execution_progress,
             )
+            reporter.operation("Writing undrained-cell report")
+            _write_undrained_report(staging / "undrained_cells.csv", undrained_by_mini)
             reporter.enter("finalizing")
             started = time.perf_counter()
             reporter.operation(
@@ -1178,13 +1225,17 @@ def _create_terrain_dataset(spec: TerrainSpec, reporter: StageReporter) -> Terra
         reporter.operation("Writing output manifest")
         manifest = write_manifest(staging, "terrain-products", spec)
         reporter.operation("Publishing outputs", total=1, unit="steps")
-        publisher.publish((*tuple(path.name for path in terrain_paths.values()), manifest))
+        publisher.publish(
+            (*tuple(path.name for path in terrain_paths.values()),
+             "undrained_cells.csv", manifest)
+        )
         reporter.advance(1)
 
 
     diagnostics = tuple(terrain_report.worker_diagnostics)
     owned_cells = sum(int(value.get("owned_cells", 0)) for value in diagnostics)
     drainage_cells = sum(int(value.get("drainage_cells", 0)) for value in diagnostics)
+    undrained_cells = sum(count for count, _ in undrained_by_mini.values())
     negative_cells = sum(
         int(value.get("negative_hand_cells", 0)) for value in diagnostics
     )
@@ -1221,7 +1272,18 @@ def _create_terrain_dataset(spec: TerrainSpec, reporter: StageReporter) -> Terra
         domain_report,
         terrain_report,
         timings,
+        output_dir / "undrained_cells.csv",
+        undrained_cells,
     )
+
+
+def _write_undrained_report(path: Path, values: dict[int, tuple[int, int]]) -> None:
+    with path.open("w", newline="", encoding="utf-8") as stream:
+        writer = csv.writer(stream, lineterminator="\n")
+        writer.writerow(("mini_id", "undrained_cells", "total_cells", "percentage_undrained"))
+        for mini_id, (undrained, total) in sorted(values.items()):
+            if undrained:
+                writer.writerow((mini_id, undrained, total, 100 * undrained / total))
 
 
 def _validate_terrain_spec(spec: TerrainSpec) -> None:
@@ -1235,8 +1297,8 @@ def _validate_terrain_spec(spec: TerrainSpec) -> None:
 def _validate_terrain_inputs(assets: dict[str, Path], grid: GridSpec) -> None:
     expected_dtypes = {
         "dem": None,
-        "cells": "int32",
-        "drainage": "uint8",
+        "grid_catchments": "int32",
+        "grid_segments": "int32",
         "d8": "uint8",
     }
     for name, path in assets.items():
@@ -1250,6 +1312,8 @@ def _validate_terrain_inputs(assets: dict[str, Path], grid: GridSpec) -> None:
                     f"{name} raster has dtype {source.dtypes[0]}, "
                     f"expected {expected}"
                 )
+
+    validate_segment_ownership(assets, grid, TerrainProductsError)
 
 
 def _validate_terrain_outputs(paths: dict[str, Path], grid: GridSpec) -> None:
@@ -1392,13 +1456,13 @@ def _terrain_worker_with_cache(
         "products": 0.0,
     }
     patches = []
-    owned_count = drainage_count = negative_count = 0
+    owned_count = drainage_count = undrained_count = negative_count = 0
     negative_min = negative_max = None
     for unit in payload.units:
         window = unit.raster.window
         read_started = time.perf_counter()
-        ownership = aligned_reader.read("cells", window)
-        drainage_values = aligned_reader.read("drainage", window)
+        ownership = aligned_reader.read("grid_catchments", window)
+        drainage_values = aligned_reader.read("grid_segments", window)
         dem = aligned_reader.read("dem", window)
         d8 = (
             aligned_reader.read("d8", window)
@@ -1415,7 +1479,8 @@ def _terrain_worker_with_cache(
             )
         if np.any(np.ma.getmaskarray(drainage_values)[owned]):
             raise TerrainProductsError("Drainage mask does not cover cells")
-        drainage = owned & (np.asarray(drainage_values.data) != 0)
+        segment_ids = np.asarray(drainage_values.data)
+        drainage = owned & (segment_ids == unit.mini_id)
         if not np.any(drainage):
             raise TerrainProductsError(
                 f"Rasterized mini {unit.mini_id} has no drainage"
@@ -1448,16 +1513,19 @@ def _terrain_worker_with_cache(
             del routing_elevation
         else:
             validation_started = time.perf_counter()
-            direction, rank = _validated_d8(d8, owned, drainage, unit.mini_id)
+            routable = _drainage_connected_cells(owned, drainage)
+            direction, rank = _validated_d8(d8, routable, drainage, unit.mini_id)
             del d8
             timings["d8_validation"] += time.perf_counter() - validation_started
+        valid = owned & (rank >= 0)
+        undrained = owned & ~valid
         product_started = time.perf_counter()
         hand, ltnd = _terrain_products_float32(
             elevation, direction, rank, transform, crs=payload.grid.crs
         )
         del elevation, labels, rank
         timings["products"] += time.perf_counter() - product_started
-        negatives = hand[owned & (hand < 0)]
+        negatives = hand[valid & (hand < 0)]
         if negatives.size:
             value_min, value_max = float(negatives.min()), float(negatives.max())
             negative_min = (
@@ -1468,10 +1536,22 @@ def _terrain_worker_with_cache(
             )
         direction_output = None
         if payload.write_flow_direction:
-            direction_output = np.where(owned, direction, 0).astype("uint8")
-        patches.append(_TerrainPatch(window, owned, hand, ltnd, direction_output))
+            direction_output = np.where(valid, direction, 0).astype("uint8")
+        patches.append(
+            _TerrainPatch(
+                unit.mini_id,
+                window,
+                valid,
+                hand,
+                ltnd,
+                direction_output,
+                int(owned.sum()),
+                int(undrained.sum()),
+            )
+        )
         owned_count += int(owned.sum())
         drainage_count += int(drainage.sum())
+        undrained_count += int(undrained.sum())
         negative_count += int(negatives.size)
     return WorkerOutput(
         _PacketValue(tuple(patches)),
@@ -1479,6 +1559,7 @@ def _terrain_worker_with_cache(
         {
             "owned_cells": owned_count,
             "drainage_cells": drainage_count,
+            "undrained_cells": undrained_count,
             "negative_hand_cells": negative_count,
             "negative_hand_min": negative_min,
             "negative_hand_max": negative_max,

@@ -130,8 +130,8 @@ def test_full_bhae_performance_target(tmp_path, record_property):
     report = create_terrain_dataset(
         TerrainSpec(
             dem=Path(values["BHAE_DEM"]),
-            mini_ownership=Path(values["BHAE_MINI_OWNERSHIP"]),
-            drainage=Path(values["BHAE_DRAINAGE"]),
+            grid_catchments=Path(values["BHAE_MINI_OWNERSHIP"]),
+            grid_segments=Path(values["BHAE_DRAINAGE"]),
             d8=Path(os.environ["BHAE_D8"]) if os.environ.get("BHAE_D8") else None,
             output_dir=tmp_path / "terrain",
         )

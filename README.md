@@ -84,8 +84,8 @@ Create strict mini-confined HAND and local terrain-to-drainage COGs. Add
 ```bash
 mgb-vec-hydro terrain-products \
   --dem prepared/dem.tif \
-  --cells prepared/cells.tif \
-  --drainage prepared/drainage.tif \
+  --grid-catchments prepared/grid_catchments.tif \
+  --grid-segments prepared/grid_segments.tif \
   --direction-source dem \
   --output-dir output/terrain
 ```
@@ -100,8 +100,8 @@ mgb-vec-hydro sample-minis \
   --mini-catchments output/minis/mini_catchments.fgb \
   --mini-segments output/minis/mini_segments.fgb \
   --dem prepared/dem.tif \
-  --cells prepared/cells.tif \
-  --drainage prepared/drainage.tif \
+  --grid-catchments prepared/grid_catchments.tif \
+  --grid-segments prepared/grid_segments.tif \
   --hand output/terrain/hand.tif \
   --ltnd output/terrain/ltnd.tif \
   --hru prepared/hru.tif \

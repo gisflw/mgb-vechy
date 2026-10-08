@@ -16,7 +16,7 @@ import shapely
 from pyproj import CRS, Transformer
 
 from mgb_vec_hydro.aggregation import AGGREGATION_COLUMNS
-from mgb_vec_hydro.crs_utils import require_metre_units
+from mgb_vec_hydro.crs_utils import geodetic_tools, require_metre_units
 from mgb_vec_hydro.exceptions import MiniSamplingError
 from mgb_vec_hydro.execution.executor import (
     ExecutionConfig,
@@ -44,11 +44,13 @@ from mgb_vec_hydro.execution.vector import (
     inspect_vector_provider,
     iter_provider_batches,
 )
-from mgb_vec_hydro.preparation import BLOCK_SIZE, GridSpec, read_mini_index
+from mgb_vec_hydro.preparation import (
+    BLOCK_SIZE, GridSpec, read_mini_index, validate_segment_ownership,
+)
 
 SAMPLING_BYTES_PER_CELL = 96
 TASK_FIXED_BYTES = 8 * 1024 * 1024
-NODATA_DATASETS = ("dem", "drainage", "hand", "hru", "ltnd")
+NODATA_DATASETS = ("dem", "grid_segments", "hand", "hru", "ltnd")
 NODATA_REPORT_FILENAMES = tuple(f"nodata_{name}.csv" for name in NODATA_DATASETS)
 
 
@@ -61,8 +63,8 @@ class MiniSamplingSpec:
     mini_catchments: Path
     mini_segments: Path
     dem: Path
-    mini_ownership: Path
-    drainage: Path
+    grid_catchments: Path
+    grid_segments: Path
     hand: Path
     ltnd: Path
     hru: Path
@@ -134,8 +136,8 @@ def _sample_minibasins(spec: MiniSamplingSpec, reporter: StageReporter) -> MiniS
     raster_assets = {
         "dem": Path(spec.dem),
         "hru": Path(spec.hru),
-        "cells": Path(spec.mini_ownership),
-        "drainage": Path(spec.drainage),
+        "grid_catchments": Path(spec.grid_catchments),
+        "grid_segments": Path(spec.grid_segments),
         "hand": Path(spec.hand),
         "ltnd": Path(spec.ltnd),
     }
@@ -304,8 +306,8 @@ def _validate_sampling_rasters(
     expected_dtypes = {
         "dem": None,
         "hru": None,
-        "cells": "int32",
-        "drainage": "uint8",
+        "grid_catchments": "int32",
+        "grid_segments": "int32",
         "hand": "float32",
         "ltnd": "float32",
     }
@@ -325,6 +327,8 @@ def _validate_sampling_rasters(
                     f"expected {expected}"
                 )
 
+    validate_segment_ownership(assets, grid, MiniSamplingError)
+
 
 def _plan_sampling(
     spec: MiniSamplingSpec,
@@ -332,7 +336,7 @@ def _plan_sampling(
 ) -> tuple[dict[int, _MiniMetadata], tuple[RasterUnit, ...]]:
     catchments_path = Path(spec.mini_catchments)
     segments_path = Path(spec.mini_segments)
-    prepared_index = read_mini_index(spec.mini_ownership)
+    prepared_index = read_mini_index(spec.grid_catchments)
     catchments = _stream_vector_metadata(
         catchments_path, "catchments", grid.crs, spec.batch_size
     )
@@ -495,7 +499,7 @@ def _sampling_worker_with_cache(
             "reach_cells": 0,
             "hru_valid_cells": 0,
             "nodata": {
-                name: 0 for name in payload.raster_assets if name != "cells"
+                name: 0 for name in payload.raster_assets if name != "grid_catchments"
             },
         }
         for label in minis
@@ -509,8 +513,8 @@ def _sampling_worker_with_cache(
         arrays = {
             "dem": rasters.read("dem", window, masked=True),
             "hru": rasters.read("hru", window, masked=True),
-            "ownership": rasters.read("cells", window, masked=True),
-            "drainage": rasters.read("drainage", window, masked=True),
+            "ownership": rasters.read("grid_catchments", window, masked=True),
+            "grid_segments": rasters.read("grid_segments", window, masked=True),
             "hand": rasters.read("hand", window, masked=True),
             "ltnd": rasters.read("ltnd", window, masked=True),
         }
@@ -520,7 +524,9 @@ def _sampling_worker_with_cache(
         started = time.perf_counter()
         ownership = np.asarray(arrays["ownership"].data)
         owner_valid = ~np.ma.getmaskarray(arrays["ownership"])
+        segment_ids = np.asarray(arrays["grid_segments"].data)
         labels = np.unique(ownership[owner_valid])
+        areas_block = None
         for raw_label in labels:
             label = int(raw_label)
             if label not in minis:
@@ -530,7 +536,7 @@ def _sampling_worker_with_cache(
             acc["catchment_cells"] += int(selected.sum())
             valid = {
                 name: _valid_cells(arrays[name], selected, label, name.upper())
-                for name in ("dem", "hand", "ltnd", "hru", "drainage")
+                for name in ("dem", "hand", "ltnd", "hru", "grid_segments")
             }
             for name, valid_cells in valid.items():
                 acc["nodata"][name] += int((selected & ~valid_cells).sum())
@@ -546,7 +552,18 @@ def _sampling_worker_with_cache(
                 arrays["hand"].data[valid["hand"]], dtype=np.float64
             )
             bins = np.searchsorted(np.arange(1, 101), hand_values, side="left")
-            acc["flooded_area"] += np.bincount(bins, minlength=101)
+            if areas_block is None:
+                hand_raster = arrays["hand"]
+                area_cells = owner_valid & ~np.ma.getmaskarray(hand_raster)
+                if np.issubdtype(hand_raster.dtype, np.floating):
+                    area_cells &= ~np.isnan(hand_raster.data)
+                areas_block = np.zeros(owner_valid.shape, dtype=np.float64)
+                areas_block[area_cells] = _cell_areas_km2(
+                    payload.grid, window, area_cells
+                )
+            acc["flooded_area"] += np.bincount(
+                bins, weights=areas_block[valid["hand"]], minlength=101
+            )
 
             paired = valid["hand"] & valid["ltnd"]
             acc["hand"].append(
@@ -556,8 +573,8 @@ def _sampling_worker_with_cache(
                 np.asarray(arrays["ltnd"].data[paired], dtype=np.float64)
             )
             reach = (
-                valid["drainage"]
-                & (np.asarray(arrays["drainage"].data) != 0)
+                valid["grid_segments"]
+                & (segment_ids == label)
                 & valid["dem"]
             )
             dem_values = np.asarray(arrays["dem"].data[reach], dtype=np.float64)
@@ -630,7 +647,7 @@ def _sampling_worker_with_cache(
             {
                 f"flooded_area_{stage}": float(area)
                 for stage, area in enumerate(
-                    _flooded_areas(acc["flooded_area"], value.attributes["unit_area"]),
+                    _flooded_areas(acc["flooded_area"]),
                     start=1,
                 )
             }
@@ -675,11 +692,58 @@ def _valid_cells(
     return valid
 
 
-def _flooded_areas(counts: np.ndarray, unit_area: float) -> np.ndarray:
-    total = int(counts.sum())
-    cumulative = np.cumsum(counts)[:100]
-    areas = unit_area * cumulative / total
-    areas[cumulative == total] = unit_area
+def _flooded_areas(cell_areas: np.ndarray) -> np.ndarray:
+    return np.cumsum(cell_areas)[:100]
+
+
+def _cell_areas_km2(grid: GridSpec, window, selected: np.ndarray) -> np.ndarray:
+    """Return geodesic pixel areas for selected cells in row-major order."""
+    cells = np.flatnonzero(selected)
+    if not cells.size:
+        return np.empty(0, dtype=np.float64)
+    rows, cols = np.divmod(cells, selected.shape[1])
+    transform = grid.transform
+    transformer, geod = geodetic_tools(grid.crs.to_wkt())
+    if grid.crs.is_geographic:
+        row_areas = {}
+        for row in np.unique(rows):
+            x0 = transform.c + (window.col_off * transform.a)
+            x1 = x0 + transform.a
+            y0 = transform.f + (window.row_off + row) * transform.e
+            y1 = y0 + transform.e
+            lon, lat = transformer.transform(
+                [x0, x1, x1, x0], [y0, y0, y1, y1]
+            )
+            area = abs(geod.polygon_area_perimeter(lon, lat)[0]) / 1e6
+            if not np.isfinite(area) or area <= 0:
+                raise MiniSamplingError(
+                    "Raster grid produced invalid geodesic cell areas"
+                )
+            row_areas[int(row)] = area
+        return np.fromiter((row_areas[int(row)] for row in rows), dtype=np.float64)
+
+    # ponytail: non-separable projected grids call Geod once per cell; use a
+    # batched ellipsoidal polygon-area API if pyproj adds one.
+    areas = np.empty(cells.size, dtype=np.float64)
+    for start in range(0, cells.size, 4096):
+        stop = min(start + 4096, cells.size)
+        block_rows, block_cols = rows[start:stop], cols[start:stop]
+        x0 = transform.c + (window.col_off + block_cols) * transform.a
+        x1 = x0 + transform.a
+        y0 = transform.f + (window.row_off + block_rows) * transform.e
+        y1 = y0 + transform.e
+        x = np.column_stack((x0, x1, x1, x0))
+        y = np.column_stack((y0, y0, y1, y1))
+        lon, lat = transformer.transform(x, y)
+        for index in range(stop - start):
+            area = abs(
+                geod.polygon_area_perimeter(lon[index], lat[index])[0]
+            ) / 1e6
+            if not np.isfinite(area) or area <= 0:
+                raise MiniSamplingError(
+                    "Raster grid produced invalid geodesic cell areas"
+                )
+            areas[start + index] = area
     return areas
 
 
@@ -715,7 +779,7 @@ def _write_nodata_reports(
 def _warn_nodata(findings: list[tuple[int, str, int, int]]) -> None:
     if not findings:
         return
-    flags = sorted({f"{name}" for _, name, _, _ in findings})
+    flags = sorted({"--" + name.replace("_", "-") for _, name, _, _ in findings})
     warnings.warn(
         "Nodata cells were found within the domain for raster(s): "
         + ", ".join(flags)

@@ -118,15 +118,15 @@ block writes and bounded corrections, and creates internally masked COGs with
 bounded compression threads. Working rasters use uncompressed Rasterio
 `MemoryFile` storage when scratch permits, reserving
 `ceil(1.25 × cells × (dtype bytes + 1)) + 8 MiB` per product. Preparation
-prioritizes cells and drainage, then remaining products by name; terrain uses
+prioritizes catchment and segment grids, then remaining products by name; terrain uses
 stable name order. Disk fallback keeps the existing working compression
 choices, and final COG compression is unchanged. Both working storage paths
 are released before publication and on failure.
 
-Preparation derives its raster domain from mini-catchment polygons and stores
-mini IDs directly in `cells.tif`. A `mini_index` dataset tag contains JSON
+Preparation derives its raster domain from mini-catchment polygons and segment
+overlays and stores mini IDs directly in `grid_catchments.tif`. A `mini_index` dataset tag contains JSON
 records `[mini_id, minx, miny, maxx, maxy]`, ordered by ID. Bounds enclose the
-final owned pixels after connectivity correction. Terrain and sampling read
+final owned pixels after segment overlays. Terrain and sampling read
 this embedded metadata directly; no index sidecar is published.
 
 ## Stage execution
@@ -137,8 +137,8 @@ each final indexed FlatGeobuf through one writer. Aggregation first streams attr
 finalizes topology, processing order, and dense IDs, then reads geometry in
 bounded packets directly into the temporary GeoPackage for dissolution,
 retaining only mapping attributes separately. Preparation clips aligned sources and
-rasterizes strict ownership/drainage in bounded parallel blocks, with deterministic ordered
-reduction and coordinator-only connectivity correction. Terrain reads
+rasterizes ownership and segment IDs in bounded parallel blocks, with deterministic ordered
+reduction and downstream-priority segment overlays. Terrain reads
 direct COG windows for complete minis and assembles HAND, LTND, and optional
 flow direction. Sampling derives block-aware packets and reduces exact mini
 statistics into bounded Arrow scratch packets before final HRU-column

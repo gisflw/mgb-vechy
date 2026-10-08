@@ -70,7 +70,7 @@ def _write_prepared(root, feature_count, raster_size):
             target.write_mask(np.full(shape, 255, dtype="uint8"), window=window)
     copy_raster(working, root / "dem.tif", driver="COG", BLOCKSIZE=512)
     working.unlink()
-    for name, dtype in (("cells", "int32"), ("drainage", "uint8")):
+    for name, dtype in (("grid_catchments", "int32"), ("grid_segments", "int32")):
         working = root / f"{name}.working.tif"
         with rasterio.open(
             working,
@@ -86,9 +86,9 @@ def _write_prepared(root, feature_count, raster_size):
             blockxsize=512,
             blockysize=512,
         ) as target:
-            if name == "cells":
+            if name == "grid_catchments":
                 target.update_tags(mini_index=f"[[1,0,0,{raster_size},{raster_size}]]")
-            target.write(np.full((raster_size, raster_size), int(name == "cells"), dtype=dtype), 1)
+            target.write(np.full((raster_size, raster_size), int(name == "grid_catchments"), dtype=dtype), 1)
             target.write_mask(np.full((raster_size, raster_size), 255, dtype="uint8"))
         copy_raster(
             working, root / f"{name}.tif", driver="COG", BLOCKSIZE=512

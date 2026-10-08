@@ -3,6 +3,7 @@ import json
 import numpy as np
 import pytest
 import rasterio
+from rasterio.shutil import copy as copy_raster
 from pyproj import CRS, Transformer
 from affine import Affine
 from shapely.geometry import LineString, Polygon
@@ -17,6 +18,8 @@ from mgb_vec_hydro.terrain import (
     TerrainSpec,
     _agree_condition_dem,
     _validated_d8,
+    _drainage_connected_cells,
+    _write_undrained_report,
     compute_flow_directions,
     compute_hand,
     compute_ltnd,
@@ -181,8 +184,8 @@ def test_terrain_outputs_custom_agree_profile_and_strict_domain(tmp_path):
     report = create_terrain_dataset(
         TerrainSpec(
             dem=prepared.dem,
-            mini_ownership=prepared.mini_ownership,
-            drainage=prepared.drainage,
+            grid_catchments=prepared.grid_catchments,
+            grid_segments=prepared.grid_segments,
             output_dir=output_dir,
             agree_sharp=12,
             agree_smooth=3,
@@ -205,7 +208,13 @@ def test_terrain_outputs_custom_agree_profile_and_strict_domain(tmp_path):
     assert report.mini_count == 2
     assert report.timings["conditioning"] >= 0
     assert sorted(path.name for path in output_dir.iterdir()) == [
-        "hand.tif", "ltnd.tif", "manifest-terrain-products.json"
+        "hand.tif", "ltnd.tif", "manifest-terrain-products.json",
+        "undrained_cells.csv",
+    ]
+    assert report.undrained_cells_csv == output_dir / "undrained_cells.csv"
+    assert report.undrained_cells == 0
+    assert (output_dir / "undrained_cells.csv").read_text().splitlines() == [
+        "mini_id,undrained_cells,total_cells,percentage_undrained"
     ]
     manifest = json.loads((output_dir / "manifest-terrain-products.json").read_text())
     assert manifest["parameters"]["agree_sharp"] == 12
@@ -218,18 +227,18 @@ def test_terrain_outputs_custom_agree_profile_and_strict_domain(tmp_path):
     assert tags["agree_buffer_pixels"] == "2"
     assert np.all(mask[:, 3] == 0)
     with (
-        rasterio.open(prepared.mini_ownership) as ownership,
-        rasterio.open(prepared.drainage) as drainage,
+        rasterio.open(prepared.grid_catchments) as ownership,
+        rasterio.open(prepared.grid_segments) as drainage,
     ):
         np.testing.assert_array_equal(ownership.dataset_mask(), drainage.dataset_mask())
         assert np.all(drainage.read(1)[ownership.dataset_mask() == 0] == 0)
-    assert [row[0] for row in read_mini_index(prepared.mini_ownership)] == [1, 2]
+    assert [row[0] for row in read_mini_index(prepared.grid_catchments)] == [1, 2]
 
 
 def test_terrain_validates_direct_grid_inputs(tmp_path):
     prepared, _minis = _terrain_inputs(tmp_path)
     mismatched = tmp_path / "mismatched-ownership.tif"
-    with rasterio.open(prepared.mini_ownership) as source:
+    with rasterio.open(prepared.grid_catchments) as source:
         profile = source.profile.copy()
         data = source.read(1)
         mask = source.dataset_mask()
@@ -243,8 +252,8 @@ def test_terrain_validates_direct_grid_inputs(tmp_path):
         create_terrain_dataset(
             TerrainSpec(
                 dem=prepared.dem,
-                mini_ownership=mismatched,
-                drainage=prepared.drainage,
+                grid_catchments=mismatched,
+                grid_segments=prepared.grid_segments,
                 output_dir=grid_output,
                 workers=1,
             )
@@ -258,8 +267,8 @@ def test_terrain_d8_mode_consumes_explicit_d8_and_publishes_only_products(tmp_pa
     report = create_terrain_dataset(
         TerrainSpec(
             dem=prepared.dem,
-            mini_ownership=prepared.mini_ownership,
-            drainage=prepared.drainage,
+            grid_catchments=prepared.grid_catchments,
+            grid_segments=prepared.grid_segments,
             d8=prepared.d8,
             direction_source="d8",
             write_flow_direction=True,
@@ -273,11 +282,62 @@ def test_terrain_d8_mode_consumes_explicit_d8_and_publishes_only_products(tmp_pa
         "hand.tif",
         "ltnd.tif",
         "manifest-terrain-products.json",
+        "undrained_cells.csv",
     ]
     manifest = json.loads((output / "manifest-terrain-products.json").read_text())
     assert manifest["parameters"]["agree_buffer"] == 4
     assert manifest["parameters"]["direction_source"] == "d8"
     assert not (output / "mini_index.csv").exists()
+
+
+@pytest.mark.parametrize("direction_source", ["dem", "d8"])
+def test_terrain_masks_disconnected_cells_in_both_routing_modes(
+    tmp_path, direction_source
+):
+    prepared, _minis = _terrain_inputs(tmp_path, with_d8=True)
+    with rasterio.open(prepared.grid_catchments) as source:
+        ownership = source.read(1)
+        profile = source.profile.copy()
+        tags = source.tags()
+        mask = source.dataset_mask()
+    ownership[:, 1] = 0
+    ownership_path = tmp_path / "ownership-with-island.tif"
+    profile.update(driver="GTiff", compress="deflate")
+    with rasterio.open(ownership_path, "w", **profile) as target:
+        target.write(ownership, 1)
+        target.write_mask(mask)
+        target.update_tags(**tags)
+    cog_path = tmp_path / "ownership-with-island-cog.tif"
+    copy_raster(ownership_path, cog_path, driver="COG")
+    ownership_path = cog_path
+
+    output = tmp_path / f"{direction_source}-island-terrain"
+    report = create_terrain_dataset(
+        TerrainSpec(
+            dem=prepared.dem,
+            grid_catchments=ownership_path,
+            grid_segments=prepared.grid_segments,
+            d8=prepared.d8,
+            direction_source=direction_source,
+            write_flow_direction=True,
+            output_dir=output,
+            workers=1,
+        )
+    )
+
+    assert report.undrained_cells == 4
+    assert (output / "undrained_cells.csv").read_text().splitlines()[1].startswith(
+        "1,4,8,50.0"
+    )
+    with (
+        rasterio.open(output / "hand.tif") as hand,
+        rasterio.open(output / "ltnd.tif") as ltnd,
+        rasterio.open(output / "flow_direction.tif") as flow,
+    ):
+        mask = hand.dataset_mask()
+        np.testing.assert_array_equal(mask, ltnd.dataset_mask())
+        np.testing.assert_array_equal(mask, flow.dataset_mask())
+        assert np.count_nonzero((mask == 0) & (ownership > 0)) == 4
 
 def test_d8_validation_terminalizes_drainage_and_rejects_invalid_paths():
     owned = np.ones((1, 3), dtype=bool)
@@ -316,6 +376,43 @@ def test_d8_validation_terminalizes_drainage_and_rejects_invalid_paths():
             drainage,
             "mini",
         )
+
+
+def test_drainage_connected_mask_uses_eight_neighbor_components():
+    owned = np.array(
+        [
+            [True, False, True, False, False, False],
+            [False, True, False, False, False, False],
+            [False, False, False, False, True, False],
+            [True, False, False, False, False, True],
+        ]
+    )
+    drainage = np.zeros_like(owned)
+    drainage[0, 0] = True
+    drainage[3, 5] = True
+
+    connected = _drainage_connected_cells(owned, drainage)
+
+    np.testing.assert_array_equal(
+        connected,
+        [
+            [True, False, True, False, False, False],
+            [False, True, False, False, False, False],
+            [False, False, False, False, True, False],
+            [False, False, False, False, False, True],
+        ],
+    )
+
+
+def test_undrained_report_sorts_affected_minis_and_omits_zero_rows(tmp_path):
+    report = tmp_path / "undrained_cells.csv"
+    _write_undrained_report(report, {8: (0, 10), 3: (2, 10), 1: (1, 4)})
+
+    assert report.read_text().splitlines() == [
+        "mini_id,undrained_cells,total_cells,percentage_undrained",
+        "1,1,4,25.0",
+        "3,2,10,20.0",
+    ]
 
 
 def test_longer_valley_route_wins_over_short_ridge_breach():
@@ -436,8 +533,8 @@ def test_ltnd_with_crs_matches_geodesic_route_sums(crs, transform, direction):
 
 def test_agree_defaults_are_unchanged(tmp_path):
     spec = TerrainSpec(
-        dem=tmp_path / "dem", mini_ownership=tmp_path / "ownership",
-        drainage=tmp_path / "drainage",
+        dem=tmp_path / "dem", grid_catchments=tmp_path / "ownership",
+        grid_segments=tmp_path / "grid_segments",
         output_dir=tmp_path / "output",
     )
     assert (spec.agree_sharp, spec.agree_smooth, spec.agree_buffer) == (80.0, 8.0, 4)
@@ -449,8 +546,8 @@ def test_terrain_missing_or_malformed_index_fails_natively(tmp_path, metadata, e
 
     prepared, _ = _terrain_inputs(tmp_path)
     working = tmp_path / "working.tif"
-    cells = tmp_path / "cells.tif"
-    with rasterio.open(prepared.mini_ownership) as source:
+    cells = tmp_path / "grid_catchments.tif"
+    with rasterio.open(prepared.grid_catchments) as source:
         profile = source.profile.copy()
         profile.update(driver="GTiff")
         with rasterio.open(working, "w", **profile) as target:
@@ -462,7 +559,25 @@ def test_terrain_missing_or_malformed_index_fails_natively(tmp_path, metadata, e
     output = tmp_path / "terrain"
     with pytest.raises(error):
         create_terrain_dataset(TerrainSpec(
-            dem=prepared.dem, mini_ownership=cells, drainage=prepared.drainage,
+            dem=prepared.dem, grid_catchments=cells, grid_segments=prepared.grid_segments,
             output_dir=output, workers=1,
         ))
     assert not output.exists()
+
+
+@pytest.mark.parametrize("wrong_id", [-1, 1, 999])
+def test_terrain_rejects_segment_ids_that_do_not_match_ownership(tmp_path, wrong_id):
+    prepared, _ = _terrain_inputs(tmp_path)
+    invalid = tmp_path / "invalid-segments.tif"
+    with rasterio.open(prepared.grid_segments) as source:
+        values = source.read(1)
+        values[values == 2] = wrong_id
+        profile = source.profile.copy()
+        profile.update(driver="COG")
+        with rasterio.open(invalid, "w", **profile) as target:
+            target.write(values, 1)
+            target.write_mask(source.dataset_mask())
+    with pytest.raises(TerrainProductsError, match="segment IDs must match"):
+        create_terrain_dataset(TerrainSpec(dem=prepared.dem,
+            grid_catchments=prepared.grid_catchments, grid_segments=invalid,
+            output_dir=tmp_path / "out", workers=1))

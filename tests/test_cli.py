@@ -22,16 +22,16 @@ def test_public_stage_commands_expose_their_primary_inputs():
         ),
         "terrain-products": (
             "--dem",
-            "--cells",
-            "--drainage",
+            "--grid-catchments",
+            "--grid-segments",
             "--direction-source",
         ),
         "sample-minis": (
             "--mini-catchments",
             "--mini-segments",
             "--dem",
-            "--cells",
-            "--drainage",
+            "--grid-catchments",
+            "--grid-segments",
             "--hand",
             "--ltnd",
             "--hru",
@@ -42,6 +42,8 @@ def test_public_stage_commands_expose_their_primary_inputs():
         result = runner.invoke(main, [command, "--help"])
         assert result.exit_code == 0
         assert all(option in result.output for option in options)
+        assert "--cells" not in result.output
+        assert "--drainage" not in result.output
         assert "--mini-index" not in result.output
         assert "--checkpoint-dir" not in result.output
 
@@ -113,9 +115,13 @@ def test_agree_cli_defaults_are_unchanged():
     ("define-roi", "define_roi_dataset", "roi_segments.fgb", []),
     ("aggregate", "aggregate_roi_dataset", "source_to_mini.csv", []),
     ("prepare", "prepare_dataset", "dem.tif", []),
+    *[("prepare", "prepare_dataset", name, []) for name in (
+        "grid_catchments.tif", "grid_segments.tif", "cells.tif", "drainage.tif",
+    )],
     ("prepare", "prepare_dataset", "hru.tif", ["--categorical-raster", "hru"]),
     ("prepare", "prepare_dataset", "d8.tif", ["--d8"]),
     ("terrain-products", "create_terrain_dataset", "hand.tif", []),
+    ("terrain-products", "create_terrain_dataset", "undrained_cells.csv", []),
     ("terrain-products", "create_terrain_dataset", "flow_direction.tif", ["--write-flow-direction"]),
     ("sample-minis", "sample_minibasins", "sampled_minis.csv", []),
     ("sample-minis", "sample_minibasins", "manifest-sample-minis.json", []),
@@ -203,15 +209,15 @@ def test_sample_cli_renders_one_clean_nodata_warning_and_lists_reports(
         "mini-catchments",
         "mini-segments",
         "dem",
-        "cells",
-        "drainage",
+        "grid_catchments",
+        "grid_segments",
         "hand",
         "ltnd",
         "hru",
     ):
         path = tmp_path / option
         path.touch()
-        args.extend([f"--{option}", str(path)])
+        args.extend(["--" + option.replace("_", "-"), str(path)])
     args.extend(["--output-dir", str(tmp_path / "out")])
 
     result = CliRunner().invoke(main, args)

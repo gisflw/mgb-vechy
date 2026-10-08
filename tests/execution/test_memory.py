@@ -64,16 +64,16 @@ def test_raster_working_storage_preserves_pixels_masks_and_cleans(tmp_path, memo
     data = np.arange(16, dtype="int32").reshape(4, 4)
     valid = data % 2 == 0
     with RasterAssembler(
-        tmp_path, grid, [RasterProductSpec("cells", "int32", tags={"units": "m"})],
+        tmp_path, grid, [RasterProductSpec("grid_catchments", "int32", tags={"units": "m"})],
         scratch_memory_bytes=memory_bytes,
     ) as assembler:
         assert bool(assembler._memory_files) == bool(memory_bytes)
-        assembler.write_block(RasterPatch("cells", Window(0, 0, 4, 4), data, valid))
-        np.testing.assert_array_equal(assembler.read("cells", Window(0, 0, 4, 4)).mask, ~valid)
+        assembler.write_block(RasterPatch("grid_catchments", Window(0, 0, 4, 4), data, valid))
+        np.testing.assert_array_equal(assembler.read("grid_catchments", Window(0, 0, 4, 4)).mask, ~valid)
         files = assembler.finish()
     assert not assembler._memory_files
     assert not list(tmp_path.glob(".*.working.tif*"))
-    with rasterio.open(files["cells"]) as source:
+    with rasterio.open(files["grid_catchments"]) as source:
         np.testing.assert_array_equal(source.read(1), data)
         np.testing.assert_array_equal(source.read_masks(1), valid * 255)
         assert source.tags()["units"] == "m"
@@ -85,7 +85,7 @@ def test_raster_working_storage_preserves_pixels_masks_and_cleans(tmp_path, memo
 def test_raster_storage_cleanup_when_compression_fails(tmp_path, monkeypatch, memory_bytes):
     grid = GridSpec(rasterio.crs.CRS.from_epsg(3857), from_origin(0, 4, 1, 1), 4, 4)
     assembler = RasterAssembler(
-        tmp_path, grid, [RasterProductSpec("cells", "int32")], scratch_memory_bytes=memory_bytes,
+        tmp_path, grid, [RasterProductSpec("grid_catchments", "int32")], scratch_memory_bytes=memory_bytes,
     )
     memories = list(assembler._memory_files.values())
 

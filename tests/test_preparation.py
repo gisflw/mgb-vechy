@@ -19,12 +19,10 @@ from mgb_vec_hydro.preparation import (
     GridSpec,
     NamedRaster,
     PreparationSpec,
-    _BlockConnectivity,
-    _label_components,
-    _plan_connectivity_correction,
     _ownership_index,
-    _rasterize_drainage_block,
     _rasterize_ownership_block,
+    _rasterize_segments_block,
+    _segment_graph,
     prepare_dataset,
     read_mini_index,
 )
@@ -228,16 +226,16 @@ def test_prepare_pipeline_publishes_valid_canonical_dataset(tmp_path):
     operations = {update.operation for update in updates}
     assert "Reading mini inputs" in operations
     assert "Building mini ownership index" in operations
-    assert "Compressing cells.tif" in operations
+    assert "Compressing grid_catchments.tif" in operations
     assert "Publishing outputs" in operations
     processing = [update for update in updates if update.phase == "processing"]
     assert processing[-1].completed == processing[-1].total == report.execution.reduced
 
     assert report.raster_count == 2
     assert sorted(path.name for path in report.output_dir.iterdir()) == [
-        "cells.tif",
         "dem.tif",
-        "drainage.tif",
+        "grid_catchments.tif",
+        "grid_segments.tif",
         "land.tif",
         "manifest-prepare.json",
     ]
@@ -249,7 +247,7 @@ def test_prepare_pipeline_publishes_valid_canonical_dataset(tmp_path):
         {"name": "land", "path": str(land.resolve()), "kind": "categorical"}
     ]
     assert not any(path.is_dir() for path in report.output_dir.iterdir())
-    assert [row[0] for row in read_mini_index(report.mini_ownership)] == [1]
+    assert [row[0] for row in read_mini_index(report.grid_catchments)] == [1]
     for name in ("dem", "land"):
         with rasterio.open(report.output_dir / f"{name}.tif") as source:
             assert source.tags(ns="IMAGE_STRUCTURE")["LAYOUT"] == "COG"
@@ -295,7 +293,7 @@ def test_parallel_preparation_matches_serial_across_multiple_blocks(tmp_path):
         )
         == 2
     )
-    for name in ("dem", "land", "d8", "cells", "drainage"):
+    for name in ("dem", "land", "d8", "grid_catchments", "grid_segments"):
         with (
             rasterio.open(reports[1].output_dir / f"{name}.tif") as serial,
             rasterio.open(reports[2].output_dir / f"{name}.tif") as parallel,
@@ -305,7 +303,7 @@ def test_parallel_preparation_matches_serial_across_multiple_blocks(tmp_path):
             np.testing.assert_array_equal(
                 serial.dataset_mask(), parallel.dataset_mask()
             )
-    assert read_mini_index(reports[1].mini_ownership) == read_mini_index(reports[2].mini_ownership)
+    assert read_mini_index(reports[1].grid_catchments) == read_mini_index(reports[2].grid_catchments)
     with rasterio.open(reports[2].d8) as normalized:
         assert np.all(normalized.read(1, masked=True).compressed() == 1)
 
@@ -402,138 +400,40 @@ def test_joint_ownership_rejects_true_cell_overlap():
         )
 
 
-def test_components_use_eight_neighbors_and_deterministic_statistics():
-    owned = np.eye(3, dtype=bool)
-    drainage = np.eye(3, dtype=bool)
-    components, sizes, drain_counts, first = _label_components(owned, drainage)
-    assert components.max() == 1
-    np.testing.assert_array_equal(sizes, [0, 3])
-    np.testing.assert_array_equal(drain_counts, [0, 3])
-    np.testing.assert_array_equal(first, [9, 0])
+
+@pytest.mark.parametrize("order", [[0, 1, 2], [2, 1, 0], [1, 0, 2]])
+@pytest.mark.parametrize("graph, winner", [
+    ({1: 2, 2: 3, 3: None}, 3),
+    ({1: None, 2: None, 3: None}, 1),
+    ({1: 3, 2: None, 3: None}, 2),
+])
+def test_segment_collisions_follow_ancestry_then_lowest_id(order, graph, winner):
+    lines = np.asarray([LineString([(0, .5), (2, .5)])] * 3, dtype=object)
+    labels = np.asarray([1, 2, 3], dtype="int32")
+    result = _rasterize_segments_block(lines[order], labels[order], (1, 2),
+                                       from_origin(0, 1, 1, 1), graph)
+    np.testing.assert_array_equal(result, [[winner, winner]])
+    assert result.dtype == np.int32
 
 
-class _ArrayAssembler:
-    def __init__(self, ownership, drainage):
-        self.arrays = {"cells": ownership, "drainage": drainage}
-
-    def read(self, product, window, *, masked=True):
-        row = int(window.row_off)
-        col = int(window.col_off)
-        height = int(window.height)
-        width = int(window.width)
-        return self.arrays[product][row : row + height, col : col + width]
-
-
-def test_connectivity_keeps_drainage_component_reassigns_enclosed_and_drops_exterior():
-    values = np.zeros((5, 7), dtype="int32")
-    valid = np.zeros_like(values, dtype=bool)
-    values[1, 1:3] = 1
-    valid[1, 1:3] = True
-    # An undrained label-1 island is completely surrounded by label 2.
-    values[2:5, 3:6] = 2
-    valid[2:5, 3:6] = True
-    values[3, 4] = 1
-    # Another label-1 component touches the exterior grid boundary.
-    values[0, 6] = 1
-    valid[0, 6] = True
-    drainage_values = np.zeros_like(values, dtype="uint8")
-    drainage_values[1, 1] = 1
-    ownership = np.ma.array(values, mask=~valid)
-    drainage = np.ma.array(drainage_values, mask=~valid)
-    assembler = _ArrayAssembler(ownership, drainage)
-    grid = GridSpec(CRS.from_epsg(3857), from_origin(0, 5, 1, 1), 7, 5)
-
-    correction = _plan_connectivity_correction(
-        assembler,
-        grid,
-        Polygon([(0, 0), (7, 0), (7, 5), (0, 5)]),
-        1,
-        "mini",
-        1_000_000,
-    )
-
-    assert correction is not None
-    targets = dict(zip(correction["flat"], correction["targets"], strict=True))
-    assert targets[np.ravel_multi_index((3, 4), values.shape)] == 2
-    assert targets[np.ravel_multi_index((0, 6), values.shape)] == 0
-    ownership.data.ravel()[correction["flat"]] = correction["targets"]
-    ownership.mask.ravel()[correction["flat"]] = correction["targets"] == 0
-    scanned_blocks = []
-    assert _ownership_index(assembler, grid, 2, progress=scanned_blocks.append) == [
-        [1, 1, 3, 3, 4], [2, 3, 0, 6, 3],
-    ]
-    assert scanned_blocks == [1]
+@pytest.mark.parametrize("downstream, error", [
+    (None, "require id_down"), ([2, 7], "missing downstream"),
+    ([2, 1], "cycle"),
+])
+def test_segment_graph_rejects_invalid_inputs(downstream, error):
+    attrs = {"id": [1, 2]}
+    if downstream is not None:
+        attrs["id_down"] = downstream
+    vector = VectorTable.from_pydict(attrs, [LineString([(0, 0), (1, 1)])] * 2,
+                                     crs="EPSG:3857", geometry_type="LineString")
+    with pytest.raises(PreparedDataError, match=error):
+        _segment_graph(vector)
 
 
-def test_connectivity_selects_by_drainage_then_size_then_first_cell():
-    owned = np.zeros((4, 7), dtype=bool)
-    owned[0, 0:2] = True
-    owned[2, 0:3] = True
-    owned[0, 5:7] = True
-    drainage = np.zeros_like(owned)
-    drainage[0, 0] = True
-    drainage[2, 0] = True
-    drainage[0, 5] = True
-    _, sizes, drain_counts, first = _label_components(owned, drainage)
-    candidates = np.flatnonzero(drain_counts[1:] > 0) + 1
-    selected = min(
-        candidates,
-        key=lambda value: (
-            -int(drain_counts[value]),
-            -int(sizes[value]),
-            int(first[value]),
-        ),
-    )
-    assert sizes[selected] == 3
-
-    # Equal drainage and size falls back to the row-major first cell.
-    owned[2, 0:3] = False
-    _, sizes, drain_counts, first = _label_components(owned, drainage)
-    candidates = np.flatnonzero(drain_counts[1:] > 0) + 1
-    selected = min(
-        candidates,
-        key=lambda value: (
-            -int(drain_counts[value]),
-            -int(sizes[value]),
-            int(first[value]),
-        ),
-    )
-    assert first[selected] == 0
-
-
-def test_joint_drainage_recovers_matching_line_hidden_by_stable_burn_order():
-    ownership = np.asarray([[1, 2]], dtype="int32")
-    valid = np.ones_like(ownership, dtype=bool)
-    segments = np.asarray(
-        [LineString([(0, 0.5), (2, 0.5)]), LineString([(0, 0.5), (2, 0.5)])],
-        dtype=object,
-    )
-    drainage = _rasterize_drainage_block(
-        segments,
-        np.asarray([1, 2], dtype="int32"),
-        ownership,
-        valid,
-        from_origin(0, 1, 1, 1),
-    )
-    np.testing.assert_array_equal(drainage, [[1, 1]])
-
-
-def test_streaming_connectivity_joins_diagonal_components_across_block_corner():
-    tracker = _BlockConnectivity(4)
-    first = np.zeros((2, 2), dtype="int32")
-    first[1, 1] = 1
-    first_valid = first != 0
-    tracker.start_row(0)
-    tracker.add_block(0, 0, first, first_valid, first_valid)
-
-    second = np.zeros((2, 2), dtype="int32")
-    second[0, 0] = 1
-    second_valid = second != 0
-    tracker.start_row(2)
-    tracker.add_block(2, 2, second, second_valid, np.zeros_like(second_valid))
-
-    assert tracker.disconnected_labels(np.asarray([1], dtype="int32")) == []
-
+def test_segment_graph_accepts_null_sinks():
+    vector = VectorTable.from_pydict({"id": [1, 2], "id_down": [2, None]},
+        [LineString([(0, 0), (1, 1)])] * 2, crs="EPSG:3857", geometry_type="LineString")
+    assert _segment_graph(vector) == {1: 2, 2: None}
 
 def test_preparation_embeds_tight_bounds_and_preserves_numeric_ids(tmp_path):
     ids = list(range(12, 0, -1))
@@ -562,13 +462,13 @@ def test_preparation_embeds_tight_bounds_and_preserves_numeric_ids(tmp_path):
         mini_segments=tmp_path / "segments.fgb", output_dir=tmp_path / "prepared",
         workers=1,
     ))
-    index = read_mini_index(report.mini_ownership)
-    with rasterio.open(report.mini_ownership) as cells:
+    index = read_mini_index(report.grid_catchments)
+    with rasterio.open(report.grid_catchments) as cells:
         assert cells.tags(ns="IMAGE_STRUCTURE")["LAYOUT"] == "COG"
         assert json.loads(cells.tags()["mini_index"]) == index
         np.testing.assert_array_equal(cells.read(1), [list(range(1, 13))] * 2)
     assert index == [[i, i - 1, 0, i, 2] for i in range(1, 13)]
-    assert sorted(path.name for path in report.files) == ["cells.tif", "dem.tif", "drainage.tif"]
+    assert sorted(path.name for path in report.files) == ["dem.tif", "grid_catchments.tif", "grid_segments.tif"]
     assert not (report.output_dir / "mini_index.csv").exists()
 
 
@@ -592,3 +492,217 @@ def test_preparation_requires_dense_integer_ids(tmp_path, bad_ids):
             mini_segments=segments, output_dir=tmp_path / "prepared", workers=1,
         ))
     assert not (tmp_path / "prepared").exists()
+
+
+def _write_overlay_minis(tmp_path, polygons, lines, downstream):
+    attrs = {"id": list(range(1, len(polygons) + 1)), "id_down": downstream}
+    paths = []
+    for name, geometries, kind in (
+        ("catchments", polygons, "MultiPolygon" if any(g.geom_type == "MultiPolygon" for g in polygons) else "Polygon"),
+        ("segments", lines, "MultiLineString" if any(g.geom_type == "MultiLineString" for g in lines) else "LineString"),
+    ):
+        path = tmp_path / f"{name}.fgb"
+        write_vector_table(VectorTable.from_pydict(attrs, geometries,
+            crs="EPSG:3857", geometry_type=kind), path, driver="FlatGeobuf")
+        paths.append(path)
+    return paths
+
+
+@pytest.mark.parametrize("workers", [1, 2])
+def test_overlay_preserves_polygons_and_expands_source_masks(tmp_path, workers):
+    from shapely.geometry import box
+    # Streams cross a polygon gap, neighboring labels and exterior cells.
+    polygons = [box(2, 2, 5, 6), box(7, 2, 10, 6)]
+    lines = [LineString([(3.5, 4.5), (11.5, 4.5)]),
+             LineString([(8.5, 3.5), (8.5, 5.5)])]
+    catchments, segments = _write_overlay_minis(tmp_path, polygons, lines, [2, -1])
+    dem = tmp_path / "dem.tif"
+    hru = tmp_path / "hru.tif"
+    _write_multiblock_raster(dem, np.ones((8, 14)), "float32")
+    _write_multiblock_raster(hru, np.ones((8, 14)), "int32")
+    report = prepare_dataset(PreparationSpec(dem=dem, mini_catchments=catchments,
+        mini_segments=segments, output_dir=tmp_path / "prepared", workers=workers,
+        rasters=(NamedRaster("hru", hru, "categorical"),)))
+    with rasterio.open(report.grid_catchments) as owner, rasterio.open(report.grid_segments) as stream:
+        assert owner.bounds == (1, 1, 13, 7)
+        assert owner.dtypes == stream.dtypes == ("int32",)
+        expected, polygon_valid = _rasterize_ownership_block(np.asarray(polygons, dtype=object),
+            np.array([1, 2]), owner.shape, owner.transform)
+        streams = _rasterize_segments_block(np.asarray(lines, dtype=object), np.array([1, 2]),
+            owner.shape, owner.transform, {1: 2, 2: None})
+        expected[streams > 0] = streams[streams > 0]
+        valid = polygon_valid | (streams > 0)
+        np.testing.assert_array_equal(owner.read(1), expected)
+        np.testing.assert_array_equal(owner.dataset_mask(), valid * 255)
+        np.testing.assert_array_equal(stream.read(1), streams)
+        np.testing.assert_array_equal(stream.dataset_mask(), owner.dataset_mask())
+        assert np.any((streams > 0) & ~polygon_valid)
+        assert np.all(stream.read(1)[~valid] == 0)
+        for path in (report.dem, report.rasters["hru"]):
+            with rasterio.open(path) as source:
+                np.testing.assert_array_equal(source.dataset_mask(), owner.dataset_mask())
+
+
+def test_segment_only_blocks_are_masked_and_deterministic(tmp_path):
+    from shapely.geometry import box
+    # Exercise real block boundaries with a short raster.
+    polygons = [box(1, 1, 3, 3)]
+    lines = [LineString([(1.5, 1.5), (1028.5, 1.5)])]
+    catchments, segments = _write_overlay_minis(tmp_path, polygons, lines, [-1])
+    dem = tmp_path / "dem.tif"
+    _write_multiblock_raster(dem, np.ones((4, 1030)), "float32")
+    outputs = []
+    for workers in (1, 2):
+        report = prepare_dataset(PreparationSpec(dem=dem, mini_catchments=catchments,
+            mini_segments=segments, output_dir=tmp_path / f"prepared-{workers}", workers=workers))
+        with rasterio.open(report.grid_segments) as source:
+            expected = _rasterize_segments_block(np.asarray(lines, dtype=object),
+                np.array([1]), source.shape, source.transform, {1: None})
+            np.testing.assert_array_equal(source.read(1), expected)
+        arrays = []
+        for path in (report.dem, report.grid_catchments, report.grid_segments):
+            with rasterio.open(path) as source:
+                arrays.extend((source.read(1), source.dataset_mask()))
+        outputs.append(arrays)
+        assert arrays[3][2, 1028] == 255
+        assert arrays[0][2, 1028] == 1
+    for first, second in zip(*outputs, strict=True):
+        np.testing.assert_array_equal(first, second)
+
+
+def test_disconnected_components_survive_production_and_route(tmp_path):
+    from shapely.geometry import box, MultiPolygon, MultiLineString
+    from mgb_vec_hydro.terrain import TerrainSpec, create_terrain_dataset
+    polygons = [MultiPolygon([box(1, 1, 4, 4), box(6, 1, 9, 4)])]
+    lines = [MultiLineString([[(3.5, 1), (3.5, 4)], [(8.5, 1), (8.5, 4)]])]
+    catchments, segments = _write_overlay_minis(tmp_path, polygons, lines, [-1])
+    dem = tmp_path / "dem.tif"
+    _write_multiblock_raster(dem, np.tile(np.arange(10, 0, -1), (5, 1)), "float32")
+    prepared = prepare_dataset(PreparationSpec(dem=dem, mini_catchments=catchments,
+        mini_segments=segments, output_dir=tmp_path / "prepared", workers=1))
+    with rasterio.open(prepared.grid_catchments) as source:
+        assert np.count_nonzero(source.read(1)) == 18  # Both nine-cell polygon components are retained.
+    terrain = create_terrain_dataset(TerrainSpec(dem=prepared.dem,
+        grid_catchments=prepared.grid_catchments, grid_segments=prepared.grid_segments,
+        output_dir=tmp_path / "terrain", workers=1))
+    with rasterio.open(terrain.ltnd) as source:
+        assert source.read(1).max() > 0
+
+
+def test_legacy_outputs_retired_atomically(tmp_path, monkeypatch):
+    from mgb_vec_hydro.exceptions import PublicationError
+    import mgb_vec_hydro.execution.publication as publication
+    catchments, segments = _write_multiblock_minis(tmp_path, 2)
+    dem = tmp_path / "dem.tif"
+    _write_multiblock_raster(dem, np.ones((2, 2)), "float32")
+    output = tmp_path / "prepared"
+    output.mkdir()
+    for name in ("cells.tif", "drainage.tif"):
+        (output / name).write_bytes(b"old")
+    spec = PreparationSpec(dem=dem, mini_catchments=catchments, mini_segments=segments,
+                           output_dir=output, workers=1)
+    with pytest.raises(PublicationError, match="already exist"):
+        prepare_dataset(spec)
+    from dataclasses import replace
+    original = publication.os.replace
+    def fail(source, destination):
+        if Path(destination) == output / "grid_segments.tif":
+            raise OSError("injected failure")
+        return original(source, destination)
+    from pathlib import Path
+    monkeypatch.setattr(publication.os, "replace", fail)
+    with pytest.raises(PublicationError, match="injected failure"):
+        prepare_dataset(replace(spec, overwrite=True))
+    assert sorted(p.name for p in output.iterdir()) == ["cells.tif", "drainage.tif"]
+    assert all(p.read_bytes() == b"old" for p in output.iterdir())
+    monkeypatch.setattr(publication.os, "replace", original)
+    prepare_dataset(replace(spec, overwrite=True))
+    assert not (output / "cells.tif").exists()
+    assert not (output / "drainage.tif").exists()
+
+
+@pytest.mark.parametrize("outside_dem", [False, True])
+def test_overlay_rejects_insufficient_source_coverage(tmp_path, outside_dem):
+    from shapely.geometry import box
+    polygons = [box(1, 1, 3, 3)]
+    lines = [LineString([(1.5, 1.5), (6.5 if outside_dem else 4.5, 1.5)])]
+    catchments, segments = _write_overlay_minis(tmp_path, polygons, lines, [-1])
+    dem = tmp_path / "dem.tif"
+    hru = tmp_path / "hru.tif"
+    _write_multiblock_raster(dem, np.ones((5, 6)), "float32")
+    _write_multiblock_raster(hru, np.ones((5, 4)), "int32")
+    output = tmp_path / "prepared"
+    with pytest.raises(PreparedDataError, match="does not cover"):
+        prepare_dataset(PreparationSpec(dem=dem, mini_catchments=catchments,
+            mini_segments=segments, output_dir=output, workers=1,
+            rasters=(NamedRaster("hru", hru, "categorical"),)))
+    assert not output.exists()
+
+
+def test_undrained_disconnected_component_is_preserved_and_masked_in_terrain(tmp_path):
+    from shapely.geometry import box, MultiPolygon
+    from mgb_vec_hydro.terrain import TerrainSpec, create_terrain_dataset
+    catchments, segments = _write_overlay_minis(tmp_path,
+        [MultiPolygon([box(1, 1, 4, 4), box(6, 1, 9, 4)])],
+        [LineString([(3.5, 1), (3.5, 4)])], [-1])
+    dem = tmp_path / "dem.tif"
+    _write_multiblock_raster(dem, np.ones((5, 10)), "float32")
+    prepared = prepare_dataset(PreparationSpec(dem=dem, mini_catchments=catchments,
+        mini_segments=segments, output_dir=tmp_path / "prepared", workers=1))
+    with rasterio.open(prepared.grid_catchments) as source:
+        assert np.count_nonzero(source.read(1)) == 18
+    output = tmp_path / "terrain"
+    report = create_terrain_dataset(
+        TerrainSpec(
+            dem=prepared.dem,
+            grid_catchments=prepared.grid_catchments,
+            grid_segments=prepared.grid_segments,
+            output_dir=output,
+            workers=1,
+        )
+    )
+    assert report.undrained_cells == 9
+    assert (output / "undrained_cells.csv").read_text().splitlines() == [
+        "mini_id,undrained_cells,total_cells,percentage_undrained",
+        "1,9,18,50.0",
+    ]
+    with (
+        rasterio.open(prepared.grid_catchments) as ownership,
+        rasterio.open(output / "hand.tif") as hand,
+    ):
+        owned = ownership.read(1) == 1
+        assert np.count_nonzero((hand.dataset_mask() == 0) & owned) == 9
+
+
+def test_collisions_follow_noncontending_intermediate_segments():
+    lines = np.asarray([LineString([(0, .5), (2, .5)])] * 2, dtype=object)
+    result = _rasterize_segments_block(lines, np.array([1, 3]), (1, 2),
+        from_origin(0, 1, 1, 1), {1: 2, 2: 3, 3: None})
+    np.testing.assert_array_equal(result, [[3, 3]])
+
+
+@pytest.mark.parametrize("name", ["grid_catchments", "grid_segments", "cells", "drainage"])
+def test_preparation_rejects_reserved_named_rasters(tmp_path, name):
+    with pytest.raises(PreparedDataError, match="non-reserved"):
+        prepare_dataset(PreparationSpec(dem=tmp_path / "dem",
+            mini_catchments=tmp_path / "catchments", mini_segments=tmp_path / "segments",
+            output_dir=tmp_path / "out", rasters=(NamedRaster(name, tmp_path / "raster", "categorical"),)))
+
+
+def test_segment_junctions_at_pixel_and_block_boundaries_match_global_burn():
+    from rasterio.windows import Window, transform as window_transform
+    transform = from_origin(0, 12, 1, 1)
+    lines = np.asarray([
+        LineString([(0.25, .25), (512, 6), (1029.75, 11.75)]),
+        LineString([(512, 0), (512, 12)]),
+        LineString([(0, 6), (1030, 6)]),
+    ], dtype=object)
+    graph = {1: 2, 2: None, 3: None}
+    expected = _rasterize_segments_block(lines, np.array([1, 2, 3]), (12, 1030), transform, graph)
+    result = np.zeros_like(expected)
+    for col in range(0, 1030, 512):
+        window = Window(col, 0, min(512, 1030 - col), 12)
+        result[:, col:col + int(window.width)] = _rasterize_segments_block(
+            lines, np.array([1, 2, 3]), (12, int(window.width)),
+            window_transform(window, transform), graph)
+    np.testing.assert_array_equal(result, expected)

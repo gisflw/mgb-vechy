@@ -198,7 +198,8 @@ def prepare_command(
     )
     overwrite = _confirm_replacement(
         output_dir,
-        ("dem.tif", "cells.tif", "drainage.tif", "manifest-prepare.json",
+        ("dem.tif", "grid_catchments.tif", "grid_segments.tif",
+         "cells.tif", "drainage.tif", "manifest-prepare.json",
          *(f"{raster.name}.tif" for raster in rasters),
          *(("d8.tif",) if d8 is not None else ())),
     )
@@ -396,12 +397,12 @@ def aggregate_command(
     required=True,
 )
 @click.option(
-    "--cells",
+    "--grid-catchments",
     type=click.Path(exists=True, dir_okay=False, path_type=Path),
     required=True,
 )
 @click.option(
-    "--drainage",
+    "--grid-segments",
     type=click.Path(exists=True, dir_okay=False, path_type=Path),
     required=True,
 )
@@ -452,8 +453,8 @@ def aggregate_command(
 @click.option("--io-slots", type=click.IntRange(min=1), default=2, show_default=True)
 def terrain_products_command(
     dem: Path,
-    cells: Path,
-    drainage: Path,
+    grid_catchments: Path,
+    grid_segments: Path,
     d8: Path | None,
     output_dir: Path,
     direction_source: str,
@@ -470,14 +471,15 @@ def terrain_products_command(
     overwrite = _confirm_replacement(
         output_dir,
         ("hand.tif", "ltnd.tif", "manifest-terrain-products.json",
+         "undrained_cells.csv",
          *(("flow_direction.tif",) if write_flow_direction else ())),
     )
     report = _run_stage(
         create_terrain_dataset,
         TerrainSpec(
             dem=dem,
-            mini_ownership=cells,
-            drainage=drainage,
+            grid_catchments=grid_catchments,
+            grid_segments=grid_segments,
             d8=d8,
             output_dir=output_dir,
             overwrite=overwrite,
@@ -496,9 +498,13 @@ def terrain_products_command(
     click.echo(f"Wrote {report.ltnd}")
     if report.flow_direction is not None:
         click.echo(f"Wrote {report.flow_direction}")
+    click.echo(f"Wrote {report.undrained_cells_csv}")
     click.echo(f"Wrote {report.output_dir / 'manifest-terrain-products.json'}")
     click.echo(f"Processed {report.mini_count} complete minis")
-    click.echo(f"Cells: {report.owned_cells} owned, {report.drainage_cells} drainage")
+    click.echo(
+        f"Cells: {report.owned_cells} owned, {report.drainage_cells} drainage, "
+        f"{report.undrained_cells} undrained"
+    )
     _echo_timings(report.timings)
     if report.negative_hand_cells:
         click.echo(
@@ -526,12 +532,12 @@ def terrain_products_command(
     required=True,
 )
 @click.option(
-    "--cells",
+    "--grid-catchments",
     type=click.Path(exists=True, dir_okay=False, path_type=Path),
     required=True,
 )
 @click.option(
-    "--drainage",
+    "--grid-segments",
     type=click.Path(exists=True, dir_okay=False, path_type=Path),
     required=True,
 )
@@ -567,8 +573,8 @@ def sample_minis_command(
     mini_catchments: Path,
     mini_segments: Path,
     dem: Path,
-    cells: Path,
-    drainage: Path,
+    grid_catchments: Path,
+    grid_segments: Path,
     hand: Path,
     ltnd: Path,
     hru: Path,
@@ -596,8 +602,8 @@ def sample_minis_command(
                     mini_catchments=mini_catchments,
                     mini_segments=mini_segments,
                     dem=dem,
-                    mini_ownership=cells,
-                    drainage=drainage,
+                    grid_catchments=grid_catchments,
+                    grid_segments=grid_segments,
                     hand=hand,
                     ltnd=ltnd,
                     hru=hru,

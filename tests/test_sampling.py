@@ -20,15 +20,36 @@ from mgb_vec_hydro.exceptions import (
 )
 from mgb_vec_hydro.execution.vector import VectorTable, write_vector_table
 from mgb_vec_hydro.preparation import (
+    GridSpec,
     NamedRaster,
     PreparationSpec,
     prepare_dataset,
 )
 from mgb_vec_hydro.sampling import (
     MiniSamplingSpec,
+    _cell_areas_km2,
     sample_minibasins,
 )
 from mgb_vec_hydro.terrain import TerrainSpec, create_terrain_dataset
+
+
+def _independent_cell_areas_km2(crs, transform, selected):
+    crs = CRS.from_user_input(crs)
+    transformer = Transformer.from_crs(crs, crs.geodetic_crs, always_xy=True)
+    geod = crs.get_geod()
+    areas = np.zeros(selected.shape, dtype=np.float64)
+    for row, col in np.argwhere(selected):
+        corners = [
+            transform @ (col, row),
+            transform @ (col + 1, row),
+            transform @ (col + 1, row + 1),
+            transform @ (col, row + 1),
+        ]
+        lon, lat = transformer.transform(
+            [point[0] for point in corners], [point[1] for point in corners]
+        )
+        areas[row, col] = abs(geod.polygon_area_perimeter(lon, lat)[0]) / 1e6
+    return areas
 
 
 def _sampling_inputs(
@@ -122,8 +143,8 @@ def _sampling_inputs(
     terrain_report = create_terrain_dataset(
         TerrainSpec(
             dem=preparation.dem,
-            mini_ownership=preparation.mini_ownership,
-            drainage=preparation.drainage,
+            grid_catchments=preparation.grid_catchments,
+            grid_segments=preparation.grid_segments,
             output_dir=terrain,
             workers=1,
             d8=preparation.d8,
@@ -131,6 +152,27 @@ def _sampling_inputs(
         )
     )
     return minis, preparation, terrain_report
+
+
+@pytest.mark.parametrize(
+    "crs,transform",
+    [
+        ("EPSG:4326", Affine(0.01, 0, -45, 0, -0.02, -13)),
+        ("EPSG:3857", Affine(100, 0, 1000, 0, -200, 8399737)),
+    ],
+)
+def test_cell_areas_match_independent_geodesic_corner_areas(crs, transform):
+    from rasterio.windows import Window
+
+    selected = np.array([[True, False, True], [True, True, False]])
+    grid = GridSpec(CRS.from_user_input(crs), transform, 3, 2)
+    measured = np.zeros(selected.shape, dtype=np.float64)
+    measured[selected] = _cell_areas_km2(
+        grid, Window(0, 0, 3, 2), selected
+    )
+    expected = _independent_cell_areas_km2(crs, transform, selected)
+
+    np.testing.assert_allclose(measured, expected, rtol=1e-12, atol=1e-15)
 
 
 def test_sampling_geographic_centimetre_dem_has_metric_slopes(tmp_path):
@@ -207,8 +249,8 @@ def _sampling_spec(
         mini_segments=minis / "mini_segments.fgb",
 
         dem=prepared.dem,
-        mini_ownership=prepared.mini_ownership,
-        drainage=prepared.drainage,
+        grid_catchments=prepared.grid_catchments,
+        grid_segments=prepared.grid_segments,
         hand=terrain.hand,
         ltnd=terrain.ltnd,
         hru=prepared.rasters["hru"] if hru is None else hru,
@@ -277,8 +319,8 @@ def test_sampling_pipeline_is_exact_block_reusing_and_atomic(tmp_path):
 
     with (
         rasterio.open(prepared.dem) as dem,
-        rasterio.open(prepared.mini_ownership) as ownership,
-        rasterio.open(prepared.drainage) as drainage,
+        rasterio.open(prepared.grid_catchments) as ownership,
+        rasterio.open(prepared.grid_segments) as drainage,
         rasterio.open(terrain.hand) as hand,
         rasterio.open(terrain.ltnd) as ltnd,
     ):
@@ -309,11 +351,11 @@ def test_sampling_pipeline_is_exact_block_reusing_and_atomic(tmp_path):
     np.testing.assert_allclose(frame["latitude"], [value[1] for value in expected])
 
 
-def test_sampling_flooded_areas_use_hand_thresholds_and_catchment_area(tmp_path):
+def test_sampling_flooded_areas_sum_geodesic_pixels_by_hand_threshold(tmp_path):
     minis, prepared, terrain = _sampling_inputs(tmp_path)
-    with rasterio.open(prepared.mini_ownership) as source:
+    with rasterio.open(prepared.grid_catchments) as source:
         labels = source.read(1)
-    with rasterio.open(prepared.drainage) as source:
+    with rasterio.open(prepared.grid_segments) as source:
         drainage = source.read(1)
     reach_cells = np.argwhere((labels == 1) & (drainage != 0))
     custom_hand = np.array(
@@ -329,14 +371,14 @@ def test_sampling_flooded_areas_use_hand_thresholds_and_catchment_area(tmp_path)
         values[labels == 1] = custom_hand
 
     drainage_path = _rewrite_raster(
-        prepared.drainage, tmp_path / "drainage-odd-reach.tif", remove_reach_cell
+        prepared.grid_segments, tmp_path / "drainage-odd-reach.tif", remove_reach_cell
     )
     hand_path = _rewrite_raster(
         terrain.hand, tmp_path / "hand-thresholds.tif", set_hand_values
     )
     spec = replace(
         _sampling_spec(minis, prepared, terrain, tmp_path / "sampled"),
-        drainage=drainage_path,
+        grid_segments=drainage_path,
         hand=hand_path,
     )
     report = sample_minibasins(spec)
@@ -348,8 +390,8 @@ def test_sampling_flooded_areas_use_hand_thresholds_and_catchment_area(tmp_path)
 
     with (
         rasterio.open(spec.dem) as dem,
-        rasterio.open(spec.mini_ownership) as ownership,
-        rasterio.open(spec.drainage) as drain,
+        rasterio.open(spec.grid_catchments) as ownership,
+        rasterio.open(spec.grid_segments) as drain,
         rasterio.open(spec.hand) as hand,
     ):
         dem_values = dem.read(1)
@@ -366,9 +408,12 @@ def test_sampling_flooded_areas_use_hand_thresholds_and_catchment_area(tmp_path)
             assert row.reach_elevation == p50
             assert row.reach_slope == (p85 - p10) / 0.75
 
-            catchment_hand = hand_values[labels == label]
+            catchment_mask = labels == label
+            cell_areas = _independent_cell_areas_km2(
+                dem.crs, dem.transform, catchment_mask
+            )
             expected = [
-                row.unit_area * np.count_nonzero(catchment_hand <= stage) / len(catchment_hand)
+                cell_areas[catchment_mask & (hand_values <= stage)].sum()
                 for stage in range(1, 101)
             ]
             np.testing.assert_allclose(
@@ -377,9 +422,9 @@ def test_sampling_flooded_areas_use_hand_thresholds_and_catchment_area(tmp_path)
 
 
 
-def test_fully_flooded_area_equals_vector_catchment_area(tmp_path):
+def test_fully_flooded_area_sums_cells_without_vector_area_scaling(tmp_path):
     minis, prepared, terrain = _sampling_inputs(tmp_path)
-    with rasterio.open(prepared.mini_ownership) as source:
+    with rasterio.open(prepared.grid_catchments) as source:
         labels = source.read(1)
     hand_path = _rewrite_raster(
         terrain.hand,
@@ -393,8 +438,17 @@ def test_fully_flooded_area_equals_vector_catchment_area(tmp_path):
         )
     )
     frame = pd.read_csv(report.sampled_minis)
-    for row in frame.itertuples(index=False):
-        assert row.flooded_area_100 == row.unit_area
+    with (
+        rasterio.open(prepared.dem) as dem,
+        rasterio.open(prepared.grid_catchments) as ownership,
+    ):
+        labels = ownership.read(1)
+        for mini_id, row in enumerate(frame.itertuples(index=False), start=1):
+            expected = _independent_cell_areas_km2(
+                dem.crs, dem.transform, labels == mini_id
+            ).sum()
+            assert row.flooded_area_100 == pytest.approx(expected)
+            assert row.flooded_area_100 != row.unit_area
 
 
 def test_sampling_warns_for_partial_nodata_and_uses_valid_cells(tmp_path, monkeypatch):
@@ -402,7 +456,7 @@ def test_sampling_warns_for_partial_nodata_and_uses_valid_cells(tmp_path, monkey
 
     monkeypatch.setattr(MemorySizing, "packet_bytes", property(lambda self: 1))
     minis, prepared, terrain = _sampling_inputs(tmp_path)
-    with rasterio.open(prepared.mini_ownership) as source:
+    with rasterio.open(prepared.grid_catchments) as source:
         labels = source.read(1)
     mini_one = np.argwhere(labels == 1)
     mini_two = np.argwhere(labels == 2)
@@ -432,8 +486,8 @@ def test_sampling_warns_for_partial_nodata_and_uses_valid_cells(tmp_path, monkey
                 mask.__setitem__(tuple(mini_two[0]), 0),
             ),
         ),
-        "drainage": _rewrite_raster(
-            prepared.drainage,
+        "grid_segments": _rewrite_raster(
+            prepared.grid_segments,
             tmp_path / "drainage-with-mask.tif",
             lambda values: None,
             lambda mask: mask.__setitem__(tuple(mini_one[4]), 0),
@@ -451,7 +505,7 @@ def test_sampling_warns_for_partial_nodata_and_uses_valid_cells(tmp_path, monkey
     assert messages == [
         (
             "Nodata cells were found within the domain for raster(s): "
-            "--dem, --drainage, --hand, --hru, --ltnd. Statistics exclude these cells; "
+            "--dem, --grid-segments, --hand, --hru, --ltnd. Statistics exclude these cells; "
             "substantial missing coverage can produce unrealistic results. Please verify "
             "whether the affected results are suitable."
         )
@@ -475,6 +529,7 @@ def test_sampling_warns_for_partial_nodata_and_uses_valid_cells(tmp_path, monkey
     frame = pd.read_csv(report.sampled_minis)
     np.testing.assert_allclose(frame.filter(regex=r"^hru_").sum(axis=1), 100)
     with (
+        rasterio.open(spec.dem) as dem,
         rasterio.open(spec.hand) as hand_source,
         rasterio.open(spec.ltnd) as ltnd_source,
     ):
@@ -485,10 +540,11 @@ def test_sampling_warns_for_partial_nodata_and_uses_valid_cells(tmp_path, monkey
             & ~np.ma.getmaskarray(hand)
             & ~np.isnan(hand.data)
         )
+        cell_areas = _independent_cell_areas_km2(
+            dem.crs, dem.transform, valid_hand
+        )
         expected_areas = [
-            frame.loc[0, "unit_area"]
-            * np.count_nonzero(valid_hand & (hand.data <= stage))
-            / np.count_nonzero(valid_hand)
+            cell_areas[valid_hand & (hand.data <= stage)].sum()
             for stage in range(1, 101)
         ]
         paired = (
@@ -523,7 +579,7 @@ def test_sampling_fails_when_required_statistic_has_only_nodata(
     tmp_path, dataset, statistic
 ):
     minis, prepared, terrain = _sampling_inputs(tmp_path)
-    with rasterio.open(prepared.mini_ownership) as source:
+    with rasterio.open(prepared.grid_catchments) as source:
         labels = source.read(1)
     missing = labels == 1
     path = {
@@ -564,7 +620,7 @@ def test_sampling_fails_when_required_statistic_has_only_nodata(
 
 def test_sampling_rejects_infinite_values_within_the_mini_domain(tmp_path):
     minis, prepared, terrain = _sampling_inputs(tmp_path)
-    with rasterio.open(prepared.mini_ownership) as source:
+    with rasterio.open(prepared.grid_catchments) as source:
         ownership = source.read(1)
     cell = tuple(np.argwhere(ownership == 1)[0])
     dem_path = _rewrite_raster(
@@ -634,10 +690,21 @@ def test_sampling_preserves_mini_ids_above_nine_through_the_pipeline(tmp_path):
     assert report.mini_count == terrain.mini_count == 12
     assert report.catchment_cells == 12 * 12
     assert report.reach_cells == 12 * 4
-    with rasterio.open(prepared.dem) as dem, rasterio.open(prepared.mini_ownership) as cells:
+    with rasterio.open(prepared.dem) as dem, rasterio.open(prepared.grid_catchments) as cells:
         owners = cells.read(1)
         elevations = dem.read(1)
         for mini_id, row in zip(range(1, 13), frame.itertuples(index=False), strict=True):
             reach = (owners == mini_id) & (np.indices(owners.shape)[1] % 4 == 2)
             assert row.reach_elevation == np.median(elevations[reach])
     np.testing.assert_allclose(frame.filter(regex=r"^hru_").sum(axis=1), 100)
+
+
+def test_sampling_rejects_mismatched_positive_segment_ids(tmp_path):
+    minis, prepared, terrain = _sampling_inputs(tmp_path)
+    stream = _rewrite_raster(prepared.grid_segments, tmp_path / "wrong-segments.tif",
+        lambda values: values.__setitem__(values == 2, 1))
+    spec = replace(_sampling_spec(minis, prepared, terrain, tmp_path / "out"),
+                   grid_segments=stream)
+    with pytest.raises(MiniSamplingError, match="segment IDs must match"):
+        sample_minibasins(spec)
+    assert not spec.output_dir.exists()
