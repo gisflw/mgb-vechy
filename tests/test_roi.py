@@ -10,7 +10,64 @@ from mgb_vec_hydro.execution.vector import (
     read_vector_table,
     write_vector_table,
 )
-from mgb_vec_hydro.roi import ROI_COLUMNS, RoiSpec, define_roi_dataset
+from mgb_vec_hydro.roi import (
+    ROI_COLUMNS,
+    RoiSpec,
+    _topological_order,
+    define_roi_dataset,
+)
+
+
+def _sorted_topological_order(ids, downstream):
+    indegree = dict.fromkeys(ids, 0)
+    for target in downstream.values():
+        if target in indegree:
+            indegree[target] += 1
+    ready = sorted(
+        (value for value, count in indegree.items() if count == 0),
+        key=str,
+        reverse=True,
+    )
+    order = []
+    while ready:
+        value = ready.pop()
+        order.append(value)
+        target = downstream.get(value)
+        if target in indegree:
+            indegree[target] -= 1
+            if indegree[target] == 0:
+                ready.append(target)
+                ready.sort(key=str, reverse=True)
+    return order
+
+
+@pytest.mark.parametrize(
+    ("ids", "downstream"),
+    [
+        ({1, 10, 2}, {1: None, 10: None, 2: None}),
+        ({1, "1", "out"}, {1: "out", "1": "out", "out": None}),
+        (
+            {"a", "b", "z", "out"},
+            {"a": "z", "b": "out", "z": "out", "out": None},
+        ),
+        (set(), {}),
+        (
+            set(range(1001)),
+            {**{value: 1000 for value in range(1000)}, 1000: None},
+        ),
+    ],
+)
+def test_roi_topological_heap_matches_sorted_order(ids, downstream):
+    assert _topological_order(ids, downstream) == _sorted_topological_order(
+        ids, downstream
+    )
+
+
+def test_roi_topological_heap_rejects_cycle():
+    with pytest.raises(
+        TopologyCycleError, match="Detected topology cycle in the selected ROI"
+    ):
+        _topological_order({1, 2}, {1: 2, 2: 1})
 
 
 def _inputs(tmp_path, *, orders=(3, 2, 1), downstream=(None, 1, 2)):

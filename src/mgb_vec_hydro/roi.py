@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import heapq
 import time
 from collections import defaultdict
 from collections.abc import Callable, Hashable, Iterable
@@ -635,21 +636,23 @@ def _topological_order(
     for downstream_id in downstream.values():
         if downstream_id in ids:
             upstream_count[downstream_id] += 1
-    ready = sorted(
-        (value for value, count in upstream_count.items() if count == 0),
-        key=str,
-        reverse=True,
-    )
+    serial = 0
+    ready = []
+    for value, count in upstream_count.items():
+        if count == 0:
+            ready.append((str(value), -serial, value))
+            serial += 1
+    heapq.heapify(ready)
     order: list[Hashable] = []
     while ready:
-        current = ready.pop()
+        _, _, current = heapq.heappop(ready)
         order.append(current)
         target = downstream.get(current)
         if target in upstream_count:
             upstream_count[target] -= 1
             if upstream_count[target] == 0:
-                ready.append(target)
-                ready.sort(key=str, reverse=True)
+                heapq.heappush(ready, (str(target), -serial, target))
+                serial += 1
     if len(order) != len(ids):
         raise TopologyCycleError("Detected topology cycle in the selected ROI")
     return order
