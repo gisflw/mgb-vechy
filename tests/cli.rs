@@ -9,6 +9,7 @@ fn root_and_prepro_help_and_version() {
         vec!["prepro", "terrain-products", "--help"],
         vec!["prepro", "define-roi", "--help"],
         vec!["prepro", "aggregate", "--help"],
+        vec!["prepro", "prepare", "--help"],
         vec!["--version"],
     ] {
         let output = Command::new(env!("CARGO_BIN_EXE_mgb"))
@@ -70,5 +71,26 @@ fn terrain_requires_explicit_inputs_and_rejects_invalid_flags() {
             .output()
             .unwrap();
         assert!(!output.status.success());
+    }
+}
+
+#[test]
+fn preparation_requires_inputs_and_valid_paired_options() {
+    for args in [
+        vec!["prepro", "prepare"],
+        vec!["prepro", "prepare", "--d8", "directions.tif"],
+        vec!["prepro", "prepare", "--d8-encoding", "esri"],
+        vec!["prepro", "prepare", "--d8-encoding", "invalid"],
+        vec!["prepro", "prepare", "--categorical-raster", "hru"],
+        vec!["prepro", "prepare", "--workers=-1"],
+    ] {
+        assert!(
+            !Command::new(env!("CARGO_BIN_EXE_mgb"))
+                .args(args)
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
     }
 }

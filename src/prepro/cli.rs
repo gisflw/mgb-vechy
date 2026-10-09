@@ -1,7 +1,8 @@
 //! Preprocessing command parsing, separate from the root module dispatcher.
 use super::{
-    AggregationSpec, DirectionSource, RoiSpec, SamplingSpec, TerrainSpec, aggregate_roi_dataset,
-    create_terrain_dataset, define_roi_dataset, sample_minibasins,
+    AggregationSpec, D8Encoding, DirectionSource, NamedRaster, PreparationSpec, RasterKind,
+    RoiSpec, SamplingSpec, TerrainSpec, aggregate_roi_dataset, create_terrain_dataset,
+    define_roi_dataset, prepare_dataset, sample_minibasins,
 };
 use clap::{Args as ClapArgs, Subcommand};
 use std::path::PathBuf;
@@ -19,6 +20,8 @@ enum Command {
     DefineRoi(RoiArgs),
     /// Aggregate normalized ROI units into ordered mini-basins.
     Aggregate(AggregationArgs),
+    /// Prepare aligned rasters and canonical mini ownership.
+    Prepare(PreparationArgs),
     /// Sample terrain and HRU attributes for each mini-basin.
     SampleMinis(SampleArgs),
     /// Create confined HAND and geodesic terrain-to-drainage distance.
@@ -69,6 +72,32 @@ struct AggregationArgs {
     uparea_min: f64,
     #[arg(long)]
     lmin: f64,
+    #[arg(long, default_value_t = 4)]
+    workers: usize,
+    #[arg(long, default_value_t = 4096)]
+    memory_limit_mb: usize,
+}
+
+#[derive(ClapArgs)]
+struct PreparationArgs {
+    #[arg(long)]
+    dem: PathBuf,
+    #[arg(long)]
+    mini_catchments: PathBuf,
+    #[arg(long)]
+    mini_segments: PathBuf,
+    #[arg(long)]
+    output_dir: PathBuf,
+    #[arg(long, num_args = 2, action = clap::ArgAction::Append, value_names = ["NAME", "PATH"])]
+    continuous_raster: Vec<String>,
+    #[arg(long, num_args = 2, action = clap::ArgAction::Append, value_names = ["NAME", "PATH"])]
+    categorical_raster: Vec<String>,
+    #[arg(long, requires = "d8_encoding")]
+    d8: Option<PathBuf>,
+    #[arg(long, value_enum, requires = "d8")]
+    d8_encoding: Option<D8Encoding>,
+    #[arg(long, default_value_t = 1.)]
+    dem_scale: f64,
     #[arg(long, default_value_t = 4)]
     workers: usize,
     #[arg(long, default_value_t = 4096)]
@@ -172,6 +201,40 @@ pub fn run(args: Args) -> anyhow::Result<()> {
                 report.mini_count,
                 report.workers_used,
                 report.catchments.display()
+            );
+            Ok(())
+        }
+        Command::Prepare(args) => {
+            let mut rasters = Vec::new();
+            for (values, kind) in [
+                (args.continuous_raster, RasterKind::Continuous),
+                (args.categorical_raster, RasterKind::Categorical),
+            ] {
+                for pair in values.as_chunks::<2>().0 {
+                    rasters.push(NamedRaster {
+                        name: pair[0].clone(),
+                        path: pair[1].clone().into(),
+                        kind,
+                    });
+                }
+            }
+            let report = prepare_dataset(&PreparationSpec {
+                dem: args.dem,
+                mini_catchments: args.mini_catchments,
+                mini_segments: args.mini_segments,
+                output_dir: args.output_dir,
+                rasters,
+                d8: args.d8,
+                d8_encoding: args.d8_encoding,
+                dem_scale: args.dem_scale,
+                workers: args.workers,
+                memory_limit_mb: args.memory_limit_mb,
+            })?;
+            println!(
+                "Prepared {} minis using {} workers: {}",
+                report.mini_count,
+                report.workers_used,
+                report.dem.display()
             );
             Ok(())
         }

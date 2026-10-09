@@ -3,8 +3,8 @@ pub(crate) mod vector;
 use super::model::{Grid, Window};
 use anyhow::{Context, Result, bail, ensure};
 use gdal::{
-    Dataset, Metadata,
-    raster::Buffer,
+    Dataset, DriverManager, Metadata,
+    raster::{Buffer, GdalType, RasterCreationOptions},
     spatial_ref::{AxisMappingStrategy, CoordTransform, SpatialRef},
 };
 use geographiclib_rs::{Geodesic, PolygonArea, Winding};
@@ -232,4 +232,126 @@ pub(crate) fn mini_windows(source: &Dataset, grid: &Grid) -> Result<Vec<(i64, Wi
             ))
         })
         .collect()
+}
+
+pub(crate) fn staging_raster<T: GdalType>(
+    directory: &Path,
+    name: &str,
+    grid: &Grid,
+) -> Result<Dataset> {
+    let mut ds = DriverManager::get_driver_by_name("GTiff")?
+        .create_with_band_type_with_options::<T, _>(
+            directory.join(format!("work-{name}")),
+            grid.width,
+            grid.height,
+            1,
+            &RasterCreationOptions::from_iter([
+                "TILED=YES",
+                "SPARSE_OK=YES",
+                "BLOCKXSIZE=512",
+                "BLOCKYSIZE=512",
+                "BIGTIFF=IF_SAFER",
+            ]),
+        )?;
+    ds.set_geo_transform(&grid.transform)?;
+    ds.set_spatial_ref(&spatial_ref(&grid.wkt)?)?;
+    Ok(ds)
+}
+pub(crate) fn attach_mask(ds: &mut Dataset, validity: &Dataset, grid: &Grid) -> Result<()> {
+    let mut band = ds.rasterband(1)?;
+    band.create_mask_band(true)?;
+    let mut mask = band.open_mask_band()?;
+    let source = validity.rasterband(1)?;
+    for window in windows(Window {
+        x: 0,
+        y: 0,
+        width: grid.width,
+        height: grid.height,
+    }) {
+        let position = (window.x as isize, window.y as isize);
+        let size = (window.width, window.height);
+        let mut values = source.read_as::<u8>(position, size, size, None)?;
+        mask.write(position, size, &mut values)?;
+    }
+    ds.flush_cache()?;
+    Ok(())
+}
+pub(crate) fn finish_cog(
+    source: &Dataset,
+    path: &Path,
+    workers: usize,
+    resampling: Option<&str>,
+) -> Result<()> {
+    let mut options = vec![
+        "BLOCKSIZE=512".to_owned(),
+        "COMPRESS=ZSTD".to_owned(),
+        "LEVEL=1".to_owned(),
+        "PREDICTOR=STANDARD".to_owned(),
+        "BIGTIFF=IF_SAFER".to_owned(),
+        format!("NUM_THREADS={workers}"),
+    ];
+    if let Some(resampling) = resampling {
+        options.push(format!("OVERVIEW_RESAMPLING={resampling}"));
+    }
+    let mut output = source.create_copy(
+        &DriverManager::get_driver_by_name("COG")?,
+        path,
+        &RasterCreationOptions::from_iter(options),
+    )?;
+    output.flush_cache()?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cog_helper_preserves_gdal_default_overviews_and_supports_explicit_resampling() -> Result<()>
+    {
+        let temp = tempfile::tempdir()?;
+        let mut source = DriverManager::get_driver_by_name("MEM")?
+            .create_with_band_type::<f32, _>("", 1025, 513, 1)?;
+        source.set_geo_transform(&[0., 1., 0., 513., 0., -1.])?;
+        source.set_spatial_ref(&SpatialRef::from_epsg(3857)?)?;
+        let values = (0..1025 * 513)
+            .map(|i| ((i % 1025) * (i % 1025) + i / 1025) as f32)
+            .collect();
+        source
+            .rasterband(1)?
+            .write((0, 0), (1025, 513), &mut Buffer::new((1025, 513), values))?;
+        source.rasterband(1)?.create_mask_band(true)?;
+        source.rasterband(1)?.open_mask_band()?.fill(255., None)?;
+        let mut reference = source.create_copy(
+            &DriverManager::get_driver_by_name("COG")?,
+            temp.path().join("reference.tif"),
+            &RasterCreationOptions::from_iter(["BLOCKSIZE=512"]),
+        )?;
+        reference.flush_cache()?;
+        finish_cog(&source, &temp.path().join("default.tif"), 1, None)?;
+        finish_cog(
+            &source,
+            &temp.path().join("nearest.tif"),
+            1,
+            Some("NEAREST"),
+        )?;
+        let overview = |ds: &Dataset| -> Result<Vec<f32>> {
+            let band = ds.rasterband(1)?.overview(0)?;
+            let size = band.size();
+            Ok(band
+                .read_as::<f32>((0, 0), size, size, None)?
+                .data()
+                .to_vec())
+        };
+        let expected = overview(&reference)?;
+        assert_eq!(
+            overview(&Dataset::open(temp.path().join("default.tif"))?)?,
+            expected
+        );
+        assert_ne!(
+            overview(&Dataset::open(temp.path().join("nearest.tif"))?)?,
+            expected
+        );
+        Ok(())
+    }
 }

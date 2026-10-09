@@ -26,7 +26,11 @@ ROI and aggregation are implemented in `prepro::roi` and
 `prepro::aggregation`, with typed source IDs, deterministic topology,
 source-ellipsoid metrics, and bounded parallel geometry work.
 [Vector-stage validation](vector-validation.md) records their checks and
-measurements. Raster preparation is next.
+measurements. Raster preparation is implemented in `prepro::preparation`,
+using GDAL rasterization and GEOS indexing/predicates, bounded block workers,
+and internally masked COGs. All five stages can run using candidate upstream
+products. [Preparation and pipeline validation](preparation-validation.md)
+records scientific comparisons and performance evidence.
 
 ## What stays fixed
 
@@ -63,9 +67,9 @@ not a crate per stage or a general workflow framework:
 | `prepro::execution` | Shared GDAL cache budget and safe temporary-output publication. |
 | `cli` / `prepro::cli` | Dispatch modules / parse preprocessing requests and present results. |
 
-Each scientific stage gets one file and module (ROI, aggregation, terrain, and
-sampling now; preparation when implemented), owning its science,
-validation, parameters, and orchestration. Keep shared GIS and resource helpers
+Each scientific stage gets one file and module (ROI, aggregation, preparation,
+terrain, and sampling), owning its science, validation, parameters, and
+orchestration. Keep shared GIS and resource helpers
 in `io` and `execution`.
 
 Use dense internal indices for graph operations while retaining original IDs
@@ -204,8 +208,9 @@ comparisons come after the two Jacui implementations are useful.
 5. ROI and aggregation are implemented with typed topology and geometry adapters.
    Preserve outlet precedence, evolving merges, representative IDs, and dense
    processing order. Use basin-only inputs for the routine performance loop.
-6. Implement preparation with verified ownership/rasterization semantics.
-   Exercise the full candidate pipeline on both networks once all stages exist.
+6. Preparation is implemented with verified ownership/rasterization semantics.
+   Both networks exercise the full candidate pipeline; validation and performance
+   evidence are recorded in `preparation-validation.md`.
 7. Replace GIS adapters natively where doing so demonstrably simplifies or
    improves the implementation. Python production components are already
    removed; the historical source remains in Git for scientific reference.

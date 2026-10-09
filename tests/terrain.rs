@@ -214,6 +214,7 @@ fn products_preserve_ownership_masks_metadata_and_worker_determinism() -> Result
         assert_eq!(csv.lines().count(), 2);
         let manifest: serde_json::Value = serde_json::from_reader(fs::File::open(first.manifest)?)?;
         assert_eq!(manifest["step"], "terrain-products");
+        assert_eq!(manifest["parameters"]["workers_used"], first.workers_used);
         assert!(Path::new(manifest["parameters"]["dem"].as_str().unwrap()).is_absolute());
     }
     Ok(())

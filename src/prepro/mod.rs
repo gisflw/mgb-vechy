@@ -15,3 +15,8 @@ pub use sampling::{SamplingReport, SamplingSpec, sample_minibasins};
 
 pub mod terrain;
 pub use terrain::{DirectionSource, TerrainReport, TerrainSpec, create_terrain_dataset};
+
+pub mod preparation;
+pub use preparation::{
+    D8Encoding, NamedRaster, PreparationReport, PreparationSpec, RasterKind, prepare_dataset,
+};

@@ -147,6 +147,29 @@ fn commands_use_prepro_and_correct_upstream_and_outlet_order() {
     ] {
         assert!(aggregate.args.iter().any(|arg| arg == flag));
     }
+    let prepare = invocation(temp.path(), &opts, Stage::Prepare).unwrap();
+    let flags: Vec<_> = prepare
+        .args
+        .iter()
+        .map(|arg| arg.to_string_lossy())
+        .collect();
+    assert!(
+        flags
+            .windows(3)
+            .any(|args| args[0] == "--categorical-raster"
+                && args[1] == "hru"
+                && args[2].ends_with("input/hru.tif"))
+    );
+    assert!(
+        prepare
+            .inputs
+            .contains(&opts.output_dir.join("mini_catchments.fgb"))
+    );
+    assert!(
+        flags
+            .windows(2)
+            .any(|args| args[0] == "--dem-scale" && args[1] == "0.01")
+    );
     assert!(invocation(temp.path(), &opts, Stage::All).is_err());
 }
 

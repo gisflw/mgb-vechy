@@ -224,9 +224,11 @@ pub fn sample_minibasins(spec: &SamplingSpec) -> Result<SamplingReport> {
         );
     }
     write_sampled(staging.path(), &minis, &results)?;
+    let mut parameters = serde_json::to_value(&spec)?;
+    parameters["workers_used"] = serde_json::json!(workers);
     serde_json::to_writer_pretty(
         File::create(staging.path().join("manifest-sample-minis.json"))?,
-        &serde_json::json!({"step": "sample-minis", "parameters": &spec}),
+        &serde_json::json!({"step": "sample-minis", "parameters": parameters}),
     )?;
     let nodata_reports = files
         .iter()

@@ -1,8 +1,32 @@
 # Stage 3: prepare raster data
 
-Frozen scientific reference for `mgb::prepro`; Rust implementation is pending.
+Implemented in Rust under `mgb::prepro::preparation`, preserving this frozen
+scientific reference.
 
-Current stage name: `prepare`.
+CLI command: `mgb prepro prepare`. Library entry point:
+`prepare_dataset(&PreparationSpec) -> Result<PreparationReport>`.
+
+```bash
+mgb prepro prepare --dem source_dem.tif --dem-scale 0.01 \
+  --mini-catchments mini_catchments.fgb --mini-segments mini_segments.fgb \
+  --categorical-raster hru source_hru.tif --output-dir prepared
+```
+
+Repeat `--continuous-raster NAME PATH` or `--categorical-raster NAME PATH` for
+additional inputs. Supply `--d8 PATH --d8-encoding canonical|esri` together.
+Named rasters use `NamedRaster` and `RasterKind`; `D8Encoding` selects direction
+normalization. Names match `[a-z][a-z0-9_-]*`; `dem`, `d8`, `grid_catchments`,
+`grid_segments`, `cells`, and `drainage` are reserved.
+
+`--workers` defaults to 4 and `--memory-limit-mb` to 4096. The application
+allocation budget bounds resident geometry, worker scratch, queued results, and
+GDAL cache; it is not a hard RSS ceiling. Concurrency is reduced to fit, and
+inputs or collision workspaces that cannot fit fail explicitly.
+
+The report includes output paths, mini count, and peak processing concurrency.
+The manifest records absolute input paths and `workers_used`. Existing stage
+products are never overwritten; failures publish no preparation products.
+Other stages may share the output directory.
 
 Clip aligned rasters and establish mini ownership and matching drainage on a
 canonical DEM grid. See the [shared data contracts](shared_data_contracts.md).

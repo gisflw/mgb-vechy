@@ -5,7 +5,7 @@ each with three ordered outlets. Large assets remain local and gitignored;
 the tracked configuration, inventory, audit provenance, and historical timing
 records stay unchanged during candidate work except for explicit corrections.
 
-The Rust package implements terrain products and mini sampling, and provides
+The Rust package implements all five preprocessing stages and provides
 regression tooling.
 The developer utility is separate from the production `mgb prepro` CLI:
 
@@ -67,14 +67,24 @@ cargo run --release --example jacui -- compare --network bhae \
   --stage sample-minis --output-dir tests/regression/jacui/runs/bhae-sampling
 ```
 
-ROI, aggregation, terrain, and sampling work against the current Rust executable.
-`--stage all` (the default) still requires raster preparation and uses candidate
-upstream products. Run sampling for both networks for scientific validation.
+All stages work against the current Rust executable. `--stage all` (the default)
+uses candidate upstream products throughout the full workflow. Use
+`--stage prepare` for preparation against captured mini vectors, or run the full
+pipeline for both networks:
+
+```bash
+cargo run --release --example jacui -- run --network bhae \
+  --stage all --command target/release/mgb \
+  --output-dir tests/regression/jacui/runs/bhae-pipeline
+cargo run --release --example jacui -- compare --network bhae \
+  --stage all --output-dir tests/regression/jacui/runs/bhae-pipeline
+```
+
+Repeat with `--network tdxhydro` and a fresh output directory.
 Candidate commands take the form `<executable prefix> prepro <stage> ...`.
 Repeat `--command-arg` to supply prefix arguments without shell evaluation,
 for example `--command cargo --command-arg=run --command-arg=--release
---command-arg=--`. The implemented stage adapters match the Rust CLI;
-preparation flags remain provisional.
+--command-arg=--`. All stage adapters match the Rust CLI.
 
 `run` accepts `--workers` and `--memory-limit-mb`, defaulting to 4 and 4096.
 Outputs must go to a fresh, empty directory. Inputs and expected products,
@@ -110,7 +120,8 @@ MGB_REGRESSION_COMMAND=target/release/mgb JACUI_STAGE=terrain-products \
 ```
 
 Use `JACUI_STAGE=sample-minis`, `JACUI_STAGE=define-roi`, or
-`JACUI_STAGE=aggregate` to test the other implemented stages.
+`JACUI_STAGE=aggregate`, or `JACUI_STAGE=prepare` to test individual stages.
+Omit `JACUI_STAGE` or set it to `all` for the full workflow.
 
 `MGB_REGRESSION_COMMAND` is an executable path, not shell text; use the developer
 utility for executable-prefix arguments. Explicit runs fail on missing fixtures.
@@ -120,8 +131,7 @@ The dataset capture omits flow-direction products; the
 ## Performance evidence
 
 Each candidate stage writes a log. `benchmark.json` records wall time, exit
-status, revision, platform, resource settings, admitted geometry workers when
-reported in the stage manifest, executable arguments, and timing
+status, revision, platform, resource settings, workers used from each stage manifest, executable arguments, and timing
 of failed invocations too. On Linux, `max_process_rss_kib` is `wait4`'s maximum
 individual-process RSS including completed descendants, not summed concurrent
 RSS. Other platforms record null for this Linux-specific metric.

@@ -1,14 +1,11 @@
 //! Confined mini-basin routing and raw-DEM HAND/geodesic LTND products.
 use super::{
     execution::{CACHE_BYTES, CacheBudget, MIB, publish},
-    io::{self, read, windows},
+    io::{self, attach_mask, read, staging_raster, windows},
     model::{Grid, Window},
 };
 use anyhow::{Context, Result, bail, ensure};
-use gdal::{
-    Dataset, DriverManager, Metadata,
-    raster::{GdalType, RasterCreationOptions},
-};
+use gdal::{Dataset, Metadata, raster::GdalType};
 use geographiclib_rs::{Geodesic, InverseGeodesic};
 use serde::Serialize;
 use std::{
@@ -953,44 +950,6 @@ fn check_collisions(spec: &TerrainSpec) -> Result<()> {
     }
     Ok(())
 }
-fn staging_raster<T: GdalType>(directory: &Path, name: &str, grid: &Grid) -> Result<Dataset> {
-    let mut ds = DriverManager::get_driver_by_name("GTiff")?
-        .create_with_band_type_with_options::<T, _>(
-            directory.join(format!("work-{name}")),
-            grid.width,
-            grid.height,
-            1,
-            &RasterCreationOptions::from_iter([
-                "TILED=YES",
-                "SPARSE_OK=YES",
-                "BLOCKXSIZE=512",
-                "BLOCKYSIZE=512",
-                "BIGTIFF=IF_SAFER",
-            ]),
-        )?;
-    ds.set_geo_transform(&grid.transform)?;
-    ds.set_spatial_ref(&io::spatial_ref(&grid.wkt)?)?;
-    Ok(ds)
-}
-fn attach_mask(ds: &mut Dataset, validity: &Dataset, grid: &Grid) -> Result<()> {
-    let mut band = ds.rasterband(1)?;
-    band.create_mask_band(true)?;
-    let mut mask = band.open_mask_band()?;
-    let source = validity.rasterband(1)?;
-    for window in windows(Window {
-        x: 0,
-        y: 0,
-        width: grid.width,
-        height: grid.height,
-    }) {
-        let position = (window.x as isize, window.y as isize);
-        let size = (window.width, window.height);
-        let mut values = source.read_as::<u8>(position, size, size, None)?;
-        mask.write(position, size, &mut values)?;
-    }
-    ds.flush_cache()?;
-    Ok(())
-}
 fn output_raster<T: GdalType>(
     directory: &Path,
     name: &str,
@@ -1306,11 +1265,12 @@ pub fn create_terrain_dataset(spec: &TerrainSpec) -> Result<TerrainReport> {
         }
     }
     csv.flush()?;
+    let mut parameters = serde_json::to_value(&spec)?;
+    parameters["workers_used"] = serde_json::json!(workers_used);
     serde_json::to_writer_pretty(
         File::create(staging.path().join("manifest-terrain-products.json"))?,
-        &serde_json::json!({"step":"terrain-products","parameters":spec}),
+        &serde_json::json!({"step":"terrain-products","parameters":parameters}),
     )?;
-    let cog = DriverManager::get_driver_by_name("COG")?;
     for (name, mut ds) in [
         ("hand.tif", Some(hand)),
         ("ltnd.tif", Some(ltnd)),
@@ -1319,20 +1279,7 @@ pub fn create_terrain_dataset(spec: &TerrainSpec) -> Result<TerrainReport> {
         if let Some(ds) = ds.as_mut() {
             attach_mask(ds, &validity, &grid)?;
             ds.flush_cache()?;
-            let mut output = ds.create_copy(
-                &cog,
-                staging.path().join(name),
-                &RasterCreationOptions::from_iter([
-                    "BLOCKSIZE=512".to_owned(),
-                    "COMPRESS=ZSTD".to_owned(),
-                    "LEVEL=1".to_owned(),
-                    "PREDICTOR=STANDARD".to_owned(),
-                    "BIGTIFF=IF_SAFER".to_owned(),
-                    format!("NUM_THREADS={workers}"),
-                ]),
-            )?;
-            output.flush_cache()?;
-            drop(output);
+            io::finish_cog(ds, &staging.path().join(name), workers, None)?;
             let output = Dataset::open(staging.path().join(name))?;
             io::validate_raster(
                 &output,

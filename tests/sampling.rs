@@ -257,6 +257,10 @@ fn sampling_values_order_and_worker_determinism() -> Result<()> {
     assert_eq!(bytes, fs::read(parallel.sampled_minis)?);
     let manifest: Value = serde_json::from_reader(fs::File::open(parallel.manifest)?)?;
     assert_eq!(manifest["step"], "sample-minis");
+    assert_eq!(
+        manifest["parameters"]["workers_used"],
+        parallel.workers_used
+    );
     assert!(Path::new(manifest["parameters"]["dem"].as_str().unwrap()).is_absolute());
     Ok(())
 }

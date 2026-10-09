@@ -58,7 +58,7 @@ pub struct Invocation {
     pub inputs: Vec<PathBuf>,
 }
 
-/// Implemented stages match the Rust CLI; preparation flags remain provisional.
+/// All stage adapters match the Rust CLI.
 pub fn invocation(root: &Path, options: &RunOptions, stage: Stage) -> Result<Invocation> {
     let config: Config = serde_json::from_reader(File::open(root.join("config.json"))?)?;
     let fields = config
