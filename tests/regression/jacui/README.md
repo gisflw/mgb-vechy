@@ -67,14 +67,14 @@ cargo run --release --example jacui -- compare --network bhae \
   --stage sample-minis --output-dir tests/regression/jacui/runs/bhae-sampling
 ```
 
-Terrain and sampling work against the current Rust executable. `--stage all`
-(the default) requires the three remaining stages and uses candidate upstream products. Run
-sampling for both networks for scientific validation.
+ROI, aggregation, terrain, and sampling work against the current Rust executable.
+`--stage all` (the default) still requires raster preparation and uses candidate
+upstream products. Run sampling for both networks for scientific validation.
 Candidate commands take the form `<executable prefix> prepro <stage> ...`.
 Repeat `--command-arg` to supply prefix arguments without shell evaluation,
 for example `--command cargo --command-arg=run --command-arg=--release
---command-arg=--`. The terrain and sampling option adapters match the Rust CLI; adapters for pending stages
-remain provisional.
+--command-arg=--`. The implemented stage adapters match the Rust CLI;
+preparation flags remain provisional.
 
 `run` accepts `--workers` and `--memory-limit-mb`, defaulting to 4 and 4096.
 Outputs must go to a fresh, empty directory. Inputs and expected products,
@@ -109,7 +109,8 @@ MGB_REGRESSION_COMMAND=target/release/mgb JACUI_STAGE=terrain-products \
   cargo test --test regression jacui_candidate_scientific_regression -- --ignored
 ```
 
-Use `JACUI_STAGE=sample-minis` to test sampling instead.
+Use `JACUI_STAGE=sample-minis`, `JACUI_STAGE=define-roi`, or
+`JACUI_STAGE=aggregate` to test the other implemented stages.
 
 `MGB_REGRESSION_COMMAND` is an executable path, not shell text; use the developer
 utility for executable-prefix arguments. Explicit runs fail on missing fixtures.
@@ -119,7 +120,8 @@ The dataset capture omits flow-direction products; the
 ## Performance evidence
 
 Each candidate stage writes a log. `benchmark.json` records wall time, exit
-status, revision, platform, resource settings, executable arguments, and timing
+status, revision, platform, resource settings, admitted geometry workers when
+reported in the stage manifest, executable arguments, and timing
 of failed invocations too. On Linux, `max_process_rss_kib` is `wait4`'s maximum
 individual-process RSS including completed descendants, not summed concurrent
 RSS. Other platforms record null for this Linux-specific metric.
@@ -146,3 +148,10 @@ Review regenerated products, provenance, inventory, and benchmark records
 before replacing this capture. This is a separate reference operation, never
 part of candidate regression. `scratch/analysis` stays reserved for the user's
 broader manual testing.
+
+For the vector stages, use the same `run` and `compare` commands with
+`--stage define-roi` or `--stage aggregate`. Separate aggregation runs consume
+captured ROI products. To check candidate ROI integration, invoke
+`mgb prepro aggregate` directly with candidate ROI paths and compare the
+result using `--stage aggregate`. Keep the stage output directories separate
+so the comparator can verify each exact product set.

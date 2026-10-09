@@ -262,7 +262,9 @@ pub fn compare_vector(actual: &Path, reference: &Path) -> Result<()> {
     };
     ensure!(
         schema(&a) == schema(&b),
-        "Vector field names/types/order differ"
+        "Vector field names/types/order differ: {:?} vs {:?}",
+        schema(&a),
+        schema(&b)
     );
     let geometry_schema = |layer: &gdal::vector::Layer<'_>| {
         layer
@@ -273,7 +275,9 @@ pub fn compare_vector(actual: &Path, reference: &Path) -> Result<()> {
     };
     ensure!(
         geometry_schema(&a) == geometry_schema(&b),
-        "Vector geometry schemas differ"
+        "Vector geometry schemas differ: {:?} vs {:?}",
+        geometry_schema(&a),
+        geometry_schema(&b)
     );
     let mut a = vector_rows(&mut a)?;
     let mut b = vector_rows(&mut b)?;

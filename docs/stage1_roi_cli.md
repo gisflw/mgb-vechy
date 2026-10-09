@@ -1,6 +1,7 @@
 # Stage 1: define ROI
 
-Frozen scientific reference for `mgb::prepro`; Rust implementation is pending.
+Implemented by `mgb::prepro::roi::define_roi_dataset` and
+`mgb prepro define-roi`, following the frozen scientific reference.
 
 Current stage name: `define-roi`.
 
@@ -70,3 +71,24 @@ selected catchment IDs, missing selected source pairs, selected cycles,
 non-integral selected Strahler orders, and invalid, empty, null, or wrongly
 typed selected polygon/line geometries. Catchment duplicates outside the
 selected IDs do not affect the ROI.
+
+## Rust usage
+
+```bash
+mgb prepro define-roi --catchments catchments.gpkg --segments segments.gpkg \
+  --catchments-layer catchments --segments-layer segments \
+  --crs EPSG:4326 --outlet-id 171984 --outlet-id 420329 \
+  --outlet-id 178658 --id-col cotrecho --id-down-col nutrjus \
+  --strahler-order-col nustrahler --output-dir output
+```
+
+Field defaults are `id`, `id_down`, and `strahler_order`. Optional
+`--catchments-source-crs` and `--segments-source-crs` replace source metadata.
+Integer source IDs normalize to int64 without changing values; real and string
+IDs retain their type. ROI geometry layer types retain the source declaration.
+
+`--workers` and `--memory-limit-mb` default to 4 and 4096. Topology and selected
+geometry stay resident; conservative accounting reduces geometry concurrency
+or rejects inputs that cannot fit. The budget is not a hard RSS ceiling.
+Existing stage products are never overwritten; failed publication rolls back
+new files. Other stages can share the output directory.

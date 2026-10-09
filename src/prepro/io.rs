@@ -1,4 +1,5 @@
 //! Shared raster windows, geometry-independent CRS transforms, and cell areas.
+pub(crate) mod vector;
 use super::model::{Grid, Window};
 use anyhow::{Context, Result, bail, ensure};
 use gdal::{

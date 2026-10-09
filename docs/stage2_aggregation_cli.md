@@ -1,6 +1,7 @@
 # Stage 2: aggregate mini-basins
 
-Frozen scientific reference for `mgb::prepro`; Rust implementation is pending.
+Implemented by `mgb::prepro::aggregation::aggregate_roi_dataset` and
+`mgb prepro aggregate`, following the frozen scientific reference.
 
 Current stage name: `aggregate`.
 
@@ -77,3 +78,18 @@ Reject missing required attributes, mismatched CRS or source IDs, duplicate
 IDs, invalid numeric attributes or geometries, cycles, and negative thresholds.
 Fail when no reach satisfies the area threshold or any catchment has no
 surviving aggregation target in its `sub`.
+
+## Rust usage
+
+```bash
+mgb prepro aggregate --roi-catchments output/roi_catchments.fgb \
+  --roi-segments output/roi_segments.fgb --uparea-min 60 --lmin 6 \
+  --output-dir output
+```
+
+Both thresholds are required. `--workers` and `--memory-limit-mb` default to
+4 and 4096. Topology decisions are sequential; complete geometric unions run
+in bounded threads. Topology and source WKB stay resident. Inputs or individual
+union groups that exceed conservative allocation estimates fail explicitly;
+the application budget is not a hard RSS ceiling. Existing stage products are
+never overwritten, and failed publication rolls back new files.

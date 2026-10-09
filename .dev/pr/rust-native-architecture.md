@@ -22,7 +22,11 @@ Admission uses each mini window rather than reserving the largest window for
 every worker. Geographic LTND reuses row edge lengths; staging remains sparse
 and uncompressed until one final masked COG conversion.
 [Terrain validation and measurements](terrain-validation.md) record its checks.
-ROI and aggregation are the next stages.
+ROI and aggregation are implemented in `prepro::roi` and
+`prepro::aggregation`, with typed source IDs, deterministic topology,
+source-ellipsoid metrics, and bounded parallel geometry work.
+[Vector-stage validation](vector-validation.md) records their checks and
+measurements. Raster preparation is next.
 
 ## What stays fixed
 
@@ -59,8 +63,8 @@ not a crate per stage or a general workflow framework:
 | `prepro::execution` | Shared GDAL cache budget and safe temporary-output publication. |
 | `cli` / `prepro::cli` | Dispatch modules / parse preprocessing requests and present results. |
 
-Each scientific stage gets one file and module (`sampling.rs` and `terrain.rs` now;
-ROI, aggregation, and preparation when implemented), owning its science,
+Each scientific stage gets one file and module (ROI, aggregation, terrain, and
+sampling now; preparation when implemented), owning its science,
 validation, parameters, and orchestration. Keep shared GIS and resource helpers
 in `io` and `execution`.
 
@@ -197,7 +201,7 @@ comparisons come after the two Jacui implementations are useful.
    ties, partial nodata, deterministic workers, and oversized-mini rejection.
 4. Terrain is implemented against prepared Jacui inputs and synthetic routing
    fixtures, preserving directions, confinement, raw-DEM HAND, and geodesic LTND.
-5. Implement ROI and aggregation with typed topology and geometry adapters.
+5. ROI and aggregation are implemented with typed topology and geometry adapters.
    Preserve outlet precedence, evolving merges, representative IDs, and dense
    processing order. Use basin-only inputs for the routine performance loop.
 6. Implement preparation with verified ownership/rasterization semantics.

@@ -1,7 +1,11 @@
 //! Preprocessing of hydrography, mini-basins, terrain, and model attributes.
 //!
 //! Stage implementations follow the frozen contracts in `docs/`.
+pub mod aggregation;
 pub mod cli;
+pub mod roi;
+pub use aggregation::{AggregationReport, AggregationSpec, aggregate_roi_dataset};
+pub use roi::{RoiReport, RoiSpec, define_roi_dataset};
 pub mod execution;
 pub mod io;
 pub mod model;

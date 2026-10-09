@@ -7,6 +7,8 @@ fn root_and_prepro_help_and_version() {
         vec!["prepro", "--help"],
         vec!["prepro", "sample-minis", "--help"],
         vec!["prepro", "terrain-products", "--help"],
+        vec!["prepro", "define-roi", "--help"],
+        vec!["prepro", "aggregate", "--help"],
         vec!["--version"],
     ] {
         let output = Command::new(env!("CARGO_BIN_EXE_mgb"))
@@ -19,6 +21,25 @@ fn root_and_prepro_help_and_version() {
         if args == ["--version"] {
             assert!(text.contains("0.1.0"));
         }
+    }
+}
+
+#[test]
+fn vector_stages_require_explicit_inputs_and_reject_invalid_flags() {
+    for args in [
+        vec!["prepro", "define-roi"],
+        vec!["prepro", "aggregate"],
+        vec!["prepro", "define-roi", "--workers=-1"],
+        vec!["prepro", "aggregate", "--lmin=invalid"],
+    ] {
+        assert!(
+            !Command::new(env!("CARGO_BIN_EXE_mgb"))
+                .args(args)
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
     }
 }
 

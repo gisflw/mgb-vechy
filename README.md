@@ -4,9 +4,9 @@ MGB is a Rust library and command-line toolset for hydrography and model inputs.
 Its first module, `mgb::prepro`, prepares vector networks, mini-basins, terrain
 products, and model attributes using explicit segment and downstream IDs.
 
-Terrain products and mini sampling are implemented in Rust, with library APIs,
-CLI commands, and Jacui regression tools. ROI selection, aggregation, and
-preparation remain pending; ROI and aggregation are next. The five stage contracts define scientific
+ROI selection, mini-basin aggregation, terrain products, and mini sampling are
+implemented in Rust, with library APIs, CLI commands, and Jacui regression tools.
+Raster preparation remains pending. The five stage contracts define scientific
 behavior across implemented and pending stages.
 
 ## Build and check
@@ -28,14 +28,15 @@ cargo test --all-targets --locked
 
 The executable is `mgb`; scientific commands use `mgb prepro <stage>`.
 The public library namespace is `mgb::prepro`. There is one Cargo package;
-each scientific stage has its own module (`mgb::prepro::sampling` and `mgb::prepro::terrain`).
+each scientific stage has its own module (`roi`, `aggregation`, `terrain`, and
+`sampling` under `mgb::prepro`).
 
 ## Frozen preprocessing workflow
 
 | Stage | Capability | Main products |
 | --- | --- | --- |
-| 1. [Define ROI](docs/stage1_roi_cli.md) | Upstream outlet union and normalized hydrography. | ROI catchments and segments. |
-| 2. [Aggregate mini-basins](docs/stage2_aggregation_cli.md) | Group source units using area, length, and network rules. | Mini catchments, reaches, and source-to-mini mapping. |
+| 1. [Define ROI](docs/stage1_roi_cli.md) | Implemented: upstream outlet union and normalized hydrography. | ROI catchments and segments. |
+| 2. [Aggregate mini-basins](docs/stage2_aggregation_cli.md) | Implemented: group source units using area, length, and network rules. | Mini catchments, reaches, and source-to-mini mapping. |
 | 3. [Prepare raster data](docs/stage3_prepare_data.md) | Aligned inputs, raster ownership, and matching drainage. | Prepared DEM, optional rasters, and mini-ID grids. |
 | 4. [Terrain products](docs/stage4_terrain_cli.md) | Implemented: confined routing, HAND, and terrain-to-drainage distance. | HAND, LTND, diagnostics, and optional directions. |
 | 5. [Sample mini-basins](docs/stage5_mini_sampling_cli.md) | Implemented: terrain, HRU, and flooded-area summaries. | Mini attribute CSV and missing-data reports. |

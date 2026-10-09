@@ -58,7 +58,7 @@ pub struct Invocation {
     pub inputs: Vec<PathBuf>,
 }
 
-/// Sampling and terrain match the Rust CLI; pending stage flags remain provisional.
+/// Implemented stages match the Rust CLI; preparation flags remain provisional.
 pub fn invocation(root: &Path, options: &RunOptions, stage: Stage) -> Result<Invocation> {
     let config: Config = serde_json::from_reader(File::open(root.join("config.json"))?)?;
     let fields = config
@@ -284,7 +284,12 @@ pub fn run(root: &Path, options: &RunOptions) -> Result<Value> {
         let started = Instant::now();
         let result = result();
         let (code, rss) = result.as_ref().copied().unwrap_or((-1, None));
-        let measurement = json!({"stage": stage.name(), "wall_seconds": started.elapsed().as_secs_f64(),
+        let wall_seconds = started.elapsed().as_secs_f64();
+        let workers_used = File::open(output.join(format!("manifest-{}.json", stage.name())))
+            .ok()
+            .and_then(|file| serde_json::from_reader::<_, Value>(file).ok())
+            .and_then(|manifest| manifest["parameters"]["workers_used"].as_u64());
+        let measurement = json!({"stage": stage.name(), "wall_seconds": wall_seconds, "workers_used": workers_used,
             "max_process_rss_kib": rss, "exit_code": code,
             "error": result.as_ref().err().map(|error| format!("{error:#}"))});
         report["measurements"]

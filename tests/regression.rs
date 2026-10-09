@@ -136,6 +136,17 @@ fn commands_use_prepro_and_correct_upstream_and_outlet_order() {
         .collect();
     assert_eq!(outlets, ["640538827", "640543432", "640538824"]);
     assert!(roi.args.iter().any(|arg| arg == "--segments-source-crs"));
+    let aggregate = invocation(temp.path(), &opts, Stage::Aggregate).unwrap();
+    for flag in [
+        "--roi-catchments",
+        "--roi-segments",
+        "--uparea-min",
+        "--lmin",
+        "--workers",
+        "--memory-limit-mb",
+    ] {
+        assert!(aggregate.args.iter().any(|arg| arg == flag));
+    }
     assert!(invocation(temp.path(), &opts, Stage::All).is_err());
 }
 
