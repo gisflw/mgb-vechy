@@ -1,125 +1,88 @@
 # Stage 5: sample mini-basin attributes
 
-`mgb-vec-hydro sample-minis` consumes explicit mini vectors, prepared domain
-rasters with embedded mini bounds, terrain products, the prepared DEM, and the
-categorical HRU raster.
+Current stage name: `sample-minis`.
 
-```bash
-mgb-vec-hydro sample-minis \
-  --mini-catchments minis/mini_catchments.fgb \
-  --mini-segments minis/mini_segments.fgb \
-  --dem prepared/dem.tif \
-  --grid-catchments prepared/grid_catchments.tif \
-  --grid-segments prepared/grid_segments.tif \
-  --hand terrain/hand.tif \
-  --ltnd terrain/ltnd.tif \
-  --hru prepared/hru.tif \
-  --output-dir sampled
-```
+Summarize terrain and existing HRU classes into one geometry-free attribute
+row per mini. See the [shared data contracts](shared_data_contracts.md).
 
-## Options
+## Inputs
 
-| Option | Status | Type/default | Meaning |
-| --- | --- | --- | --- |
-| `--mini-catchments` | Required | Existing vector path | Aggregated mini-catchment polygons and normalized mini attributes. |
-| `--mini-segments` | Required | Existing vector path | Aggregated mini-segment lines and normalized reach attributes. |
-| `--dem` | Required | Existing raster path | Prepared DEM and authoritative canonical grid for sampling. |
-| `--grid-catchments` | Required | Existing raster path | Dense integer mini IDs and embedded bounds used to select catchment cells. |
-| `--grid-segments` | Required | Existing raster path | Int32 mini segment IDs; matching IDs select reach cells within each mini. |
-| `--hand` | Required | Existing raster path | Terrain height-above-drainage raster used for reach and tributary statistics. |
-| `--ltnd` | Required | Existing raster path | Local terrain-to-drainage distance raster used for tributary statistics. |
-| `--hru` | Required | Existing raster path | Integer categorical HRU raster; sampled classes must be in `1..100`. |
-| `--output-dir` | Required | Directory path | Directory where `sampled_minis.csv` and any nodata reports are published. |
-| `--workers` | Optional | Positive integer; default `4` | Number of worker processes used for bounded sampling packets. There is no upper limit imposed by the CLI or stage validator. |
-| `--memory-limit-mb` | Optional | Positive integer MB; default `4096` | Soft memory sizing hint for sampling packets and retained statistics. |
-| `--io-slots` | Optional | Positive integer; default `2` | Maximum number of concurrent raster reads. |
-| `--batch-size` | Optional | Positive integer rows; default `10000` | Batch size used when reading vector metadata. |
+Mini catchments and segments use the [aggregation schema](stage2_aggregation_cli.md#outputs)
+and contain the same IDs as the prepared `mini_index`. Their attributes agree
+except that segment `unit_length` is independently used for reach slope.
+Both vectors declare the DEM CRS.
 
-Click also provides `--help` to display the command’s generated option list.
+The six raster inputs are DEM, catchment IDs, segment IDs, HAND, LTND, and HRU.
+All are single-band COGs matching the DEM's canonical grid, CRS, and internal
+masks. DEM, HAND, and LTND declare `units=m`. HRU values are integer classes
+in `1..100`; no new HRU classes are constructed by this stage.
 
-The DEM is authoritative for CRS and canonical grid. Both mini vectors must
-declare that CRS, use the exact aggregation schema, and contain the same IDs
-as the mini IDs stored in `grid_catchments.tif`. All six raster inputs must be
-single-band COGs with the exact DEM grid, matching CRS, and internal masks.
-The HRU raster must be integer-valued; sampled class IDs must be in `1..100`.
-CRS, grid, masks, and mini IDs must match. Missing fields and unreadable
-inputs fail directly in the underlying libraries.
+## Scientific behavior
 
-DEM, HAND, and LTND must declare `units=m` for their stored values.
-In particular, degree-valued LTND cannot be accurately converted
-with one scale factor after route directions have been discarded. For a DEM
-stored in centimetres, run preparation with `--dem-scale 0.01`, then regenerate
-terrain and sampling into new directories.
+Use ownership IDs to select catchment cells. Reach cells have matching segment
+IDs (`grid_segments == mini_id`). Positive segment IDs must match ownership.
+Longitude and latitude are a representative point on the mini segment,
+transformed to EPSG:4326.
 
-Sampling uses mini IDs in cells rather than polygon masks. Catchment
-statistics use cells owned by each mini; reach elevation uses matching
-segment IDs (`grid_segments == mini_id`). Positive IDs must match overlaid
-ownership. Longitude and latitude use a representative point on each mini
-segment. Exact percentiles and deterministic accumulators are reduced
-over complete mini packets, while each distinct canonical COG block is read
-once per raster in a packet. No raster is reprojected or republished.
+| Attribute | Definition | Unit |
+| --- | --- | --- |
+| `reach_elevation` | Median valid DEM elevation on matching reach cells. | m |
+| `reach_slope` | `(P85 - P10) / (0.75 * segment unit_length)` for those reach elevations. | m/km |
+| `tributary_length` | Maximum usable LTND divided by 1000. | km |
+| `tributary_slope` | Mean HAND of cells tied for maximum usable LTND, divided by tributary length. | m/km |
+| `hru_<id>` | `100 * valid class-cell count / valid HRU-cell count`. | percent |
+| `flooded_area_<stage>` | Sum of geodesic cell areas with valid HAND at or below the stage. | km² |
 
-The output directory is staged privately and contains the CSV and an audit
-manifest with the input paths and processing parameters:
+Percentiles are exact with linear interpolation: position `(n - 1) * p` in
+sorted samples, interpolating between adjacent values. Tributary statistics
+use only paired valid HAND/LTND cells. Maximum-LTND ties satisfy
+`abs(value - maximum) <= 1e-8 + 1e-5 * abs(maximum)`.
 
-```text
-sampled/
-├── manifest-sample-minis.json
-└── sampled_minis.csv
-```
+Flood stages are integer metres from 1 through 100, inclusive. Negative HAND
+contributes at every stage; valid HAND above 100 contributes at none. Cell
+areas come from geographic pixel corners on the source CRS ellipsoid.
+Vector `unit_area` is retained as an attribute and does not scale flooded area.
+HRU percentages use valid HRU cells as their denominator and sum to 100%.
 
-The output also contains `nodata_<raster>.csv` for each affected raster.
+## Outputs
 
-Rows preserve the aggregation attributes (`id`, `id_down`, `sub`, `p_order`,
-`unit_length`, `upstream_length`, `unit_area`, and `upstream_area`) without
-geometry. The output includes longitude/latitude, `reach_slope`,
-`reach_elevation`, `tributary_length`, and `tributary_slope`; sorted `hru_<id>`
-percentage columns summing to 100%; and `flooded_area_<stage>` columns for
-stages 1 through 100, in that order. Column names omit units; lengths and
-elevations are metres, slopes are metres per kilometre, and areas are km².
-The CLI prints the concrete CSV path.
-Execution defaults are four workers, 4096 MB (4 GB) as a soft memory hint, two I/O
-slots, and 10,000-row batches. Worker counts may be any positive integer.
+| Filename | Content |
+| --- | --- |
+| `sampled_minis.csv` | One row per mini, without geometry. |
+| `nodata_<raster>.csv` | Missing-cell report for each affected input raster. |
+| `manifest-sample-minis.json` | Input paths and processing parameters. |
 
-Reach elevation is the median DEM elevation of cells labeled for each
-mini and marked as drainage, in metres. Reach slope is the difference between
-the 85th and 10th percentiles of those same reach elevations (metres), divided
-by `0.75 * unit_length` (kilometres). Each flooded-area column is the sum of
-geodesic raster-cell areas in each mini with valid HAND at or below its stage
-in metres; negative HAND is included at every stage. Cells without valid HAND
-contribute no area. Areas are measured on the source CRS ellipsoid from each
-pixel's geographic corners and reported in km². Stage 1 computes
-`unit_length` geodesically and aggregation preserves those kilometre metrics.
-Tributary length is maximum LTND divided by 1000; tributary slope is
-mean HAND at cells tied for that maximum divided by tributary length. Tributary
-statistics use only cells where both HAND and LTND are valid.
+The sampled CSV has these ordered column groups:
 
-## Nodata policy
+1. Aggregation attributes: `id`, `id_down`, `sub`, `p_order`, `unit_length`,
+   `upstream_length`, `unit_area`, `upstream_area`.
+2. `longitude`, `latitude`, `reach_slope`, `reach_elevation`,
+   `tributary_length`, `tributary_slope`.
+3. `hru_<id>` columns for classes present across the sampled domain, ordered
+   by ascending numeric class ID; absent classes in a mini receive zero.
+4. `flooded_area_1` through `flooded_area_100`, in ascending stage order.
 
-The ownership mask defines each mini's domain; masked cells outside ownership
-are excluded. Within a mini, masked cells and NaNs in DEM, HAND, LTND, HRU, and
-segment IDs are excluded from the corresponding statistics. Sampling emits one
-warning per run listing only affected flags, such as `--hand` and `--hru`. For
-each affected raster, it writes a `nodata_<raster>.csv` with columns `mini_id`,
-`nodata_cells`, `total_cells`, and `percentage_nodata`; rows include only
-affected minis and are ordered by mini ID. Reports are saved when a completed
-scan fails because a required statistic has no valid data. Infinities and
-invalid HRU classes still fail. A mini fails sampling if it has no valid HRU
-cells, HAND cells, DEM reach cells, or paired HAND/LTND cells, or if its
-maximum usable LTND is not positive.
+Aggregation attributes retain their values and km/km² units. Coordinates
+are degrees; sampled elevation, tributary length, slopes, and flooded areas
+use the units specified above. The sampled table has deterministic row order;
+ascending mini-ID order is not an established contract.
 
-HRU percentages divide each class count by the mini's valid HRU-cell count, so
-the emitted class percentages sum to 100%. Flooded-area columns sum geodesic
-cell areas for valid HAND values at or below each threshold. Vector `unit_area`
-is retained as an aggregation attribute and does not scale these estimates.
-Valid HAND values above 100 metres remain in the raster domain but contribute
-to none of the 1–100 metre thresholds. For pipeline behavior beyond sampling,
-see the [shared raster nodata policy](shared_execution.md#nodata-policy).
+## Nodata policy and invalid inputs
 
-Measured preparation, terrain, and sampling costs and reproduction commands
-are in [the unit-correction performance report](sampling_units_performance.md).
+Exclude cells outside ownership entirely. Within each mini, masked cells and
+NaNs are excluded from the corresponding DEM, HAND, LTND, HRU, or segment-grid
+statistics. Infinities and invalid HRU classes fail.
 
-`--memory-limit-mb` is a soft sizing hint for task packets and retained
-intermediates, without separate quotas. Workers and a small queue bound
-concurrency; library caches have explicit sizes. Actual RSS can exceed the
-hint. See [shared memory sizing](shared_execution.md#local-execution).
+Report partial missing coverage with one warning per run identifying the
+affected raster inputs. Each `nodata_<raster>.csv` has ordered columns
+`mini_id`, `nodata_cells`, `total_cells`, `percentage_nodata`. Include only
+affected minis, in ascending mini-ID order, with
+`percentage_nodata = 100 * nodata_cells / total_cells`. Raster names are
+`dem`, `grid_segments`, `hand`, `ltnd`, and `hru`.
+
+A mini fails if it has no valid HRU cells, valid HAND cells, valid DEM reach
+cells, or paired HAND/LTND cells, or if maximum usable LTND is not positive.
+Reports are retained when a completed scan fails for missing required
+statistics. Also reject inconsistent vector schemas/attributes, mini IDs,
+CRS, grids, masks, units, positive segment ownership, or zero/invalid reach
+lengths.

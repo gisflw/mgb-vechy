@@ -1,126 +1,40 @@
 # MGB-Vec-Hydro
 
-MGB-Vec-Hydro is a standalone Python library and command-line interface for
-preparing vector hydrography inputs for MGB workflows. It works with generic
-vector networks that expose explicit segment and downstream topology columns;
-BHO is supported as the initial regression dataset rather than as a fixed
-schema.
+MGB-Vec-Hydro prepares vector hydrography, mini-basins, raster terrain products,
+and attributes for MGB model inputs. The product is a standalone library and
+command-line toolset. Networks use explicit segment and downstream identifiers;
+BHO is a regression dataset rather than a required source schema.
 
-The implemented workflow selects raw vectors into a region of interest, aggregates
-source units into mini-basins, prepares aligned raster and mini-domain inputs,
-generates HAND and local terrain-to-drainage products, and samples terrain and
-existing HRU classes onto mini-basins. Each stage receives the files it needs
-explicitly and publishes flat output files. All steps can share one output
-folder; the CLI asks before running if that step would replace existing files. HRU class construction and
-final MGB file generation remain planned work.
+## Implemented workflow
 
-## Installation
+| Stage | Capability | Main products |
+| --- | --- | --- |
+| [1. Define ROI](docs/stage1_roi_cli.md) | Select the upstream union of one or more outlets and normalize hydrography in a chosen CRS. | ROI catchments and segments with topology and geodesic metrics. |
+| [2. Aggregate mini-basins](docs/stage2_aggregation_cli.md) | Group source units according to area, length, and network rules. | Mini catchments, mini reaches, and source-to-mini mapping. |
+| [3. Prepare raster data](docs/stage3_prepare_data.md) | Clip aligned inputs and establish raster ownership and matching drainage. | Prepared DEM, optional rasters, and mini-ID grids. |
+| [4. Terrain products](docs/stage4_terrain_cli.md) | Determine confined drainage routes and derive HAND and local terrain-to-drainage distance. | HAND, LTND, undrained-cell report, and optional flow directions. |
+| [5. Sample mini-basins](docs/stage5_mini_sampling_cli.md) | Summarize terrain, existing HRU classes, and flooded areas for each mini. | Geometry-free mini attribute CSV and missing-data reports. |
 
-MGB-Vec-Hydro requires Python 3.11 or newer. From a repository checkout, install
-the package into an isolated environment:
+Each stage consumes explicit inputs and produces flat data files. The stages
+can share an output folder. HRU class construction and final simulation-file
+generation are [remaining capabilities](docs/plan/README.md).
 
-```bash
-python -m pip install -e .
-```
+## Behavioral reference
 
-## Commands
+The stage guides and [shared data contracts](docs/shared_data_contracts.md)
+are the stable reference for implemented capabilities, scientific rules, and
+output file contracts. These contracts stay fixed when implementation changes.
+Current source and scientific tests provide the reference where details need
+verification. A scientific-contract change is separate from an architectural
+change and should be documented as such.
 
-Run the stages in this order: define an ROI, aggregate mini-basins, prepare
-the raster/mini domain, generate terrain products, then sample the mini-basins.
-`--output-dir` is the publication destination.
+The guides describe inputs, scientific parameters, results, and data meanings.
+Current command names identify the stages; they do not freeze CLI spelling,
+Python APIs, or execution machinery. Audit manifests retain their filenames
+and `step`/`parameters` envelope; runtime-specific parameter fields may evolve.
+Implementation documentation is deferred.
 
-### Prepare canonical inputs
-
-Clip already aligned rasters and rasterize the aggregated mini domain:
-
-```bash
-mgb-vec-hydro prepare \
-  --dem data/dem.tif \
-  --mini-catchments output/minis/mini_catchments.fgb \
-  --mini-segments output/minis/mini_segments.fgb \
-  --categorical-raster hru data/hru.tif \
-  --output-dir prepared
-```
-
-### Define a region of interest
-
-Select all catchments and segments upstream of one or more outlets:
-
-Inputs may be GeoPackage, FlatGeobuf, or ESRI FileGDB. FileGDB inputs require
-the corresponding `--catchments-layer` or `--segments-layer` option; those
-options can also select named GeoPackage layers.
-
-```bash
-mgb-vec-hydro define-roi \
-  --crs EPSG:6933 \
-  --catchments data/catchments.gpkg \
-  --segments data/segments.gpkg \
-  --outlet-id 123 \
-  --id-col id \
-  --id-down-col id_down \
-  --strahler-order-col strahler_order \
-  --output-dir output/roi
-```
-
-### Aggregate mini-basins
-
-Aggregate the normalized ROI using upstream-area and minimum-length thresholds:
-
-```bash
-mgb-vec-hydro aggregate \
-  --roi-catchments output/roi/roi_catchments.fgb \
-  --roi-segments output/roi/roi_segments.fgb \
-  --uparea-min 30 \
-  --lmin 6 \
-  --output-dir output/minis
-```
-
-### Generate terrain products
-
-Create strict mini-confined HAND and local terrain-to-drainage COGs. Add
-`--write-flow-direction` to publish the selected D8 raster, or use
-`--direction-source d8` to route from a prepared D8 input.
-
-```bash
-mgb-vec-hydro terrain-products \
-  --dem prepared/dem.tif \
-  --grid-catchments prepared/grid_catchments.tif \
-  --grid-segments prepared/grid_segments.tif \
-  --direction-source dem \
-  --output-dir output/terrain
-```
-
-### Sample mini-basin attributes
-
-Sample DEM, HAND, local terrain-to-drainage distance, and an existing
-categorical HRU raster into a geometry-free CSV:
-
-```bash
-mgb-vec-hydro sample-minis \
-  --mini-catchments output/minis/mini_catchments.fgb \
-  --mini-segments output/minis/mini_segments.fgb \
-  --dem prepared/dem.tif \
-  --grid-catchments prepared/grid_catchments.tif \
-  --grid-segments prepared/grid_segments.tif \
-  --hand output/terrain/hand.tif \
-  --ltnd output/terrain/ltnd.tif \
-  --hru prepared/hru.tif \
-  --output-dir output/sampled
-```
-
-Use `mgb-vec-hydro COMMAND --help` for the complete option list.
-
-## Documentation
-
-- [ROI and working CRS](docs/stage1_roi_cli.md)
-- [Prepare-data contract](docs/stage3_prepare_data.md)
-- [ROI CLI and normalized schema](docs/stage1_roi_cli.md)
-- [Mini-basin aggregation CLI](docs/stage2_aggregation_cli.md)
-- [Terrain-products CLI](docs/stage4_terrain_cli.md)
-- [Mini-basin sampling CLI](docs/stage5_mini_sampling_cli.md)
-- [Remaining workflow plans](docs/plan/README.md)
-- [Larger-than-memory processing change](docs/changes/larger-than-memory-processing.md)
-
-Internal shared execution contracts are documented in
-[docs/shared_execution.md](docs/shared_execution.md). Contributor and coding
-guidance lives in [AGENTS.md](AGENTS.md).
+Contributor guidance is in [AGENTS.md](AGENTS.md). `.dev/` holds temporary
+development documents for work being applied; they are removed once their
+implementation is complete. Workspace datasets and experiments live in the
+sibling `scratch/` folder.

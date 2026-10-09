@@ -1,87 +1,42 @@
-# Repository guidance
+# Repository guide
 
-## Project purpose
+## Purpose and current capabilities
 
-MGB-Vec-Hydro is a standalone Python library and command-line interface for
-preparing vector hydrography inputs for MGB workflows. Production code lives in
-`src/mgb_vec_hydro`; the target product is the reusable package and CLI.
+MGB-Vec-Hydro is a standalone library and command-line toolset for preparing
+hydrography and model inputs for MGB workflows. It works with generic vector
+networks using explicit segment and downstream IDs; a particular dataset's
+naming or numbering conventions do not define the product.
 
-The computational core must remain independent of QGIS and desktop GIS APIs.
-Do not import `qgis`, `processing`, `PyQt5`, `QApplication`, or QGIS
-project/layer/task APIs, and do not add QGIS integration to this repository.
-
-## Architecture and compatibility
-
-- Operate on generic vector networks with explicit segment ID and downstream ID
-  columns. BHO is the first regression target, not the product boundary.
-- Never replace topology traversal with BHO-specific ordering or prefix rules
-  such as `cobacia >= ...` or `cocursodag.startswith(...)`.
-- Treat null downstream IDs as sinks, detect missing columns before processing,
-  and reject cycles rather than allowing unbounded traversal.
-- Keep CRS handling explicit. Spatial operations must use an appropriate
-  projected CRS, and inputs with absent or incompatible CRS metadata must be
-  rejected unless the relevant interface explicitly supports an override.
-- Prefer FlatGeobuf for indexed vector workflows and GeoPackage when a
-  container is useful. Do not introduce Shapefile as a new workflow format.
-- Use `pathlib.Path`; do not change the process working directory, assume a
-  platform-specific path separator, or write temporary products into the
-  caller's current directory.
-- Publish multi-file outputs only after successful completion. Preserve the
-  existing staging, validation, and atomic-publication behavior when changing
-  a stage.
-- Validate public inputs early and raise exceptions from
-  `mgb_vec_hydro.exceptions` instead of exposing low-level GDAL, GeoPandas, or
-  Pandas failures directly.
-- Preserve deterministic results and stable tie-breaking. Add focused tests
-  before changing scientific or topology behavior.
-
-Before architectural work, read
-`docs/changes/larger-than-memory-processing.md` and the documentation for the
-stage being changed. Shared execution contracts are documented in
-`docs/shared_execution.md`. Do not add stage-specific scheduling, worker
-management or output-publication implementations when the
-capability belongs in the shared execution layer.
+Five capabilities are implemented: upstream region-of-interest selection,
+mini-basin aggregation, aligned raster and mini-domain preparation, HAND and
+local terrain-to-drainage products, and mini-basin attribute sampling from
+terrain and existing HRU classes. HRU class construction and final MGB
+simulation-file generation remain unimplemented.
 
 ## Repository map
 
-- `src/mgb_vec_hydro/`: production package and CLI.
-- `tests/`: unit and CLI tests. `tests/execution/` covers shared bounded
-  execution contracts.
-- `tests/regression/` and `tests/carinhanha/`: BHO regression coverage and
-  reference fixtures. Compatibility here protects established scientific
-  behavior without making BHO schemas the generic API.
-- `tests/benchmark/`: opt-in memory, I/O, and scaling checks; these are skipped
-  during the normal test run.
-- `legacy/`: copied QGIS-era source for understanding algorithms and workflow
-  order only. Do not import it from production code or preserve its QGIS
-  orchestration patterns.
-- `docs/stage*.md`: implemented CLI and data contracts.
-- `docs/plan/`: design notes for unimplemented workflow stages.
+- `src/`: library and command-line implementation.
+- `tests/`: automated checks, scientific regression references, and benchmarks.
+- `docs/`: stable descriptions of implemented scientific behavior and data-file
+  contracts. `docs/plan/` describes remaining capabilities, not implemented
+  contracts.
+- `.dev/`: development documents for work being applied. Every document here
+  is intended to be removed once its implementation is complete.
+  - `plan` is for future plans.
+  - `pr` is for current implementation planning.
+- `README.md`: project overview and entry point to the tool documentation.
+- `../scratch/`: workspace datasets, scripts, experiments, and outputs used to
+  test this project's implementations.
 
-Keep user-facing command examples in `README.md` concise and keep detailed
-contracts in the stage guides. Update documentation when a command, schema, or
-output contract changes; do not present implemented behavior as future work.
+## Working on the project
 
-## Development and verification
+Read the relevant tool contract and the
+[shared data contracts](docs/shared_data_contracts.md) before changing behavior.
+Use the current scientific source and regression tests as references for
+results, including units, topology, ownership, numerical conventions, and ties.
+Implementation structure and management machinery are free to change.
 
-Use an isolated Python environment and install the package with test
-dependencies:
-
-```bash
-python -m pip install -e ".[test]"
-pytest
-```
-
-Run the smallest relevant test module while iterating, followed by the full
-suite before handoff. The scaling suites are opt-in:
-
-```bash
-RUN_PREPARATION_BENCHMARKS=1 pytest tests/benchmark/test_preparation_scaling.py
-RUN_EXECUTION_BENCHMARKS=1 pytest tests/benchmark/execution
-RUN_TERRAIN_BENCHMARKS=1 pytest tests/benchmark/test_terrain_scaling.py
-RUN_SAMPLING_BENCHMARKS=1 pytest tests/benchmark/test_sampling_scaling.py
-```
-
-The full terrain benchmark requires explicit `BHAE_DEM`,
-`BHAE_MINI_OWNERSHIP` and `BHAE_DRAINAGE` paths; set
-`BHAE_D8` as well when exercising an explicit D8 input.
+Keep the computational product independent of desktop GIS applications.
+Verify changes with checks appropriate to the affected behavior. Keep durable
+documentation focused on what the tools do; keep active implementation plans
+in `.dev/`. Distinguish implemented capabilities from remaining work.

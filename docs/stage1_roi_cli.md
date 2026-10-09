@@ -1,86 +1,70 @@
 # Stage 1: define ROI
 
-`mgb-vec-hydro define-roi` reads raw GeoPackage, FlatGeobuf, or ESRI
-FileGDB providers and selects topology upstream of one or more outlets. It
-defines the authoritative output CRS for the downstream vector stages.
+Current stage name: `define-roi`.
 
-```bash
-mgb-vec-hydro define-roi \
-  --crs ESRI:102033 \
-  --catchments data/catchments.gpkg \
-  --segments data/segments.gpkg \
-  --outlet-id 90497 \
-  --id-col cotrecho \
-  --id-down-col nutrjus \
-  --strahler-order-col nustrahler \
-  --output-dir roi
-```
+Select the union of the network upstream of one or more outlets, normalize
+catchments and segments, and establish the output CRS for vector stages.
+See the [shared data contracts](shared_data_contracts.md).
 
-## Options
+## Inputs and parameters
 
-| Option | Status | Type/default | Meaning |
-| --- | --- | --- | --- |
-| `--crs` | Required | CRS text | Target CRS for the published ROI; geographic and projected CRSs are supported. |
-| `--catchments` | Required | Existing vector path | Catchment provider containing the source catchment polygons. |
-| `--catchments-layer` | Optional | Layer name | Selects a layer when the catchment provider contains multiple layers. |
-| `--catchments-source-crs` | Optional | CRS text | Overrides missing or incorrect CRS metadata for the catchment provider. |
-| `--segments` | Required | Existing vector path | Segment provider containing the source network and topology attributes. |
-| `--segments-layer` | Optional | Layer name | Selects a layer when the segment provider contains multiple layers. |
-| `--segments-source-crs` | Optional | CRS text | Overrides missing or incorrect CRS metadata for the segment provider. |
-| `--outlet-id` | Required; repeatable | Text | Segment ID of an outlet; provide one or more outlets whose upstream union defines the ROI. |
-| `--id-col` | Required | Field name | Source field containing the segment/catchment identifier. |
-| `--id-down-col` | Required | Field name | Segment field containing the downstream segment identifier; null values represent sinks. |
-| `--strahler-order-col` | Required | Field name | Segment field containing the Strahler order used during topology filtering. |
-| `--output-dir` | Required | Directory path | New directory where `roi_catchments.fgb` and `roi_segments.fgb` are published. |
-| `--workers` | Optional | Positive integer; default `4` | Number of worker processes used for bounded geometry work. There is no upper limit imposed by the CLI or stage validator. |
-| `--memory-limit-mb` | Optional | Positive integer MB; default `4096` | Soft memory sizing hint; see [shared execution](shared_execution.md#local-execution). |
-| `--io-slots` | Optional | Positive integer; default `2` | Maximum number of concurrent source-I/O operations. |
-| `--batch-size` | Optional | Positive integer rows; default `10000` | Number of provider rows inspected per bounded attribute scan. |
+| Input or parameter | Meaning |
+| --- | --- |
+| Catchment polygons and network segments | GeoPackage, FlatGeobuf, or ESRI FileGDB, with a layer selected where needed. |
+| ID field | Source identifier shared by catchments and segments. |
+| Downstream-ID field | Segment field expressing network connections; null downstream IDs represent sinks. |
+| Strahler-order field | Segment field used to filter the source network. |
+| Ordered outlet IDs | One or more source segment IDs whose upstream union defines the ROI. |
+| Target CRS | Explicit geographic or projected CRS for both output vectors. |
+| Source-CRS overrides | Optional metadata overrides for each source. |
 
-Click also provides `--help` to display the command’s generated option list.
+Required field names resolve by exact match first, then an unambiguous
+case-insensitive match. Identifiers are interpreted in the source ID type.
 
-Use `--catchments-layer` and `--segments-layer` for multi-layer containers.
-`--catchments-source-crs` and `--segments-source-crs` are the only source-CRS
-overrides; they replace missing or incorrect provider metadata. The target
-CRS remains the explicit `--crs` value.
+## Scientific behavior
 
-Topology attributes are streamed in bounded Arrow batches. Null, non-finite,
-and below-one Strahler rows are removed before traversal; selected values must
-then be integral. Null downstream IDs are sinks. Duplicate segment IDs and
-duplicate catchment IDs within the selected ROI, cycles, missing source pairs,
-incompatible CRS values, and invalid polygon/line geometries are rejected.
+- Remove rows with null, non-finite, or below-one Strahler order before outlet
+  selection. Selected Strahler orders must be integral.
+- Select outlets and all upstream contributors using explicit topology.
+  Outlet IDs must exist after filtering. Selected non-outlet segments must
+  connect toward a selected outlet, and the selected topology must be acyclic.
+- For `K` ordered outlets, assign `sub = K - outlet_index`, using zero-based
+  outlet indices. Where upstream domains overlap, the later outlet's `sub`
+  takes precedence. The selected union retains each source unit once.
+- Calculate geodesic segment lengths in km and catchment areas in km² on the
+  source CRS ellipsoid. Upstream metrics include the current unit and its
+  upstream contributors.
+- Within each `sub`, continue a water course through the upstream branch with
+  greatest upstream area, then greatest unit length, then greatest string ID.
+  Other branches start their own water courses. `water_course` is the source
+  ID identifying the resulting course.
+- Transform selected geometries to the explicit target CRS. Catchment and
+  segment attributes share the source unit's topology and metrics.
 
-The normalized output schema is:
+## Outputs
+
+| Filename | Content |
+| --- | --- |
+| `roi_catchments.fgb` | Spatially indexed normalized catchment polygons. |
+| `roi_segments.fgb` | Spatially indexed normalized network lines. |
+| `manifest-define-roi.json` | Input paths and processing parameters. |
+
+Both vector files use this ordered schema:
 
 `id`, `id_down`, `sub`, `strahler_order`, `unit_length`, `upstream_length`,
 `unit_area`, `upstream_area`, `water_course`, `geometry`.
 
-`unit_length` is geodesic length in km and `unit_area` is geodesic area in
-km². Upstream metrics are deterministic topology reductions. Selected
-geometry is processed in bounded worker packets and written to spatially
-indexed FlatGeobuf files.
+Source IDs and downstream references are preserved; `id`, `id_down`, and
+`water_course` use the source ID type. `sub` and `strahler_order` are `int64`;
+length and area attributes are `float64`. Lengths are km and areas are km²,
+independent of output CRS coordinate units. Spatial-index ordering does not
+define scientific processing order.
 
-The published directory contains these root-level files, including an audit
-manifest with the input paths and processing parameters:
+## Invalid inputs
 
-```text
-roi/
-├── manifest-define-roi.json
-├── roi_catchments.fgb
-└── roi_segments.fgb
-```
-
-There is no nested output directory. The report and CLI status identify both
-concrete paths. Defaults are 4096 MB (4 GB), four workers,
-two concurrent I/O operations, and 10,000-row scans. Worker counts may be any
-positive integer.
-
-`--memory-limit-mb` is a soft sizing hint for task packets and retained
-intermediates, without separate quotas. Workers and a small queue bound
-concurrency; library caches have explicit sizes. Actual RSS can exceed the
-hint. See [shared memory sizing](shared_execution.md#local-execution).
-
-`--batch-size` bounds provider read batches, not geometry processing packets.
-Geometry packets use source-size estimates and the memory hint, distributed
-across workers. The shared reader splits OGRSQL FID requests at 4,997 IDs;
-GeoPackage uses its native SQL without that request cap.
+Reject missing or ambiguous required fields, unusable CRS metadata, missing
+outlets, an empty filtered network, duplicate retained segment IDs, duplicate
+selected catchment IDs, missing selected source pairs, selected cycles,
+non-integral selected Strahler orders, and invalid, empty, null, or wrongly
+typed selected polygon/line geometries. Catchment duplicates outside the
+selected IDs do not affect the ROI.

@@ -1,84 +1,77 @@
 # Stage 2: aggregate mini-basins
 
-`mgb-vec-hydro aggregate` consumes the two explicit normalized ROI files. The
-catchment file is authoritative for CRS; the segment file must declare the
-same CRS and normalized schema.
+Current stage name: `aggregate`.
 
-```bash
-mgb-vec-hydro aggregate \
-  --roi-catchments roi/roi_catchments.fgb \
-  --roi-segments roi/roi_segments.fgb \
-  --uparea-min 30 \
-  --lmin 6 \
-  --output-dir minis
-```
+Group normalized ROI units into mini catchments and reaches, with a complete
+source-to-mini mapping and deterministic mini topology. See the
+[shared data contracts](shared_data_contracts.md).
 
-## Options
+## Inputs and parameters
 
-| Option | Status | Type/default | Meaning |
-| --- | --- | --- | --- |
-| `--roi-catchments` | Required | Existing FlatGeobuf path | Normalized Stage 1 catchment file used as the authoritative CRS and source-unit input. |
-| `--roi-segments` | Required | Existing FlatGeobuf path | Normalized Stage 1 segment file containing topology and reach attributes. |
-| `--uparea-min` | Required | Non-negative number | Minimum `upstream_area` threshold for a segment to be eligible as a mini-basin reach; uses normalized area units (km²). |
-| `--lmin` | Required | Non-negative number | Minimum evolving mini length used when short chains are iteratively merged; uses normalized length units (km). |
-| `--output-dir` | Required | Directory path | New directory where the mini vectors and `source_to_mini.csv` are published. |
-| `--workers` | Optional | Positive integer; default `4` | Number of worker processes used for bounded vector work. There is no upper limit imposed by the CLI or stage validator. |
-| `--memory-limit-mb` | Optional | Positive integer MB; default `4096` | Soft memory sizing hint; see [shared execution](shared_execution.md#local-execution). |
-| `--io-slots` | Optional | Positive integer; default `2` | Maximum number of concurrent vector-I/O operations. |
-| `--batch-size` | Optional | Positive integer rows; default `10000` | Number of rows processed per bounded vector batch. |
+| Input or parameter | Meaning |
+| --- | --- |
+| `roi_catchments.fgb` | Normalized catchments; authoritative CRS and source areas. |
+| `roi_segments.fgb` | Normalized network; matching CRS and source IDs, reach lengths, and topology. |
+| `uparea_min` | Required non-negative minimum eligible upstream area, in km². |
+| `lmin` | Required non-negative minimum evolving mini reach length, in km. |
 
-Click also provides `--help` to display the command’s generated option list.
+Both inputs use the [ROI schema](stage1_roi_cli.md#outputs). IDs must be unique
+and match between catchments and segments.
 
-Segments with `upstream_area >= uparea_min` are eligible reaches. Every source
-catchment remains in processing: below-threshold sources are mapped to an
-eligible mini using the same-water-course rule, then the same-`sub` fallback.
-After the area filter, eligible links are reconnected across filtered
-segments. Maximal linear chains are collapsed wherever the downstream segment
-has exactly one surviving upstream contributor and both segments share `sub`
-and `water_course`. True surviving confluences remain boundaries. `lmin` then
-operates iteratively on the evolving chain lengths with stable ID tie-breaking.
+## Scientific behavior
 
-The representative segment with the greatest upstream area, then unit length,
-then string ID supplies a provisional mini identity. Once aggregation is
-complete, processing order (`p_order`) is calculated on the final topology:
-every head mini receives 1 and every downstream mini receives one plus the
-greatest order among its direct upstream minis.
+- Reaches with `upstream_area >= uparea_min` are eligible. Eligible topology
+  reconnects across excluded segments. Maximal linear chains collapse when
+  the downstream eligible segment has one surviving upstream contributor and
+  both share `sub` and `water_course`. Surviving confluences are boundaries.
+- A group's representative is the member with greatest upstream area, then
+  greatest unit length, then greatest string ID.
+- Merge short groups within their shared `sub`/`water_course` domain using
+  evolving group lengths. The first short group by ascending string ID joins
+  its adjacent group with smallest length, then smallest string ID. Reconsider
+  lengths and neighbors after each merge. Groups still below `lmin` without a
+  merge target cease to supply reaches.
+- Assign excluded sources and removed short-group catchments to surviving
+  minis connected through unassigned sources in the same `sub`/`water_course`;
+  then use the same-`sub` fallback. Choose the candidate with smallest evolving
+  length, then smallest string ID. Every ROI catchment must have one target.
+- Mini catchment geometry is the union of assigned catchments; mini reach
+  geometry is the union of surviving reach members. Reach length is the sum
+  of member lengths; catchment area is the sum of assigned source areas.
+  Upstream length and area retain their representative source metrics.
+- On final mini topology, head minis have `p_order = 1`; a downstream mini has
+  one plus the greatest order of its direct upstream minis.
+- Sort minis by ascending `sub`, `p_order`, and `upstream_area`, then ascending
+  representative string ID. Assign dense IDs `1..N` in that order, remap
+  downstream references, and encode mouths as `-1`.
 
-Final minis are sorted by `sub`, `p_order`, and `upstream_area`, all ascending,
-with the provisional identity as a deterministic tie-breaker. `id` is replaced
-with the one-based dense sequence `1..N`; valid `id_down` references are
-remapped and mouths are written as `-1`. `source_to_mini.csv` contains exactly
-`id`, `mini_id`, `sub`, `longitude`, and `latitude`; every ROI source ID occurs
-once and `mini_id` uses the dense identity.
+## Outputs
 
-The published directory contains these root-level files, including an audit
-manifest with the input paths and processing parameters:
+| Filename | Content |
+| --- | --- |
+| `mini_catchments.fgb` | Unindexed mini polygons in final processing order. |
+| `mini_segments.fgb` | Unindexed mini reaches in the same order. |
+| `source_to_mini.csv` | Every ROI source ID mapped exactly once. |
+| `manifest-aggregate.json` | Input paths and processing parameters. |
 
-```text
-minis/
-├── manifest-aggregate.json
-├── mini_catchments.fgb
-├── mini_segments.fgb
-└── source_to_mini.csv
-```
+Both vector files have the ordered schema:
 
-There is no nested output directory. Both FlatGeobuf
-files use the ordered schema `id`, `id_down`, `sub`, `p_order`, `unit_length`,
-`upstream_length`, `unit_area`, `upstream_area`, `geometry` and the
-authoritative CRS. `strahler_order` and `water_course` remain Stage 1 inputs
-but are not published because downstream stages do not use them. The mini
-files intentionally omit a spatial index so physical feature order is
-preserved.
-The files are staged privately, validated, and atomically published. Defaults
-are 4096 MB (4 GB), four workers, two I/O operations, and 10,000-row batches. Worker
-counts may be any positive integer.
+`id`, `id_down`, `sub`, `p_order`, `unit_length`, `upstream_length`,
+`unit_area`, `upstream_area`, `geometry`.
 
-`--memory-limit-mb` is a soft sizing hint for task packets and retained
-intermediates, without separate quotas. Workers and a small queue bound
-concurrency; library caches have explicit sizes. Actual RSS can exceed the
-hint. See [shared memory sizing](shared_execution.md#local-execution).
+They retain the authoritative CRS and km/km² metric units. `strahler_order`
+and `water_course` guide aggregation but are not output columns.
+`id`, `id_down`, `sub`, and `p_order` are `int64`; length and area attributes
+are `float64`.
 
-`--batch-size` bounds provider read batches, not geometry processing packets.
-Geometry packets use source-size estimates and the memory hint, distributed
-across workers. The shared reader splits OGRSQL FID requests at 4,997 IDs;
-GeoPackage uses its native SQL without that request cap.
+The mapping CSV has exactly `id`, `mini_id`, `sub`, `longitude`, `latitude`,
+in that order. Rows are sorted by source ID interpreted as a string.
+Coordinates are source-catchment centroids transformed to EPSG:4326;
+`mini_id` is the final dense ID.
+
+## Invalid inputs
+
+Reject missing required attributes, mismatched CRS or source IDs, duplicate
+IDs, invalid numeric attributes or geometries, cycles, and negative thresholds.
+Fail when no reach satisfies the area threshold or any catchment has no
+surviving aggregation target in its `sub`.
