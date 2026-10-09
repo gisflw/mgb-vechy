@@ -1,0 +1,19 @@
+{
+  "step": "terrain-products",
+  "parameters": {
+    "dem": "/workspace/mgb_builder/tests/regression/jacui/runs/capture-tdxhydro/dem.tif",
+    "grid_catchments": "/workspace/mgb_builder/tests/regression/jacui/runs/capture-tdxhydro/grid_catchments.tif",
+    "grid_segments": "/workspace/mgb_builder/tests/regression/jacui/runs/capture-tdxhydro/grid_segments.tif",
+    "output_dir": "/workspace/mgb_builder/tests/regression/jacui/expected/tdxhydro",
+    "d8": null,
+    "direction_source": "dem",
+    "write_flow_direction": false,
+    "agree_sharp": 80.0,
+    "agree_smooth": 8.0,
+    "agree_buffer": 4,
+    "workers": 4,
+    "memory_limit_mb": 4096,
+    "io_slots": 2,
+    "overwrite": false
+  }
+}

@@ -17,8 +17,8 @@ simulation-file generation remain unimplemented.
 
 - `src/`: library and command-line implementation.
 - `tests/`: automated checks, scientific regression references, and benchmarks.
+  `tests/regression/jacui/` holds the BHAE and TDXHydro dataset references.
 - `docs/`: stable descriptions of implemented scientific behavior and data-file
-  contracts. `docs/plan/` describes remaining capabilities, not implemented
   contracts.
 - `.dev/`: development documents for work being applied. Every document here
   is intended to be removed once its implementation is complete.
@@ -26,7 +26,8 @@ simulation-file generation remain unimplemented.
   - `pr` is for current implementation planning.
 - `README.md`: project overview and entry point to the tool documentation.
 - `../scratch/`: workspace datasets, scripts, experiments, and outputs used to
-  test this project's implementations.
+  manually test this project's implementations. `scratch/analysis` is reserved
+  for broader manual testing when the tool is more mature.
 
 ## Working on the project
 

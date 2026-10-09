@@ -4,7 +4,12 @@ legacy/*
 # scratch files
 scratch/*
 
-tests/carinhanha/*
+# Local Jacui geospatial fixtures and generated regression runs.
+tests/regression/jacui/**/*.fgb
+tests/regression/jacui/**/*.tif
+tests/regression/jacui/**/*.tif.*
+tests/regression/jacui/**/*.csv
+tests/regression/jacui/runs/
 
 __pycache__/
 .venv/

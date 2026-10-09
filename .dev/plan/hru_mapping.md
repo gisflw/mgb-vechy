@@ -20,6 +20,6 @@ configuration are not yet settled.
 - Diagnostics for missing data, unmatched combinations, and unexpected values.
 
 Class generation is a separate capability from
-[mini-basin sampling](../stage5_mini_sampling_cli.md), which already summarizes
+[mini-basin sampling](../../docs/stage5_mini_sampling_cli.md), which already summarizes
 an existing categorical HRU raster. This capability produces classifications;
 mini statistics and final simulation files belong to subsequent steps.

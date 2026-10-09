@@ -1,236 +1,183 @@
-**Rust-native redesign — proposed architecture, 9 October 2026**
+# Rust-native architecture
 
-The selected direction is a standalone Rust library and CLI, with scientific
-behavior preserved and the current command names, options, published filenames,
-and file schemas kept compatible. The Python API and execution internals are
-replaceable. The objective is simpler execution and predictable resource use,
-as well as performance. This changes the recommendation from the initial
-[Python performance assessment](rust-assessment.md): further Python performance
-engineering is not a prerequisite for the redesign.
+Implementation plan for a standalone Rust library and CLI. The goal is a fresh
+architecture with simpler data flow, lower runtime overhead, and predictable
+resource use. Python production code and management APIs may be replaced
+outright; this isolated branch does not need a transition framework.
 
-This document is a design, not an implemented Rust migration. Crate
-capabilities were checked against current primary documentation and selected
-source; no Rust backend has yet passed this project's interoperability tests.
+## What stays fixed
 
-**Keep the scientific contracts; replace their machinery.**
+The [stage guides](../../README.md#implemented-workflow) and
+[shared data contracts](../../docs/shared_data_contracts.md) define scientific
+behavior and data products. Preserve topology, aggregation assignments,
+canonical ownership, routing, numeric conventions, units, masks, filenames,
+schemas, and meaningful ordering. Current scientific source and focused tests
+are references; copied QGIS-era products are not the oracle.
 
-| Preserve | Replace |
+CLI spelling, Python APIs, worker/process management, batching, caches, IPC,
+publication/rollback machinery, and runtime exception types are replaceable.
+Audit manifests retain their stage filenames and `step`/`parameters` envelope;
+runtime-specific fields may change. Do not make Python cleanup, compatibility
+wrappers, or dual-runtime operation prerequisites for Rust work.
+
+Percentiles remain exact linear percentiles; maximum-LTND ties retain their
+scientific tolerance. Geodesic measurements use the source CRS ellipsoid.
+A polygon or line union, raster boundary decision, or flat/breach routing rule
+is a scientific operation, even when a different library implements it.
+
+## Small initial architecture
+
+Start with one Cargo package exposing a library and a thin CLI. Use modules,
+not a crate per stage or a general workflow framework:
+
+| Module | Responsibility |
 | --- | --- |
-| Explicit generic segment/downstream IDs, sink handling, filtering, cycle rejection, upstream metrics, and outlet precedence | Python dictionaries/Pandas access and provider-specific request batching |
-| Aggregation eligibility, chain/confluence rules, evolving short-group merges, representative IDs, dense remapping, and stable processing order | Pandas group reductions and temporary GeoPackage/SQL dissolution orchestration |
-| Canonical grid, cell ownership, catchment overlap handling, downstream-priority segment collisions, masks, and units | Python raster orchestration and working-raster heuristics |
-| Catchment-confined AGREE, natural D8, deterministic flats, lexicographic shallow breaching, raw-DEM HAND, and geodesic LTND | Numba dispatch, compilation caches, and process-local warmup |
-| Exact reach percentiles, HRU denominators, flooded areas at stages 1–100, partial-nodata rules, and tributary tie semantics | NumPy/Pandas accumulation and CSV assembly machinery |
-| CLI commands/options, output schemas, CRS validation, domain failures, and staged publication with rollback | Click, spawned worker pools, IPC, serialization, and runtime-specific exceptions |
+| `model` | Typed source/mini IDs, topology, grids, masks, and scientific parameters. |
+| `science` | ROI, aggregation, ownership, terrain routing, and mini statistics. |
+| `io` | Vector records, raster windows, metadata, geometry, and CRS operations. |
+| `execution` | The small set of shared resource and temporary-storage helpers needed by implemented stages. |
+| `cli` | Parse requests, call the library, and present results. |
 
-Scientific behavior includes numeric and geometric conventions. For example,
-the default NumPy linear percentiles and `isclose` tolerance used for maximum
-LTND ties must be carried into Rust. Replacing geodesic areas with projected
-pixel area, treating a line union as concatenation, or changing raster boundary
-coverage would change results. Existing tests and current source are the
-reference; the copied QGIS-era implementation is not the oracle.
+Use dense internal indices for graph operations while retaining original IDs
+and prescribed string-ID ties. Move owned typed buffers between threads;
+avoid process serialization and dataframe conversion chains. Scientific
+operations consume typed inputs; file handles and CLI parsing belong at the
+boundary. Keep geometry and CRS operations explicit where external libraries
+supply them.
 
-Container byte identity is not required for a different writer. Compare
-schemas, feature ordering where specified, geometry meaning, masks, grid/CRS,
-and scientific values. Require identical discrete ownership/direction/ID
-decisions and repeatable outputs for a fixed Rust backend. Compare continuous
-values against explicit, fixture-backed tolerances that cannot conceal changed
-branch decisions. Exact current CSV formatting/order should be the initial
-target. Changing a numerical acceptance criterion must be an explicit decision.
+One CPU pool and a coherent application-memory budget are enough initially.
+Bound live raster windows and queued results, reuse buffers, and spill exact
+samples or intermediate products when needed. Scientific reduction order must
+be independent of completion order. Add shared abstractions when stages need
+them; do not reproduce the Python executor's contracts as a Rust framework.
 
-**Start with one package, a library, and a thin CLI.**
+A dataset larger than RAM and a single oversized mini are different problems.
+Use windowed raster access and complete-mini routing first. Report an
+unsupported oversized unit clearly rather than splitting routing in a way
+that changes connectivity. Paged graphs, external sorting, spill queues, and
+external geometry algorithms belong in later work supported by measured need.
+The initial Jacui cases establish behavior and performance, not universal
+larger-than-memory coverage or a hard RSS ceiling.
+
+## GIS backends
+
+Implement hydrology, topology, and statistics natively. Use narrow GIS
+adapters wherever mature libraries make the product simpler. Retaining PROJ
+or selected GDAL/GEOS operations is compatible with native Rust execution;
+removing every foreign library is not the first milestone.
+
+Candidates from the initial survey include [FlatGeobuf](https://docs.rs/flatgeobuf/),
+[GeographicLib Rust](https://docs.rs/geographiclib-rs/),
+[Rust PROJ bindings](https://github.com/georust/proj),
+[Rayon](https://docs.rs/rayon/), and native GeoTIFF/geometry libraries.
+Confirm API suitability when implementing the relevant adapter. Prefer a
+working, small adapter over a broad geospatial reimplementation.
+
+Backend selection must respect the actual data contract: CRS/WKT and source
+ellipsoids; internally masked COGs, grid transforms and required metadata;
+ordered/unindexed mini vectors; and geometry/rasterization semantics. Native
+replacements can follow after the scientific stages work. Compare decoded
+results rather than requiring identical container bytes.
+
+## Jacui regression and performance reference
+
+`scratch/analysis` contains the existing basin comparison runs, source-data
+locations, and expected products. It is the source of the
+initial reference capture, and is reserved for the user's broader manual tests
+when the tool is more mature. Do not make automated regression depend on its
+scripts, run the multi-basin analysis during this work, or write candidate
+outputs back into scratch.
+
+Use only **Jacui / BHAE** and **Jacui / TDXHydro** for dataset regression and
+performance work during this implementation. No HydroSHEDS or other basin
+runs are required. Keep small synthetic scientific tests for ties, boundaries,
+cycles, flats, and nodata cases the two real datasets do not isolate.
+
+The working reference lives in
+[tests/regression/jacui](../../tests/regression/jacui/README.md):
 
 ```text
-cli          existing five commands, options, progress, overwrite checks
-model        typed IDs, topology, grid, masks, scientific parameters
-science      ROI, aggregation, preparation rules, terrain, sampling
-execution    one bounded runtime, memory accounting, spill files, publication
-io           vector records, raster windows/tiles, CRS and geometry adapters
+tests/regression/jacui/
+  config.json                 scientific settings and outlet/schema mapping
+  inventory.json              captured file sizes and checksums
+  input/                      shared source DEM/HRU crops and basin-only vectors
+    bhae/                     raw catchments and segments
+    tdxhydro/                  raw catchments and segments
+  expected/bhae/              captured five-stage scientific products
+  expected/tdxhydro/           captured five-stage scientific products
+  benchmarks/                 bhae.json and tdxhydro.json timing records
+  runs/                       disposable candidate products and measurements
 ```
 
-Modules are sufficient initially; this does not require separate crates for
-every stage or a general workflow framework. Scientific functions accept
-typed records, grids, and bounded storage access. They do not know about
-GDAL handles, file formats, threads, or CLI parsing. Geometry and coordinate
-operations are explicit services where a mature foreign library remains useful.
-Arrow can be an I/O or spill format if needed; an Arrow → Pandas → NumPy chain
-is not part of the new internal model. Avoid adding a dataframe/query engine
-unless it removes a demonstrated requirement that typed iteration cannot cover.
+Use the repository's existing `tests/` directory, not a new `test/` tree.
+Carinhanha fixtures and their old regression tests are removed. Large binary
+assets and the large sampled CSVs stay local and are gitignored; configuration,
+provenance, checksums, diagnostics, and benchmark records are versioned.
+The capture tool extracts raw basin-only vectors and aligned source raster
+crops, runs the reference implementation with the three configured outlets,
+and records regenerated expected products and performance. Candidate regression
+then consumes only the local capture. Baseline refresh is an explicit
+reference-capture operation, not part of candidate regression.
 
-```mermaid
-flowchart LR
-    CLI[Compatible CLI] --> Science[Scientific stages]
-    Science --> Runtime[Bounded Rust runtime]
-    Runtime --> Storage[Resident buffers and spill files]
-    Runtime --> Publish[Validate and publish]
-    Science --> IO[Vector, raster, geometry and CRS adapters]
-    IO --> Native[Native Rust backends]
-    IO --> GIS[GDAL, PROJ or GEOS compatibility backends]
-```
+BHAE uses outlets `171984`, `420329`, `178658`, fields
+`cotrecho`/`nutrjus`/`nustrahler`, and has 4,071 source units and 527 minis.
+TDXHydro uses outlets `640538827`, `640543432`, `640538824`, region `610`,
+fields `linkno`/`dslinkno`/`strmOrder`, and has 4,351 source units and 546
+minis. In each case the listed order maps to `sub` 3, 2, 1, with later
+outlets taking precedence in overlaps. Both cases use EPSG:4326, minimum upstream area 60 km², minimum
+mini length 6 km, DEM scale 0.01, and AGREE 80/8/4.
 
-**Use a small bounded runtime rather than recreating the Python executor.**
+The stage runner can exercise one stage using captured upstream products, or
+all five stages using candidate upstream products. Its current command adapter
+invokes the Python reference; adapt the command layer to the Rust CLI rather
+than treating those flags as a Rust compatibility requirement.
 
-One explicitly sized CPU pool serves a stage/library invocation. Rayon is a
-candidate for CPU scheduling and Crossbeam for bounded channels; ordinary
-scoped worker threads are also reasonable if they make the admission path
-clearer. Local files do not require an async runtime. Rayon exposes thread-pool
-configuration; Crossbeam exposes bounded channels. Neither establishes a byte
-limit for application data by itself.
-[Rayon documentation](https://docs.rs/rayon/latest/rayon/struct.ThreadPoolBuilder.html),
-[Crossbeam channel documentation](https://docs.rs/crossbeam-channel/latest/crossbeam_channel/)
+Data comparisons cover exact schemas, IDs, discrete ownership, masks, required
+metadata, and ordering where specified; compare vector geometry semantically.
+Sampling rows may be matched by mini ID. CSV numeric comparisons use
+`rtol=1e-10, atol=1e-10`; continuous raster comparisons use
+`rtol=1e-6, atol=1e-6`, matching float32 products. Integer raster values and masks are
+exact. Affine coordinates and embedded mini bounds allow `atol=1e-12`
+coordinate units (`rtol=0`) for source-crop rounding; this is below one
+Jacui pixel by more than eight orders of magnitude. These are initial fixture comparison tolerances, not permission to
+change scientific branch decisions. Port synthetic flow-direction fixtures too:
+the captured dataset products do not include a flow-direction raster.
 
-The runtime needs three mechanisms: a byte budget, bounded work/results, and
-temporary storage. Admit a task only after reserving its input, scratch, and
-output allowance; workers must not wait for extra budget halfway through a
-task while retaining other permits. Move buffer ownership between threads
-instead of serializing arrays. A reservation stays with live data until it is
-consumed or spilled. Account for buffer capacity, retained backing storage,
-caches, writer/compression buffers, and global graph/index state.
+The two benchmark records report timing observations for the current
+three-outlet basin-only cases. Treat them as descriptive measurements, not
+performance thresholds. The runner's `max_process_rss_kib` is the maximum
+individual-process RSS reported by Linux wait4, including completed
+descendants; it is not the sum of concurrent worker RSS.
 
-Results carry stable ordinals. A coordinator reduces them in scientific order;
-large or delayed results spill and yield small descriptors, so an early slow
-task cannot cause an unbounded reorder buffer. Keep dispatch bounded too:
-submitting every item to a thread pool is not a bounded plan. The I/O concurrency
-limit remains separate from CPU worker count. Cancellation stops admission,
-joins active workers, and cleans staging. Use the same machinery across stages.
+Use release builds for Rust performance comparisons. Compare the same local
+inputs, settings, machine, and cache conditions, with repeated runs and medians
+for performance conclusions. Separate startup/JIT and warmed-reference effects.
+Keep timing measurements out of scientific pass/fail assertions; there are no
+machine-independent speed thresholds. Broader scaling and manual basin
+comparisons come after the two Jacui implementations are useful.
 
-`--memory-limit-mb` remains the user-facing sizing control. The redesign should
-give it coherent application-memory accounting, instead of independent task
-and scratch hints that can coexist above the nominal amount. It is not a
-portable hard RSS ceiling: allocator overhead, foreign-library allocations,
-mapped resident pages, and OS caches are separate concerns. Report accounted
-peaks and observed process memory separately. A blocked task must not trigger
-a quiet fallback to an unbounded allocation.
+## Implementation order
 
-**Larger-than-memory support must cover every growing structure.**
+1. Capture and verify both Jacui references and establish fixture-local
+   performance measurements before changing production science.
+2. Establish the Rust package, typed model, thin CLI, and the minimum I/O and
+   resource helpers needed for a working stage.
+3. Implement mini sampling first against captured upstream files. This covers
+   windowed reads, exact percentiles, HRU percentages, geodesic flooded areas,
+   tie behavior, and partial nodata without a new raster writer or dissolution.
+4. Implement terrain against the prepared Jacui inputs and synthetic routing
+   fixtures. Preserve directions, confinement, raw-DEM HAND, and geodesic LTND.
+5. Implement ROI and aggregation with typed topology and geometry adapters.
+   Preserve outlet precedence, evolving merges, representative IDs, and dense
+   processing order. Use basin-only inputs for the routine performance loop.
+6. Implement preparation with verified ownership/rasterization semantics.
+   Exercise the full candidate pipeline on both networks once all stages exist.
+7. Replace GIS adapters natively where doing so demonstrably simplifies or
+   improves the implementation. Remove replaced Python production components
+   without introducing a migration framework.
 
-| Structure | Proposed storage rule |
-| --- | --- |
-| Raster pixels and decoded masks | Window/tile access with a byte-limited cache; disk-backed working products |
-| External IDs and topology | Dense internal indices with original IDs preserved; compact resident arrays when admitted, externally sorted tables and paged arrays when not |
-| Adjacency, traversal queues and terrain basin graph | Include in the budget; spill queues/indexed adjacency when required |
-| Geometry grouped by mini | External grouping by final mini ID; admit only bounded geometry work and bounded intermediates |
-| Exact percentile samples | Spill samples and use exact external ordering/selection; do not substitute approximate quantiles |
-| Completed tasks and final tables | Bounded reduction/spill; stream CSV rows after final column discovery |
-| Vector/raster file indexes | Audit and budget metadata too; spill index construction when its resident form does not fit |
-
-Whole-dataset support and support for a single oversized unit are distinct.
-A dataset can exceed RAM while each mini/group fits the working budget. That
-is a useful first milestone, matching the current complete-mini contract.
-One mini whose routing scratch exceeds RAM requires paged arrays and external
-graph/queue algorithms; merely dividing it into independent tiles changes flat
-handling, basin connectivity, and drainage. A polygon union can likewise need
-substantial intermediate storage. Until the corresponding external algorithm
-exists, reject an oversized unit with a clear resource error and document that
-limit. Do not claim universal larger-than-memory support from tiling alone.
-Memory mapping a whole file also does not establish bounded resident memory.
-
-**Replace GDAL by capability, with small verified adapters.**
-
-| Capability | Native Rust path | Initial decision |
-| --- | --- | --- |
-| Hydrology and network algorithms | Typed Rust loops and graph algorithms | Implement natively |
-| FlatGeobuf reading | `flatgeobuf`, optionally Geozero for geometry decoding | Strong early candidate |
-| FlatGeobuf writing | `flatgeobuf` serialization plus bounded index/output construction | Audit growth; avoid assuming its writer is fully bounded |
-| Ellipsoidal distances and areas | `geographiclib-rs`, configured with the source ellipsoid | Strong early candidate, subject to numerical parity |
-| GeoTIFF/COG windows and tiles | `geotiff-reader` and `geotiff-writer` candidates | Interoperability trial before production selection |
-| Polygon union and predicates | `geo`/its overlay algorithms | Trial against real geometries; keep GEOS where equivalence is unresolved |
-| Line dissolution and representative points | Explicit native operations with parity fixtures | Separate from polygon union; retain a geometry adapter initially |
-| Broad EPSG/ESRI/WKT CRS handling and transformation | Rust `proj` bindings | Retain PROJ initially; GDAL is not required merely to use PROJ |
-| GeoPackage input | SQLite plus geometry/metadata decoding | Feasible narrower adapter; validate supported types/layers/CRS |
-| Existing FileGDB input | GDAL compatibility adapter | Preserve support until a verified replacement exists |
-| Current rasterization conventions | Native scan conversion eventually | Keep a narrow GDAL-backed operation until cell-exact parity is demonstrated |
-
-FlatGeobuf provides sequential and spatially selected reads. Its inspected
-writer spills feature bytes to a temporary file but retains feature offsets
-and bounding-box nodes in `Vec`s. Those grow with feature count, including the
-unindexed writer path. This makes it a useful building block, not proof of
-bounded writing. Indexed ROI outputs need externally sorted spatial-index
-metadata when that metadata exceeds budget; mini outputs must retain their
-intentional unindexed physical order.
-[FlatGeobuf reader](https://docs.rs/flatgeobuf/latest/flatgeobuf/struct.FgbReader.html),
-[writer source](https://docs.rs/flatgeobuf/latest/src/flatgeobuf/file_writer.rs.html)
-
-`geographiclib-rs` supports geodesic polygon accumulation and a `Geodesic::new(a,
-f)` constructor. Supply the source CRS ellipsoid; do not assume WGS84. The
-inspected `geo::GeodesicArea` implementation constructs WGS84 internally,
-which is insufficient for this tool's arbitrary-ellipsoid contract.
-[GeographicLib Rust API](https://docs.rs/geographiclib-rs/latest/geographiclib_rs/struct.Geodesic.html),
-[polygon-area API](https://docs.rs/geographiclib-rs/latest/geographiclib_rs/),
-[Geo area source](https://docs.rs/geo/latest/src/geo/algorithm/geodesic_area.rs.html)
-
-Native GeoTIFF readers provide window access. The inspected native COG
-tile writer stages base tiles in a temporary file on filesystem targets and
-emits the layout when finalized. These are promising building blocks. The
-high-level reader/writer APIs inspected do not establish the required internal
-mask and custom-metadata behavior. Before selecting a backend, verify BigTIFF,
-float/integer types, compression, internal masks and mask overviews, affine
-pixel conventions, custom/non-EPSG CRS metadata, band units, `mini_index`,
-`distance_method`, and validity-aware overview behavior. Nodata sentinels or
-alpha bands must not silently replace the current internal-mask contract.
-Low-level TIFF access may provide what high-level APIs omit, but that remains
-implementation work. Keep GDAL I/O behind the same narrow interface until the
-native backend passes.
-[GeoTIFF reader](https://docs.rs/geotiff-reader/latest/geotiff_reader/),
-[reader API](https://docs.rs/geotiff-reader/latest/geotiff_reader/struct.GeoTiffFile.html),
-[COG tile writer](https://docs.rs/geotiff-writer/latest/geotiff_writer/cog/struct.CogTileWriter.html)
-
-`geo` provides polygon union and other boolean operations, with validity and
-fill-rule conventions. That does not establish equivalence to GEOS polygon
-or line union, nor bounded intermediates. Test holes, touching rings,
-overlaps, slivers, multipart geometries, and line crossings. Geometry
-representation differences can change preparation ownership at boundaries.
-[Geo boolean operations](https://docs.rs/geo/latest/geo/algorithm/bool_ops/trait.BooleanOps.html)
-
-For CRS transformation, `proj4rs` is an interesting constrained alternative,
-but its documentation states that it is not a PROJ replacement, lacks default
-WKT support, and has experimental grid-shift support. Keep full PROJ behind a
-Rust service for the present generic CRS contract. This preserves native Rust
-execution while avoiding a broad CRS reimplementation.
-[Proj4rs documentation](https://docs.rs/proj4rs/latest/proj4rs/),
-[Rust PROJ bindings](https://github.com/georust/proj)
-
-**Migration order and evidence.**
-
-1. Extract portable scientific fixtures and expected products from the current
-   tests: topology, aggregation assignments, preparation ownership, terrain
-   routes/masks, and sampling statistics. Capture degenerate/tie cases before
-   implementing replacement geometry/rasterization. Python remains a test
-   oracle during migration, with no role in the Rust production runtime.
-2. Establish the Rust library/compatible CLI, one runtime, spill cleanup,
-   publication behavior, and narrow I/O adapters. Test cancellation,
-   out-of-order completion, saturation, and rollback using meaningful failures.
-3. Implement `sample-minis` as the first complete Rust command. It exercises
-   bounded raster reading and exact statistics without requiring a new raster
-   writer or vector dissolution. Spill exact reach samples and paired HAND/LTND
-   values when needed; final maximum-LTND tie statistics may need a second pass.
-4. Port the terrain kernels and graph search, then `terrain-products`, using
-   complete-mini scheduling initially. Add an explicit oversized-mini limit
-   until paged routing is implemented. Verify geodesic distances and scientific
-   directions before comparing runtime.
-5. Port `define-roi` and `aggregate` with compact/paged topology and external
-   geometry grouping. Preserve the existing ID string tie-breaks after internal
-   remapping. Avoid a new temporary spatial-SQL execution system solely to
-   reproduce the current Python implementation.
-6. Port `prepare`, using verified rasterization initially. Replace it with native
-   scan conversion only after boundary, overlap, segment collision, buffer,
-   nodata, and block-seam fixtures produce the same ownership.
-7. Promote each native GIS backend independently after it passes the same
-   interoperability/scientific fixtures and dataset/unit scaling checks. Remove
-   the Python production implementation once the five commands have parity;
-   an optional future Python wrapper can call the Rust library.
-
-Success is a native CLI with one resource model, fewer runtime dependencies
-and execution representations, deterministic scientific results, and measured
-memory that plateaus as dataset size grows at fixed concurrency. Also vary
-the largest mini, largest geometry group, topology size, number of features,
-and number of queued results; fixed-size tile tests alone miss those limits.
-Use disk-spill versus resident paths and one versus multiple workers as parity
-checks. Independent GIS software should validate published files.
-
-This redesign has an architectural benefit even if a particular Numba kernel
-is already fast. The biggest simplifications come from eliminating interpreter
-and JIT startup, process serialization, duplicated worker state, and conversion
-chains. External algorithms and geospatial interoperability remain real work.
-Keeping PROJ or a narrow GDAL/GEOS adapter where it saves that work is compatible
-with a Rust-native architecture and can make the overall tool simpler.
+Each stage is ready when its scientific comparisons and focused edge cases
+pass on both applicable Jacui inputs and its performance has been recorded.
+The completed product is a native library/CLI with simpler execution and
+preserved scientific products. The fixture suite survives implementation;
+this temporary architecture document is removed once applied.

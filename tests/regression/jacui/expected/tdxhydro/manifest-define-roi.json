@@ -1,0 +1,26 @@
+{
+  "step": "define-roi",
+  "parameters": {
+    "crs": "EPSG:4326",
+    "catchments": "/workspace/mgb_builder/tests/regression/jacui/input/tdxhydro/catchments.fgb",
+    "segments": "/workspace/mgb_builder/tests/regression/jacui/input/tdxhydro/segments.fgb",
+    "outlet_ids": [
+      "640538827",
+      "640543432",
+      "640538824"
+    ],
+    "id_col": "linkno",
+    "id_down_col": "dslinkno",
+    "strahler_order_col": "strmOrder",
+    "output_dir": "/workspace/mgb_builder/tests/regression/jacui/expected/tdxhydro",
+    "catchments_layer": null,
+    "segments_layer": null,
+    "catchments_source_crs": "EPSG:4326",
+    "segments_source_crs": "EPSG:4326",
+    "workers": 4,
+    "memory_limit_mb": 4096,
+    "io_slots": 2,
+    "batch_size": 10000,
+    "overwrite": false
+  }
+}

@@ -1,0 +1,15 @@
+{
+  "step": "aggregate",
+  "parameters": {
+    "roi_catchments": "/workspace/mgb_builder/tests/regression/jacui/runs/capture-bhae/roi_catchments.fgb",
+    "roi_segments": "/workspace/mgb_builder/tests/regression/jacui/runs/capture-bhae/roi_segments.fgb",
+    "uparea_min": 60.0,
+    "lmin": 6.0,
+    "output_dir": "/workspace/mgb_builder/tests/regression/jacui/expected/bhae",
+    "workers": 4,
+    "memory_limit_mb": 4096,
+    "io_slots": 2,
+    "batch_size": 10000,
+    "overwrite": false
+  }
+}

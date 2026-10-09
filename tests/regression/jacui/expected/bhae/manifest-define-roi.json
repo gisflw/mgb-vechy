@@ -1,0 +1,26 @@
+{
+  "step": "define-roi",
+  "parameters": {
+    "crs": "EPSG:4326",
+    "catchments": "/workspace/mgb_builder/tests/regression/jacui/input/bhae/catchments.fgb",
+    "segments": "/workspace/mgb_builder/tests/regression/jacui/input/bhae/segments.fgb",
+    "outlet_ids": [
+      "171984",
+      "420329",
+      "178658"
+    ],
+    "id_col": "cotrecho",
+    "id_down_col": "nutrjus",
+    "strahler_order_col": "nustrahler",
+    "output_dir": "/workspace/mgb_builder/tests/regression/jacui/expected/bhae",
+    "catchments_layer": null,
+    "segments_layer": null,
+    "catchments_source_crs": null,
+    "segments_source_crs": null,
+    "workers": 4,
+    "memory_limit_mb": 4096,
+    "io_slots": 2,
+    "batch_size": 10000,
+    "overwrite": false
+  }
+}

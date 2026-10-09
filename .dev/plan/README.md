@@ -1,10 +1,10 @@
 # Remaining capabilities
 
-The project implements [ROI selection](../stage1_roi_cli.md),
-[mini-basin aggregation](../stage2_aggregation_cli.md),
-[raster preparation](../stage3_prepare_data.md),
-[terrain products](../stage4_terrain_cli.md), and
-[mini-basin sampling](../stage5_mini_sampling_cli.md).
+The project implements [ROI selection](../../docs/stage1_roi_cli.md),
+[mini-basin aggregation](../../docs/stage2_aggregation_cli.md),
+[raster preparation](../../docs/stage3_prepare_data.md),
+[terrain products](../../docs/stage4_terrain_cli.md), and
+[mini-basin sampling](../../docs/stage5_mini_sampling_cli.md).
 
 Two capabilities remain unimplemented:
 

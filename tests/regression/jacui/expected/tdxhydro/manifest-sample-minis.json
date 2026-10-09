@@ -1,0 +1,19 @@
+{
+  "step": "sample-minis",
+  "parameters": {
+    "mini_catchments": "/workspace/mgb_builder/tests/regression/jacui/runs/capture-tdxhydro/mini_catchments.fgb",
+    "mini_segments": "/workspace/mgb_builder/tests/regression/jacui/runs/capture-tdxhydro/mini_segments.fgb",
+    "dem": "/workspace/mgb_builder/tests/regression/jacui/runs/capture-tdxhydro/dem.tif",
+    "grid_catchments": "/workspace/mgb_builder/tests/regression/jacui/runs/capture-tdxhydro/grid_catchments.tif",
+    "grid_segments": "/workspace/mgb_builder/tests/regression/jacui/runs/capture-tdxhydro/grid_segments.tif",
+    "hand": "/workspace/mgb_builder/tests/regression/jacui/runs/capture-tdxhydro/hand.tif",
+    "ltnd": "/workspace/mgb_builder/tests/regression/jacui/runs/capture-tdxhydro/ltnd.tif",
+    "hru": "/workspace/mgb_builder/tests/regression/jacui/runs/capture-tdxhydro/hru.tif",
+    "output_dir": "/workspace/mgb_builder/tests/regression/jacui/expected/tdxhydro",
+    "workers": 4,
+    "memory_limit_mb": 4096,
+    "io_slots": 2,
+    "batch_size": 10000,
+    "overwrite": false
+  }
+}

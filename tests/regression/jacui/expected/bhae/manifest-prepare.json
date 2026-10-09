@@ -1,0 +1,23 @@
+{
+  "step": "prepare",
+  "parameters": {
+    "dem": "/workspace/mgb_builder/tests/regression/jacui/input/dem.tif",
+    "output_dir": "/workspace/mgb_builder/tests/regression/jacui/expected/bhae",
+    "mini_catchments": "/workspace/mgb_builder/tests/regression/jacui/runs/capture-bhae/mini_catchments.fgb",
+    "mini_segments": "/workspace/mgb_builder/tests/regression/jacui/runs/capture-bhae/mini_segments.fgb",
+    "rasters": [
+      {
+        "name": "hru",
+        "path": "/workspace/mgb_builder/tests/regression/jacui/input/hru.tif",
+        "kind": "categorical"
+      }
+    ],
+    "d8": null,
+    "d8_encoding": null,
+    "workers": 4,
+    "memory_limit_mb": 4096,
+    "io_slots": 2,
+    "dem_scale": 0.01,
+    "overwrite": false
+  }
+}
