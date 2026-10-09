@@ -1,7 +1,7 @@
 # Shared data contracts
 
 These contracts and the stage guides freeze the historical preprocessing
-behavior for the future `mgb::prepro` implementation.
+behavior for the `mgb::prepro` implementation.
 They are the stable behavioral and data-file reference across implementation
 changes. The scientific source/tests at reference commit
 `0e29ede1d2fbb729cbdffebb2eb5b13bebf231c0` resolve details; runtime mechanisms and

@@ -71,11 +71,11 @@
     },
     "expected/bhae/mini_catchments.fgb": {
       "bytes": 39175016,
-      "sha256": "dc5c9a269caddead63ab4de7f2a3697529f30e2175394033fecce18795986b42"
+      "sha256": "284c6217563e0fc7df32704c47d91bc9c232faf830bf293d17a60ee96a7c7d22"
     },
     "expected/bhae/mini_segments.fgb": {
       "bytes": 3983888,
-      "sha256": "8ffd4c240d93a75afd8ab787080ef5102be69a824f6558717a1d662bb61c19dd"
+      "sha256": "092b8b9b678380f9e0c5ed829648fa7f95bb8529541359aed1fe5e8fd2ce1879"
     },
     "expected/bhae/nodata_hand.csv": {
       "bytes": 1420,
@@ -94,8 +94,8 @@
       "sha256": "3aab1b27749feed0daf99b075189eda6eb25fa85acbfc32dabc8bd2c312b5a65"
     },
     "expected/bhae/sampled_minis.csv": {
-      "bytes": 1115596,
-      "sha256": "458986d729caafae0ae4450ce1d318812c7646cfb7b015e81acfc75eb79ee100"
+      "bytes": 1114542,
+      "sha256": "ed626e377150e6773b436bbd94d5dad0edc688ab0976dcd6ea2deb738625541f"
     },
     "expected/bhae/source_to_mini.csv": {
       "bytes": 209229,
@@ -151,11 +151,11 @@
     },
     "expected/tdxhydro/mini_catchments.fgb": {
       "bytes": 41506680,
-      "sha256": "3f3f09539d7bd72ef4786eebeff2e5f5ba2a7221d620fe0609dfbf506f8330c1"
+      "sha256": "13c3bdd95bf4b27cd6340e22876bf020a35758990d3abbabd2f2009636b22c28"
     },
     "expected/tdxhydro/mini_segments.fgb": {
       "bytes": 14070968,
-      "sha256": "d6626b2195960bc8dfe5aa12f71c98cbf1c44ea96e5174298bf679d4e4c7bd49"
+      "sha256": "58e94193faa47086f852afc56372782adf06ddc81173594982a75005d8c4cdae"
     },
     "expected/tdxhydro/nodata_hand.csv": {
       "bytes": 1047,
@@ -174,8 +174,8 @@
       "sha256": "2788f46426384439fb0e4f918aff2766ef4e1df37a017e30bb6c132e810299cd"
     },
     "expected/tdxhydro/sampled_minis.csv": {
-      "bytes": 1160456,
-      "sha256": "343940396f82d3a56a8628ba42d43cb6026c967db7f04078bb2c72e62f433d72"
+      "bytes": 1159364,
+      "sha256": "a01a389b5b4636ba4f2042c0622258410683eb062e1dac1ed8db9502155a09c4"
     },
     "expected/tdxhydro/source_to_mini.csv": {
       "bytes": 237659,
@@ -185,5 +185,37 @@
       "bytes": 1053,
       "sha256": "f535425cfbfa3a8c47ddb72ef6a2988673887c22b907fa56b9aed51591083123"
     }
-  }
+  },
+  "corrections": [
+    {
+      "date": "2026-10-09",
+      "description": "Correct sub from float64 to int64 in mini vectors and sampled CSVs; integral values, all other attributes, geometries, and mini feature order are unchanged. ROI vectors and source-to-mini CSVs already had integer sub.",
+      "original_files": {
+        "expected/bhae/mini_catchments.fgb": {
+          "bytes": 39175016,
+          "sha256": "dc5c9a269caddead63ab4de7f2a3697529f30e2175394033fecce18795986b42"
+        },
+        "expected/bhae/mini_segments.fgb": {
+          "bytes": 3983888,
+          "sha256": "8ffd4c240d93a75afd8ab787080ef5102be69a824f6558717a1d662bb61c19dd"
+        },
+        "expected/bhae/sampled_minis.csv": {
+          "bytes": 1115596,
+          "sha256": "458986d729caafae0ae4450ce1d318812c7646cfb7b015e81acfc75eb79ee100"
+        },
+        "expected/tdxhydro/mini_catchments.fgb": {
+          "bytes": 41506680,
+          "sha256": "3f3f09539d7bd72ef4786eebeff2e5f5ba2a7221d620fe0609dfbf506f8330c1"
+        },
+        "expected/tdxhydro/mini_segments.fgb": {
+          "bytes": 14070968,
+          "sha256": "d6626b2195960bc8dfe5aa12f71c98cbf1c44ea96e5174298bf679d4e4c7bd49"
+        },
+        "expected/tdxhydro/sampled_minis.csv": {
+          "bytes": 1160456,
+          "sha256": "343940396f82d3a56a8628ba42d43cb6026c967db7f04078bb2c72e62f433d72"
+        }
+      }
+    }
+  ]
 }

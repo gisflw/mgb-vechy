@@ -1,5 +1,5 @@
 mod cli;
 
-fn main() {
-    cli::run();
+fn main() -> anyhow::Result<()> {
+    cli::run()
 }

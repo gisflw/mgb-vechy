@@ -1,6 +1,6 @@
 # Stage 5: sample mini-basin attributes
 
-Frozen scientific reference for `mgb::prepro`; Rust implementation is pending.
+Implemented by `mgb::prepro::sampling` and `mgb prepro sample-minis`.
 
 Current stage name: `sample-minis`.
 
@@ -88,3 +88,37 @@ Reports are retained when a completed scan fails for missing required
 statistics. Also reject inconsistent vector schemas/attributes, mini IDs,
 CRS, grids, masks, units, positive segment ownership, or zero/invalid reach
 lengths.
+
+## Running the Rust implementation
+
+```bash
+mgb prepro sample-minis \
+  --mini-catchments mini_catchments.fgb --mini-segments mini_segments.fgb \
+  --dem dem.tif --grid-catchments grid_catchments.tif \
+  --grid-segments grid_segments.tif --hand hand.tif --ltnd ltnd.tif \
+  --hru hru.tif --output-dir sampled --workers 4 --memory-limit-mb 4096
+```
+
+The library exposes `SamplingSpec`, `SamplingReport`, and `sample_minibasins`
+under both `mgb::prepro` and `mgb::prepro::sampling`. The specification supplies
+all eight input paths, an output directory, and positive worker/memory limits.
+The report returns output paths, mini count, and actual worker count.
+
+Worker and memory defaults above apply to the CLI. Concurrency decreases when
+necessary to fit the application allocation budget. Inputs are read in windows;
+exact samples for one mini must fit the budget. At least 48 MiB is needed for
+GIS cache and raster windows, plus mini samples and coordinator records. This
+is not a hard RSS ceiling. Sampling temporarily caps GDAL's process-wide block
+cache at 16 MiB and restores its previous limit afterward; concurrent sampling
+calls are serialized while that shared limit is in use.
+
+Rows are written in ascending mini-ID order. `sub` is an integer column;
+floating `sub` fields are rejected. Missing-data reports use owned cells as
+their denominator, including for DEM and segment-grid coverage.
+
+Existing sampling products, including diagnostic reports and symlinks, are
+never overwritten. Unrelated upstream files may share the output directory.
+Files are staged there and published without replacing existing files; a failed
+publication removes only newly published products. A completed scan missing
+required statistics retains its nodata reports but writes no sampled CSV or
+success manifest. Correct inputs and use a fresh sampling destination to retry.

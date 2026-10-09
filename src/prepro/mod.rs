@@ -5,4 +5,6 @@ pub mod cli;
 pub mod execution;
 pub mod io;
 pub mod model;
-pub mod science;
+pub mod sampling;
+
+pub use sampling::{SamplingReport, SamplingSpec, sample_minibasins};

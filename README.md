@@ -4,10 +4,10 @@ MGB is a Rust library and command-line toolset for hydrography and model inputs.
 Its first module, `mgb::prepro`, prepares vector networks, mini-basins, terrain
 products, and model attributes using explicit segment and downstream IDs.
 
-The Rust package currently provides the library layout, CLI namespace, and
-Jacui regression tools. Scientific stages await implementation, beginning with
-mini sampling. The five stage contracts freeze the previous implementation's
-scientific behavior; they do not describe functionality already available in Rust.
+Mini sampling is implemented in Rust, with a library API, CLI, and Jacui
+regression tools. ROI selection, aggregation, preparation, and terrain products
+remain pending; terrain is next. The five stage contracts define scientific
+behavior across implemented and pending stages.
 
 ## Build and check
 
@@ -25,9 +25,9 @@ cargo clippy --all-targets --locked -- -D warnings
 cargo test --all-targets --locked
 ```
 
-The executable is `mgb`; future scientific commands use `mgb prepro <stage>`.
+The executable is `mgb`; scientific commands use `mgb prepro <stage>`.
 The public library namespace is `mgb::prepro`. There is one Cargo package;
-future product modules can join it without creating a crate per stage.
+each scientific stage has its own module (currently `mgb::prepro::sampling`).
 
 ## Frozen preprocessing workflow
 
@@ -37,7 +37,7 @@ future product modules can join it without creating a crate per stage.
 | 2. [Aggregate mini-basins](docs/stage2_aggregation_cli.md) | Group source units using area, length, and network rules. | Mini catchments, reaches, and source-to-mini mapping. |
 | 3. [Prepare raster data](docs/stage3_prepare_data.md) | Aligned inputs, raster ownership, and matching drainage. | Prepared DEM, optional rasters, and mini-ID grids. |
 | 4. [Terrain products](docs/stage4_terrain_cli.md) | Confined routing, HAND, and terrain-to-drainage distance. | HAND, LTND, diagnostics, and optional directions. |
-| 5. [Sample mini-basins](docs/stage5_mini_sampling_cli.md) | Terrain, HRU, and flooded-area summaries. | Mini attribute CSV and missing-data reports. |
+| 5. [Sample mini-basins](docs/stage5_mini_sampling_cli.md) | Implemented: terrain, HRU, and flooded-area summaries. | Mini attribute CSV and missing-data reports. |
 
 Stage names remain `define-roi`, `aggregate`, `prepare`, `terrain-products`, and
 `sample-minis`, under the `prepro` CLI namespace when implemented. The

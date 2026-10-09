@@ -3,9 +3,9 @@
 The frozen scientific reference covers **Jacui / BHAE** and **Jacui / TDXHydro**,
 each with three ordered outlets. Large assets remain local and gitignored;
 the tracked configuration, inventory, audit provenance, and historical timing
-records stay unchanged during candidate work.
+records stay unchanged during candidate work except for explicit corrections.
 
-The Rust package currently provides regression tooling, not scientific stages.
+The Rust package implements mini sampling and provides regression tooling.
 The developer utility is separate from the production `mgb prepro` CLI:
 
 ```bash
@@ -43,10 +43,20 @@ Outlet order maps to `sub` 3, 2, 1; later outlets take precedence in overlaps.
 Both cases use EPSG:4326, area threshold 60 km², length threshold 6 km,
 DEM scale 0.01, and AGREE sharp/smooth/buffer values 80/8/4.
 
+## Fixture correction
+
+On 2026-10-09, an explicitly authorized correction changed `sub` from float64
+to int64 in both networks' mini catchments, mini segments, and sampled CSVs.
+Values are unchanged. Other vector attributes, geometry bytes, and mini feature
+order were checked unchanged. ROI vectors and source-to-mini CSVs already use
+integer `sub`; source rasters and historical benchmarks were not changed.
+`inventory.json` records corrected checksums and the six original file records.
+Local copies of the capture must include this correction to pass verification.
+
 ## Candidate runs and comparisons
 
-Once an external candidate implements scientific stages, run one stage against
-captured upstream products:
+Build the candidate with `cargo build --release --locked --bin mgb`, then run
+sampling against captured upstream products:
 
 ```bash
 cargo run --release --example jacui -- run --network bhae \
@@ -56,14 +66,14 @@ cargo run --release --example jacui -- compare --network bhae \
   --stage sample-minis --output-dir tests/regression/jacui/runs/bhae-sampling
 ```
 
-The command above will fail against the current skeleton because scientific
-commands are pending. `--stage all` (the default) runs all five stages, using
-candidate upstream products. Invoke both networks for full scientific validation.
+Sampling works against the current Rust executable. `--stage all` (the default)
+requires the four remaining stages and uses candidate upstream products. Run
+sampling for both networks for scientific validation.
 Candidate commands take the form `<executable prefix> prepro <stage> ...`.
 Repeat `--command-arg` to supply prefix arguments without shell evaluation,
 for example `--command cargo --command-arg=run --command-arg=--release
---command-arg=--`. The small scientific-option adapter is provisional and
-must evolve with stage implementations.
+--command-arg=--`. The sampling option adapter matches the Rust CLI; adapters for pending stages
+remain provisional.
 
 `run` accepts `--workers` and `--memory-limit-mb`, defaulting to 4 and 4096.
 Outputs must go to a fresh, empty directory. Inputs and expected products,
@@ -89,8 +99,8 @@ cargo run --release --example jacui -- compare --network tdxhydro \
   --output-dir tests/regression/jacui/expected/tdxhydro
 ```
 
-Scientific candidate regression is an ignored Rust integration test. Enable it
-explicitly once the candidate is implemented:
+Scientific candidate regression is an ignored Rust integration test. Enable sampling regression
+explicitly:
 
 ```bash
 MGB_REGRESSION_COMMAND=target/release/mgb JACUI_STAGE=sample-minis \

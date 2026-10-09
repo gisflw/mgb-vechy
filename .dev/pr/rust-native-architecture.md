@@ -10,10 +10,13 @@ available at commit
 
 ## Current state
 
-The single Cargo package, root CLI dispatcher, `prepro` module layout, Rust
-devcontainer, and Jacui developer tools are in place. Both captures are frozen.
-Scientific stages, production GIS adapters, typed scientific models, and shared
-resource helpers await implementation. Mini sampling is the next stage.
+The single Cargo package, CLI dispatcher, Rust devcontainer, and Jacui developer
+tools are in place. Mini sampling is implemented in `prepro::sampling`, using
+GDAL windowed I/O/CRS transforms, GEOS representative points, and native Rust
+statistics and ellipsoidal cell areas. It passes both Jacui sampling comparisons.
+Both captures include the explicitly authorized integer-`sub` schema correction
+recorded in their inventory. [Sampling validation and measurements](mini-sampling-validation.md)
+record the current results. Terrain is the next stage.
 
 ## What stays fixed
 
@@ -44,11 +47,16 @@ not a crate per stage or a general workflow framework:
 
 | Module | Responsibility |
 | --- | --- |
-| `prepro::model` | Typed source/mini IDs, topology, grids, masks, and scientific parameters. |
-| `prepro::science` | ROI, aggregation, ownership, terrain routing, and mini statistics. |
+| `prepro::model` | Shared typed aggregation attributes, grids, and windows; add topology when needed. |
+| `prepro::sampling` | Sampling inputs/report, validation, statistics, and stage coordination. |
 | `prepro::io` | Vector records, raster windows, metadata, geometry, and CRS operations. |
-| `prepro::execution` | The small set of shared resource and temporary-storage helpers needed by implemented stages. |
+| `prepro::execution` | Shared GDAL cache budget and safe temporary-output publication. |
 | `cli` / `prepro::cli` | Dispatch modules / parse preprocessing requests and present results. |
+
+Each scientific stage gets one file and module (`sampling.rs` now; terrain,
+ROI, aggregation, and preparation when implemented), owning its science,
+validation, parameters, and orchestration. Keep shared GIS and resource helpers
+in `io` and `execution`.
 
 Use dense internal indices for graph operations while retaining original IDs
 and prescribed string-ID ties. Move owned typed buffers between threads;
@@ -176,11 +184,11 @@ comparisons come after the two Jacui implementations are useful.
 
 1. Both Jacui references and fixture-local baseline measurements are captured.
    Verify their inventory and keep them immutable during candidate work.
-2. The Rust package and CLI skeleton are established. Add typed scientific
-   models and minimum I/O/resource helpers with the first working stage.
-3. Implement mini sampling first against captured upstream files. This covers
+2. The Rust package and CLI are established, with shared records and the
+   minimum I/O/resource helpers required by sampling.
+3. Mini sampling is implemented against captured upstream files, covering
    windowed reads, exact percentiles, HRU percentages, geodesic flooded areas,
-   tie behavior, and partial nodata without a new raster writer or dissolution.
+   ties, partial nodata, deterministic workers, and oversized-mini rejection.
 4. Implement terrain against the prepared Jacui inputs and synthetic routing
    fixtures. Preserve directions, confinement, raw-DEM HAND, and geodesic LTND.
 5. Implement ROI and aggregation with typed topology and geometry adapters.

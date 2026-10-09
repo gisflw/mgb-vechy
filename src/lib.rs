@@ -1,4 +1,4 @@
 //! MGB tools for hydrography and model inputs.
 //!
-//! Scientific functionality is being implemented against frozen data contracts.
+//! Mini sampling is implemented against frozen data contracts; other stages follow.
 pub mod prepro;

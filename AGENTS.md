@@ -8,12 +8,13 @@ networks using explicit segment and downstream IDs; a particular dataset's
 naming or numbering conventions do not define the product.
 
 The package and executable are `mgb`. Preprocessing is the first public module,
-`mgb::prepro`; scientific CLI commands will start with `mgb prepro <stage>`.
-The Rust skeleton and Jacui regression tools are implemented. Five scientific
+`mgb::prepro`; scientific CLI commands start with `mgb prepro <stage>`.
+Mini sampling and Jacui regression tools are implemented. Four scientific
 capabilities have frozen reference contracts but await Rust implementation:
-ROI selection, mini-basin aggregation, raster preparation, terrain products,
-and mini sampling. HRU construction and final simulation-file generation remain
-future capabilities. Implement mini sampling first.
+ROI selection, mini-basin aggregation, raster preparation, and terrain products.
+HRU construction and final simulation-file generation remain future capabilities.
+Implement terrain next. Keep each scientific stage in its own module, beginning
+with `prepro::sampling`; do not collect stages in a shared `science` module.
 
 ## Repository map
 

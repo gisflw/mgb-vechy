@@ -9,11 +9,11 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Preprocess hydrography and model inputs (scientific stages pending).
+    /// Preprocess hydrography and model inputs.
     Prepro(mgb::prepro::cli::Args),
 }
 
-pub fn run() {
+pub fn run() -> anyhow::Result<()> {
     match Cli::parse().command {
         Command::Prepro(args) => mgb::prepro::cli::run(args),
     }
