@@ -1,5 +1,7 @@
 # Stage 5: sample mini-basin attributes
 
+Frozen scientific reference for `mgb::prepro`; Rust implementation is pending.
+
 Current stage name: `sample-minis`.
 
 Summarize terrain and existing HRU classes into one geometry-free attribute

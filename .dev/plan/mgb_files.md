@@ -1,7 +1,7 @@
 # MGB file generation
 
 Status: unimplemented. This is an intended capability, outside the frozen
-implemented tool contracts.
+reference tool contracts.
 
 ## Purpose and inputs
 

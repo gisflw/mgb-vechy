@@ -1,5 +1,7 @@
 # Stage 3: prepare raster data
 
+Frozen scientific reference for `mgb::prepro`; Rust implementation is pending.
+
 Current stage name: `prepare`.
 
 Clip aligned rasters and establish mini ownership and matching drainage on a

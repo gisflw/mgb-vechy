@@ -1,106 +1,134 @@
 # Jacui regression reference
 
-Use these two datasets for automated scientific regression and performance
-work: **Jacui / BHAE** and **Jacui / TDXHydro**, each using three ordered outlets. Small synthetic scientific
-tests elsewhere remain useful for isolated edge cases.
+The frozen scientific reference covers **Jacui / BHAE** and **Jacui / TDXHydro**,
+each with three ordered outlets. Large assets remain local and gitignored;
+the tracked configuration, inventory, audit provenance, and historical timing
+records stay unchanged during candidate work.
 
-The existing runs in `scratch/analysis/results/jacui` supply the source data. The initial source networks confirm that the requested
-three-outlet unions are contained in the captured basin IDs. `scratch/analysis` is reserved for
-broader manual testing when the tool is more mature. Candidate regression
-runs use the local capture and do not read or write scratch.
+The Rust package currently provides regression tooling, not scientific stages.
+The developer utility is separate from the production `mgb prepro` CLI:
 
-## Contents
+```bash
+cargo run --release --example jacui -- --help
+cargo run --release --example jacui -- verify
+```
+
+`verify` checks existence, byte length, and SHA-256 for every inventory entry.
+A checkout without local assets must obtain a copy of the original capture;
+missing assets fail explicit verification and candidate runs.
+
+## Contents and provenance
 
 | Path | Purpose |
 | --- | --- |
-| `config.json` | Scientific settings, outlets, source field names, and CRS overrides. |
-| `inventory.json` | Source location, captured file sizes, and SHA-256 checksums. |
-| `input/` | Shared source DEM/HRU crops and raw basin-only catchments/segments for each network. |
-| `expected/bhae/`, `expected/tdxhydro/` | Captured reference products for all five stages, audit manifests, and diagnostics. |
-| `benchmarks/` | Current three-outlet timing records: `bhae.json` and `tdxhydro.json`. |
-| `runs/` | Disposable candidate outputs, logs, and measurements. |
-| `capture.py` | Explicitly capture reference assets from the existing scratch runs. |
-| `benchmark.py` | Exercise one stage or all stages, recording complete-invocation wall time and memory evidence. |
+| `config.json` | Scientific settings, ordered outlets, source fields, and CRS overrides. |
+| `inventory.json` | Captured file sizes, SHA-256 checksums, and source location. |
+| `input/` | Shared source DEM/HRU crops and raw basin-only vectors. |
+| `expected/bhae/`, `expected/tdxhydro/` | Frozen five-stage products, audit manifests, and diagnostics. |
+| `benchmarks/` | Historical three-outlet timing records. |
+| `runs/` | Disposable candidate products, logs, and measurements. |
 
-Large FGB/TIFF assets and sampled CSVs are gitignored. Configuration,
-checksums, source-to-mini mapping, diagnostic CSVs, audit provenance, and
-benchmark records are versioned. A checkout without local assets can capture
-them from the original scratch data:
+The capture was generated with the historical scientific implementation.
+Source and tests are available at commit
+`0e29ede1d2fbb729cbdffebb2eb5b13bebf231c0`. The baseline measurements identify
+the production revision used for their runs; they are historical evidence,
+including their original executable names and absolute paths.
 
-```bash
-python tests/regression/jacui/capture.py --scratch /workspace/scratch
-```
-
-Capture refreshes the raw basin-only inputs, regenerates all five expected
-stages with the current reference implementation, records fixture-local
-performance, and updates checksums. It reads the original source networks and
-raster paths from their existing ROI manifests. Run it only when intentionally
-refreshing the scientific baseline. Source DEM values are centimetres;
-preparation applies the configured `dem_scale=0.01`.
-
-| Case | Outlet | Source units | Minis |
+| Case | Ordered outlets | Source units | Minis |
 | --- | --- | --- | --- |
 | BHAE | 171984, 420329, 178658 | 4,071 | 527 |
 | TDXHydro, region 610 | 640538827, 640543432, 640538824 | 4,351 | 546 |
 
-In each outlet list, `sub` is assigned 3, 2, 1 in order, with later outlets
-taking precedence in overlapping upstream areas. Both cases use EPSG:4326, area threshold 60 km², length threshold 6 km,
-and AGREE sharp/smooth/buffer values 80/8/4.
+Outlet order maps to `sub` 3, 2, 1; later outlets take precedence in overlaps.
+Both cases use EPSG:4326, area threshold 60 km², length threshold 6 km,
+DEM scale 0.01, and AGREE sharp/smooth/buffer values 80/8/4.
 
-## Scientific regression
+## Candidate runs and comparisons
 
-From the repository root, run both full pipelines and compare their products:
-
-```bash
-RUN_JACUI_REGRESSION=1 pytest -q tests/regression/test_jacui.py
-```
-
-The default suite skips these dataset runs. Explicitly enabled runs fail if
-local fixtures are missing. Select one stage to compare a partial
-implementation against captured upstream products:
+Once an external candidate implements scientific stages, run one stage against
+captured upstream products:
 
 ```bash
-RUN_JACUI_REGRESSION=1 JACUI_STAGE=sample-minis pytest -q tests/regression/test_jacui.py
+cargo run --release --example jacui -- run --network bhae \
+  --stage sample-minis --command target/release/mgb \
+  --output-dir tests/regression/jacui/runs/bhae-sampling
+cargo run --release --example jacui -- compare --network bhae \
+  --stage sample-minis --output-dir tests/regression/jacui/runs/bhae-sampling
 ```
 
-`MGB_REGRESSION_COMMAND` selects an executable prefix for a candidate CLI.
-The runner currently expresses the reference CLI's options; adapt this small
-command adapter when the Rust CLI is defined. These scripts are development
-tools, not production architecture or frozen CLI contracts.
+The command above will fail against the current skeleton because scientific
+commands are pending. `--stage all` (the default) runs all five stages, using
+candidate upstream products. Invoke both networks for full scientific validation.
+Candidate commands take the form `<executable prefix> prepro <stage> ...`.
+Repeat `--command-arg` to supply prefix arguments without shell evaluation,
+for example `--command cargo --command-arg=run --command-arg=--release
+--command-arg=--`. The small scientific-option adapter is provisional and
+must evolve with stage implementations.
 
-Comparisons require exact column names/types, mini IDs, integer ownership,
-validity masks, required metadata, and specified feature order. Geometry is
-compared topologically. Sampling rows are matched by mini ID. CSV numbers use
-`rtol=1e-10, atol=1e-10`; float raster cells use `rtol=1e-6, atol=1e-6`.
-Affine coordinates and embedded mini bounds allow `atol=1e-12` coordinate
-units (`rtol=0`) for source-crop rounding; raster dimensions, integer ownership,
-and masks remain exact. These tolerances cover representation differences and do not authorize
-different scientific routing or assignment decisions. The captured dataset
-products do not include flow-direction rasters; focused routing tests supply
-that reference.
+`run` accepts `--workers` and `--memory-limit-mb`, defaulting to 4 and 4096.
+Outputs must go to a fresh, empty directory. Inputs and expected products,
+including other networks and symlink aliases, are protected from candidate
+writes. Candidate runs never read or write scratch. `--fixture PATH` globally
+selects another local capture directory.
 
-## Performance measurements
+`compare` checks the exact stage product set and audit `step`/`parameters`
+envelopes. It checks vector schemas, IDs, attributes, topologically equivalent
+geometry, and mini feature ordering. ROI rows and sampled CSV rows are matched
+by ID. Integer values and masks are exact. Numeric CSV/vector attributes use
+`rtol=1e-10, atol=1e-10`; continuous rasters use `rtol=1e-6, atol=1e-6`.
+Grid transforms and mini bounds use `rtol=0, atol=1e-12`. Raster dimensions,
+CRS, dtypes, validity masks, COG layout, units, and metadata are checked using
+bounded windows. These tolerances do not authorize changed scientific decisions.
 
-Run a full case into a fresh output folder:
+For tool validation only, compare frozen products against themselves:
 
 ```bash
-python tests/regression/jacui/benchmark.py --network bhae \
-  --output-dir tests/regression/jacui/runs/bhae
-python tests/regression/jacui/benchmark.py --network tdxhydro \
-  --output-dir tests/regression/jacui/runs/tdxhydro
+cargo run --release --example jacui -- compare --network bhae \
+  --output-dir tests/regression/jacui/expected/bhae
+cargo run --release --example jacui -- compare --network tdxhydro \
+  --output-dir tests/regression/jacui/expected/tdxhydro
 ```
 
-Use `--stage` for an individual stage, `--command` for a candidate executable,
-and `--workers`/`--memory-limit-mb` to select reference-runtime sizing.
-The runner defaults to four workers and 4096 MB. Each stage writes a log;
-`benchmark.json` records wall time, exit status, revision, platform, and sizing.
-`max_process_rss_kib` is Linux wait4's maximum individual-process RSS, including
-completed descendants, not the sum of concurrently resident workers.
+Scientific candidate regression is an ignored Rust integration test. Enable it
+explicitly once the candidate is implemented:
 
-`benchmarks/bhae.json` and `benchmarks/tdxhydro.json` record the current
-three-outlet cases. These are single-run observations on basin-only inputs,
-not speed thresholds or statistically established improvements.
-Compare release Rust builds on the same inputs and machine, control cache
-conditions, and use repeated runs and medians for performance conclusions.
-Distinguish cold startup/JIT from warmed execution. Timing does not determine
-scientific test success.
+```bash
+MGB_REGRESSION_COMMAND=target/release/mgb JACUI_STAGE=sample-minis \
+  cargo test --test regression jacui_candidate_scientific_regression -- --ignored
+```
+
+`MGB_REGRESSION_COMMAND` is an executable path, not shell text; use the developer
+utility for executable-prefix arguments. Explicit runs fail on missing fixtures.
+The dataset capture omits flow-direction products; the
+[synthetic terrain cases](../synthetic/README.md) preserve focused examples.
+
+## Performance evidence
+
+Each candidate stage writes a log. `benchmark.json` records wall time, exit
+status, revision, platform, resource settings, executable arguments, and timing
+of failed invocations too. On Linux, `max_process_rss_kib` is `wait4`'s maximum
+individual-process RSS including completed descendants, not summed concurrent
+RSS. Other platforms record null for this Linux-specific metric.
+
+Historical benchmark records are single-run observations, not thresholds.
+Use release builds, the same local inputs/settings/machine, controlled cache
+conditions, repeated runs, and medians for performance conclusions. Timing does
+not determine scientific pass/fail. Broader scaling comes after both Jacui cases
+are scientifically useful.
+
+## Historical baseline refresh
+
+Current Rust tools deliberately do not recapture or regenerate expected data.
+For an intentional historical refresh, create a separate checkout:
+
+```bash
+git worktree add --detach ../mgb-python-reference \
+  0e29ede1d2fbb729cbdffebb2eb5b13bebf231c0
+```
+
+Follow that checkout's regression README and dependency manifest to use its
+historical `capture.py`, explicitly pointing it at the original scratch data.
+Review regenerated products, provenance, inventory, and benchmark records
+before replacing this capture. This is a separate reference operation, never
+part of candidate regression. `scratch/analysis` stays reserved for the user's
+broader manual testing.

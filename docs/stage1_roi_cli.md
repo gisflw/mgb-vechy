@@ -1,5 +1,7 @@
 # Stage 1: define ROI
 
+Frozen scientific reference for `mgb::prepro`; Rust implementation is pending.
+
 Current stage name: `define-roi`.
 
 Select the union of the network upstream of one or more outlets, normalize

@@ -11,13 +11,6 @@ tests/regression/jacui/**/*.tif.*
 tests/regression/jacui/**/*.csv
 tests/regression/jacui/runs/
 
-__pycache__/
-.venv/
-.pytest_cache/
-.pytest-tmp/
-.ruff_cache/
-*.egg-info/
-build/
-dist/
+/target/
 output/
 tmp/

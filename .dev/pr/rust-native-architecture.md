@@ -1,24 +1,35 @@
-# Rust-native architecture
+# MGB Rust architecture
 
-Implementation plan for a standalone Rust library and CLI. The goal is a fresh
-architecture with simpler data flow, lower runtime overhead, and predictable
-resource use. Python production code and management APIs may be replaced
-outright; this isolated branch does not need a transition framework.
+Implementation plan for the standalone `mgb` Rust library and CLI.
+Preprocessing is its first module, `mgb::prepro`; commands start with
+`mgb prepro <stage>`. The goal is a fresh architecture with simpler data flow,
+lower runtime overhead, and predictable resource use. The Python implementation
+has been removed from this branch. Its scientific source and tests remain
+available at commit
+`0e29ede1d2fbb729cbdffebb2eb5b13bebf231c0`.
+
+## Current state
+
+The single Cargo package, root CLI dispatcher, `prepro` module layout, Rust
+devcontainer, and Jacui developer tools are in place. Both captures are frozen.
+Scientific stages, production GIS adapters, typed scientific models, and shared
+resource helpers await implementation. Mini sampling is the next stage.
 
 ## What stays fixed
 
-The [stage guides](../../README.md#implemented-workflow) and
+The [stage guides](../../README.md#frozen-preprocessing-workflow) and
 [shared data contracts](../../docs/shared_data_contracts.md) define scientific
 behavior and data products. Preserve topology, aggregation assignments,
 canonical ownership, routing, numeric conventions, units, masks, filenames,
-schemas, and meaningful ordering. Current scientific source and focused tests
-are references; copied QGIS-era products are not the oracle.
+schemas, and meaningful ordering. Captured Jacui products, synthetic terrain
+fixtures, and the scientific source/tests at the reference commit are the
+references; copied QGIS-era products are not the oracle.
 
-CLI spelling, Python APIs, worker/process management, batching, caches, IPC,
+The `mgb prepro` namespace is fixed. Stage option spelling, historical Python
+APIs, worker/process management, batching, caches, IPC,
 publication/rollback machinery, and runtime exception types are replaceable.
 Audit manifests retain their stage filenames and `step`/`parameters` envelope;
-runtime-specific fields may change. Do not make Python cleanup, compatibility
-wrappers, or dual-runtime operation prerequisites for Rust work.
+runtime-specific fields may change.
 
 Percentiles remain exact linear percentiles; maximum-LTND ties retain their
 scientific tolerance. Geodesic measurements use the source CRS ellipsoid.
@@ -27,16 +38,17 @@ is a scientific operation, even when a different library implements it.
 
 ## Small initial architecture
 
-Start with one Cargo package exposing a library and a thin CLI. Use modules,
+Use one Cargo package named `mgb`, exposing library `mgb` and executable `mgb`.
+The root CLI dispatches to preprocessing parsing under `prepro`. Use modules,
 not a crate per stage or a general workflow framework:
 
 | Module | Responsibility |
 | --- | --- |
-| `model` | Typed source/mini IDs, topology, grids, masks, and scientific parameters. |
-| `science` | ROI, aggregation, ownership, terrain routing, and mini statistics. |
-| `io` | Vector records, raster windows, metadata, geometry, and CRS operations. |
-| `execution` | The small set of shared resource and temporary-storage helpers needed by implemented stages. |
-| `cli` | Parse requests, call the library, and present results. |
+| `prepro::model` | Typed source/mini IDs, topology, grids, masks, and scientific parameters. |
+| `prepro::science` | ROI, aggregation, ownership, terrain routing, and mini statistics. |
+| `prepro::io` | Vector records, raster windows, metadata, geometry, and CRS operations. |
+| `prepro::execution` | The small set of shared resource and temporary-storage helpers needed by implemented stages. |
+| `cli` / `prepro::cli` | Dispatch modules / parse preprocessing requests and present results. |
 
 Use dense internal indices for graph operations while retaining original IDs
 and prescribed string-ID ties. Move owned typed buffers between threads;
@@ -113,11 +125,12 @@ Use the repository's existing `tests/` directory, not a new `test/` tree.
 Carinhanha fixtures and their old regression tests are removed. Large binary
 assets and the large sampled CSVs stay local and are gitignored; configuration,
 provenance, checksums, diagnostics, and benchmark records are versioned.
-The capture tool extracts raw basin-only vectors and aligned source raster
-crops, runs the reference implementation with the three configured outlets,
-and records regenerated expected products and performance. Candidate regression
-then consumes only the local capture. Baseline refresh is an explicit
-reference-capture operation, not part of candidate regression.
+The historical capture tool at the reference commit extracted raw basin-only
+vectors and aligned source raster crops, ran the reference implementation with
+the three configured outlets, and recorded expected products and performance.
+Rust candidate regression consumes only this frozen local capture. Baseline
+refresh requires an explicit historical reference checkout; the current Rust
+tools do not regenerate baselines.
 
 BHAE uses outlets `171984`, `420329`, `178658`, fields
 `cotrecho`/`nutrjus`/`nustrahler`, and has 4,071 source units and 527 minis.
@@ -128,9 +141,11 @@ outlets taking precedence in overlaps. Both cases use EPSG:4326, minimum upstrea
 mini length 6 km, DEM scale 0.01, and AGREE 80/8/4.
 
 The stage runner can exercise one stage using captured upstream products, or
-all five stages using candidate upstream products. Its current command adapter
-invokes the Python reference; adapt the command layer to the Rust CLI rather
-than treating those flags as a Rust compatibility requirement.
+all five stages using candidate upstream products. The Rust developer utility
+invokes
+`<executable prefix> prepro <stage>` using a small provisional option adapter.
+Update that adapter with stage implementations; its flags are not a Rust
+compatibility requirement.
 
 Data comparisons cover exact schemas, IDs, discrete ownership, masks, required
 metadata, and ordering where specified; compare vector geometry semantically.
@@ -140,8 +155,9 @@ Sampling rows may be matched by mini ID. CSV numeric comparisons use
 exact. Affine coordinates and embedded mini bounds allow `atol=1e-12`
 coordinate units (`rtol=0`) for source-crop rounding; this is below one
 Jacui pixel by more than eight orders of magnitude. These are initial fixture comparison tolerances, not permission to
-change scientific branch decisions. Port synthetic flow-direction fixtures too:
-the captured dataset products do not include a flow-direction raster.
+change scientific branch decisions. The language-neutral synthetic terrain
+fixtures preserve flow-direction examples too; captured dataset products do
+not include a flow-direction raster.
 
 The two benchmark records report timing observations for the current
 three-outlet basin-only cases. Treat them as descriptive measurements, not
@@ -158,10 +174,10 @@ comparisons come after the two Jacui implementations are useful.
 
 ## Implementation order
 
-1. Capture and verify both Jacui references and establish fixture-local
-   performance measurements before changing production science.
-2. Establish the Rust package, typed model, thin CLI, and the minimum I/O and
-   resource helpers needed for a working stage.
+1. Both Jacui references and fixture-local baseline measurements are captured.
+   Verify their inventory and keep them immutable during candidate work.
+2. The Rust package and CLI skeleton are established. Add typed scientific
+   models and minimum I/O/resource helpers with the first working stage.
 3. Implement mini sampling first against captured upstream files. This covers
    windowed reads, exact percentiles, HRU percentages, geodesic flooded areas,
    tie behavior, and partial nodata without a new raster writer or dissolution.
@@ -173,8 +189,8 @@ comparisons come after the two Jacui implementations are useful.
 6. Implement preparation with verified ownership/rasterization semantics.
    Exercise the full candidate pipeline on both networks once all stages exist.
 7. Replace GIS adapters natively where doing so demonstrably simplifies or
-   improves the implementation. Remove replaced Python production components
-   without introducing a migration framework.
+   improves the implementation. Python production components are already
+   removed; the historical source remains in Git for scientific reference.
 
 Each stage is ready when its scientific comparisons and focused edge cases
 pass on both applicable Jacui inputs and its performance has been recorded.

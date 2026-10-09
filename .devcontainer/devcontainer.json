@@ -1,25 +1,30 @@
 {
-  "name": "mgb-vechy",
+  "name": "mgb",
   "build": {
     "dockerfile": "Dockerfile",
     "context": ".."
   },
-  "remoteUser": "rafbar",
-  "containerUser": "rafbar",
+  "features": {
+    "ghcr.io/devcontainers/features/rust:1": {
+      "version": "stable",
+      "profile": "minimal"
+    },
+    "ghcr.io/devcontainers/features/node:2": {
+      "version": "24"
+    }
+  },
+  "remoteUser": "vscode",
+  "containerUser": "vscode",
   "workspaceFolder": "/workspace",
   "workspaceMount": "source=${localWorkspaceFolder},target=/workspace,type=bind",
-  "remoteEnv": {
-    "PATH": "/home/rafbar/.local/bin:${containerEnv:PATH}"
-  },
   "customizations": {
     "vscode": {
       "extensions": [
         "openai.chatgpt",
-        "ms-python.python",
-        "ms-toolsai.jupyter",
+        "rust-lang.rust-analyzer",
         "zknpr.sqlite-explorer"
       ]
     }
   },
-  "postCreateCommand": "python -m pip install -e ."
+  "postCreateCommand": "rustup component add rustfmt clippy && cargo check --all-targets --locked && npm install -g @openai/codex && codex plugin marketplace add DietrichGebert/ponytail && codex plugin add ponytail@ponytail"
 }

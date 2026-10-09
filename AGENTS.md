@@ -2,23 +2,27 @@
 
 ## Purpose and current capabilities
 
-MGB-Vec-Hydro is a standalone library and command-line toolset for preparing
+MGB is a standalone Rust library and command-line toolset for preparing
 hydrography and model inputs for MGB workflows. It works with generic vector
 networks using explicit segment and downstream IDs; a particular dataset's
 naming or numbering conventions do not define the product.
 
-Five capabilities are implemented: upstream region-of-interest selection,
-mini-basin aggregation, aligned raster and mini-domain preparation, HAND and
-local terrain-to-drainage products, and mini-basin attribute sampling from
-terrain and existing HRU classes. HRU class construction and final MGB
-simulation-file generation remain unimplemented.
+The package and executable are `mgb`. Preprocessing is the first public module,
+`mgb::prepro`; scientific CLI commands will start with `mgb prepro <stage>`.
+The Rust skeleton and Jacui regression tools are implemented. Five scientific
+capabilities have frozen reference contracts but await Rust implementation:
+ROI selection, mini-basin aggregation, raster preparation, terrain products,
+and mini sampling. HRU construction and final simulation-file generation remain
+future capabilities. Implement mini sampling first.
 
 ## Repository map
 
-- `src/`: library and command-line implementation.
+- `src/`: root library/CLI and preprocessing modules under `src/prepro/`.
+- `examples/jacui.rs`: developer entry point for fixture verification,
+  candidate runs, comparisons, and benchmarks.
 - `tests/`: automated checks, scientific regression references, and benchmarks.
   `tests/regression/jacui/` holds the BHAE and TDXHydro dataset references.
-- `docs/`: stable descriptions of implemented scientific behavior and data-file
+- `docs/`: stable descriptions of frozen scientific behavior and data-file
   contracts.
 - `.dev/`: development documents for work being applied. Every document here
   is intended to be removed once its implementation is complete.
@@ -33,7 +37,8 @@ simulation-file generation remain unimplemented.
 
 Read the relevant tool contract and the
 [shared data contracts](docs/shared_data_contracts.md) before changing behavior.
-Use the current scientific source and regression tests as references for
+Use captured Jacui products, synthetic terrain fixtures, and the scientific
+source/tests at reference commit `0e29ede1d2fbb729cbdffebb2eb5b13bebf231c0` for
 results, including units, topology, ownership, numerical conventions, and ties.
 Implementation structure and management machinery are free to change.
 
@@ -41,3 +46,9 @@ Keep the computational product independent of desktop GIS applications.
 Verify changes with checks appropriate to the affected behavior. Keep durable
 documentation focused on what the tools do; keep active implementation plans
 in `.dev/`. Distinguish implemented capabilities from remaining work.
+
+Run `cargo fmt --all -- --check`, `cargo clippy --all-targets --locked -- -D warnings`,
+and `cargo test --all-targets --locked`. Scientific candidate regression is opt-in;
+missing local fixtures must fail explicit runs. Keep captures and historical
+benchmarks immutable during candidate work; never write candidate outputs to
+scratch or the reference inputs/expected products.

@@ -1,5 +1,7 @@
 # Stage 2: aggregate mini-basins
 
+Frozen scientific reference for `mgb::prepro`; Rust implementation is pending.
+
 Current stage name: `aggregate`.
 
 Group normalized ROI units into mini catchments and reaches, with a complete

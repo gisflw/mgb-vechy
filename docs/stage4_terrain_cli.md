@@ -1,5 +1,7 @@
 # Stage 4: terrain products
 
+Frozen scientific reference for `mgb::prepro`; Rust implementation is pending.
+
 Current stage name: `terrain-products`.
 
 Determine drainage routes confined to each mini and derive height above
