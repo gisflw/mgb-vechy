@@ -4,14 +4,15 @@ MGB is a Rust library and command-line toolset for hydrography and model inputs.
 Its first module, `mgb::prepro`, prepares vector networks, mini-basins, terrain
 products, and model attributes using explicit segment and downstream IDs.
 
-Mini sampling is implemented in Rust, with a library API, CLI, and Jacui
-regression tools. ROI selection, aggregation, preparation, and terrain products
-remain pending; terrain is next. The five stage contracts define scientific
+Terrain products and mini sampling are implemented in Rust, with library APIs,
+CLI commands, and Jacui regression tools. ROI selection, aggregation, and
+preparation remain pending; ROI and aggregation are next. The five stage contracts define scientific
 behavior across implemented and pending stages.
 
 ## Build and check
 
-Install stable Rust and the GDAL, GEOS, and PROJ development libraries. On
+Install stable Rust and the GDAL (with ZSTD support), GEOS, and PROJ development
+libraries. On
 Debian/Ubuntu, the native packages are `build-essential`, `pkg-config`,
 `libgdal-dev`, `libgeos-dev`, and `libproj-dev`. The repository devcontainer
 provides these dependencies and Rust tooling.
@@ -27,7 +28,7 @@ cargo test --all-targets --locked
 
 The executable is `mgb`; scientific commands use `mgb prepro <stage>`.
 The public library namespace is `mgb::prepro`. There is one Cargo package;
-each scientific stage has its own module (currently `mgb::prepro::sampling`).
+each scientific stage has its own module (`mgb::prepro::sampling` and `mgb::prepro::terrain`).
 
 ## Frozen preprocessing workflow
 
@@ -36,7 +37,7 @@ each scientific stage has its own module (currently `mgb::prepro::sampling`).
 | 1. [Define ROI](docs/stage1_roi_cli.md) | Upstream outlet union and normalized hydrography. | ROI catchments and segments. |
 | 2. [Aggregate mini-basins](docs/stage2_aggregation_cli.md) | Group source units using area, length, and network rules. | Mini catchments, reaches, and source-to-mini mapping. |
 | 3. [Prepare raster data](docs/stage3_prepare_data.md) | Aligned inputs, raster ownership, and matching drainage. | Prepared DEM, optional rasters, and mini-ID grids. |
-| 4. [Terrain products](docs/stage4_terrain_cli.md) | Confined routing, HAND, and terrain-to-drainage distance. | HAND, LTND, diagnostics, and optional directions. |
+| 4. [Terrain products](docs/stage4_terrain_cli.md) | Implemented: confined routing, HAND, and terrain-to-drainage distance. | HAND, LTND, diagnostics, and optional directions. |
 | 5. [Sample mini-basins](docs/stage5_mini_sampling_cli.md) | Implemented: terrain, HRU, and flooded-area summaries. | Mini attribute CSV and missing-data reports. |
 
 Stage names remain `define-roi`, `aggregate`, `prepare`, `terrain-products`, and
@@ -56,7 +57,7 @@ cargo run --release --example jacui -- --help
 ```
 
 [Synthetic terrain fixtures](tests/regression/synthetic/README.md) preserve
-focused routing examples for the later terrain implementation. The historical
+focused routing examples exercised against the Rust terrain kernels. The historical
 reference source and tests remain available at commit
 `0e29ede1d2fbb729cbdffebb2eb5b13bebf231c0`.
 

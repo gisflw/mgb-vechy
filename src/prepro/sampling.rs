@@ -1,7 +1,7 @@
 //! Mini-basin sampling: inputs, validation, native statistics, and stage coordination.
 use super::{
     execution::{CACHE_BYTES, CacheBudget, MIB, publish},
-    io::{self, BLOCK, read, spatial_ref, windows},
+    io::{self, read, spatial_ref, windows},
     model::{ATTRIBUTES, Attributes, Grid, Window},
 };
 use anyhow::{Context, Result, bail, ensure};
@@ -397,78 +397,25 @@ fn write_sampled(directory: &Path, minis: &[Mini], results: &[MiniResult]) -> Re
 fn inspect(spec: &SamplingSpec) -> Result<(Grid, Vec<Mini>)> {
     let datasets = open_rasters(spec)?;
     let dem = &datasets[0];
-    let transform = dem.geo_transform()?;
-    ensure!(
-        transform.iter().all(|v| v.is_finite())
-            && transform[1] > 0.
-            && transform[5] < 0.
-            && transform[2] == 0.
-            && transform[4] == 0.,
-        "DEM must have a north-up, unrotated grid"
-    );
-    let (width, height) = dem.raster_size();
-    let crs = dem.spatial_ref().context("DEM must declare a CRS")?;
-    let grid = Grid {
-        transform,
-        width,
-        height,
-        wkt: crs.to_wkt()?,
-    };
+    let grid = io::canonical_grid(dem)?;
     for (i, source) in datasets.iter().enumerate() {
-        let path = spec.rasters()[i];
-        let band = source.rasterband(1)?;
-        ensure!(
-            source.raster_count() == 1
-                && source.raster_size() == (width, height)
-                && source.geo_transform()? == transform
-                && source.spatial_ref()? == crs,
-            "Raster grid/CRS mismatch: {}",
-            path.display()
-        );
-        ensure!(
-            source.metadata_item("LAYOUT", "IMAGE_STRUCTURE").as_deref() == Some("COG")
-                && band.block_size() == (BLOCK, BLOCK),
-            "Raster must be a COG with 512-pixel tiles: {}",
-            path.display()
-        );
-        let mask = band.mask_flags()?;
-        ensure!(
-            mask.is_per_dataset()
-                && !mask.is_nodata()
-                && !mask.is_alpha()
-                && !mask.is_all_valid()
-                && band.no_data_value().is_none()
-                && !Path::new(&format!("{}.msk", path.display())).exists(),
-            "Raster must have an internal per-dataset mask and no nodata sentinel: {}",
-            path.display()
-        );
-        let expected = match i {
-            0 | 3 | 4 => "Float32",
-            _ => "Int32",
-        };
-        ensure!(
-            band.band_type().name() == expected,
-            "Raster dtype must be {expected}: {}",
-            path.display()
-        );
-        if matches!(i, 0 | 3 | 4) {
-            ensure!(
-                source.metadata_item("units", "").as_deref() == Some("m") && band.unit() == "m",
-                "Raster must declare metre units: {}",
-                path.display()
-            );
-        }
+        io::validate_raster(
+            source,
+            spec.rasters()[i],
+            &grid,
+            if matches!(i, 0 | 3 | 4) {
+                "Float32"
+            } else {
+                "Int32"
+            },
+            matches!(i, 0 | 3 | 4),
+        )?;
     }
     ensure!(
         datasets[4].metadata_item("distance_method", "").as_deref() == Some("geodesic"),
         "LTND must declare distance_method=geodesic"
     );
-    let raw = datasets[1]
-        .metadata_item("mini_index", "")
-        .context("Catchment grid lacks mini_index")?;
-    let index: Vec<(i64, f64, f64, f64, f64)> =
-        serde_json::from_str(&raw).context("Invalid mini_index")?;
-    ensure!(!index.is_empty(), "mini_index is empty");
+    let index = io::mini_windows(&datasets[1], &grid)?;
     let catchments = read_vectors(&spec.mini_catchments, &grid, false)?;
     let segments = read_vectors(&spec.mini_segments, &grid, true)?;
     ensure!(
@@ -476,32 +423,7 @@ fn inspect(spec: &SamplingSpec) -> Result<(Grid, Vec<Mini>)> {
         "Vector IDs and mini_index differ"
     );
     let mut minis = Vec::with_capacity(index.len());
-    let mut previous = 0;
-    for (id, minx, miny, maxx, maxy) in index {
-        ensure!(
-            id > previous && id <= i32::MAX as i64,
-            "mini_index IDs must be positive, unique, ascending int32 IDs"
-        );
-        previous = id;
-        ensure!(
-            [minx, miny, maxx, maxy].iter().all(|v| v.is_finite()) && minx < maxx && miny < maxy,
-            "Mini {id} has invalid bounds"
-        );
-        let pixel = |coordinate: f64, origin: f64, scale: f64, limit: usize| -> Result<usize> {
-            let offset = (coordinate - origin) / scale;
-            let rounded = offset.round();
-            ensure!(
-                rounded >= 0.
-                    && rounded <= limit as f64
-                    && (coordinate - (origin + rounded * scale)).abs() <= 1e-12,
-                "Mini {id} bounds are outside the grid or not pixel edges"
-            );
-            Ok(rounded as usize)
-        };
-        let x = pixel(minx, transform[0], transform[1], width)?;
-        let right = pixel(maxx, transform[0], transform[1], width)?;
-        let y = pixel(maxy, transform[3], transform[5], height)?;
-        let bottom = pixel(miny, transform[3], transform[5], height)?;
+    for (id, window) in index {
         let catchment = catchments
             .get(&id)
             .with_context(|| format!("Missing catchment mini {id}"))?;
@@ -518,12 +440,7 @@ fn inspect(spec: &SamplingSpec) -> Result<(Grid, Vec<Mini>)> {
             longitude: segment.1[0],
             latitude: segment.1[1],
             reach_length: segment.0.metrics[0],
-            window: Window {
-                x,
-                y,
-                width: right - x,
-                height: bottom - y,
-            },
+            window,
             owned_cells: 0,
         });
     }

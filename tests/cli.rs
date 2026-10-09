@@ -6,6 +6,7 @@ fn root_and_prepro_help_and_version() {
         vec!["--help"],
         vec!["prepro", "--help"],
         vec!["prepro", "sample-minis", "--help"],
+        vec!["prepro", "terrain-products", "--help"],
         vec!["--version"],
     ] {
         let output = Command::new(env!("CARGO_BIN_EXE_mgb"))
@@ -29,4 +30,24 @@ fn sampling_requires_explicit_inputs() {
         .unwrap();
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("--mini-catchments"));
+}
+
+#[test]
+fn terrain_requires_explicit_inputs_and_rejects_invalid_flags() {
+    for args in [
+        vec!["prepro", "terrain-products"],
+        vec![
+            "prepro",
+            "terrain-products",
+            "--direction-source",
+            "invalid",
+        ],
+        vec!["prepro", "terrain-products", "--agree-buffer=-1"],
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_mgb"))
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+    }
 }

@@ -17,7 +17,7 @@ impl CacheBudget {
     pub(crate) fn new() -> Result<Self> {
         let lock = CACHE_LOCK
             .lock()
-            .map_err(|_| anyhow::anyhow!("Sampling cache lock poisoned"))?;
+            .map_err(|_| anyhow::anyhow!("Preprocessing cache lock poisoned"))?;
         // GDAL's block cache is process-wide; serialize our changes and restore it on exit.
         let previous = unsafe { gdal_sys::GDALGetCacheMax64() };
         unsafe { gdal_sys::GDALSetCacheMax64(CACHE_BYTES as i64) };
@@ -40,7 +40,7 @@ pub(crate) fn publish(staging: &Path, output: &Path, names: &[String]) -> Result
         let target = output.join(name);
         if let Err(error) = fs::hard_link(staging.join(name), &target) {
             for path in published {
-                fs::remove_file(path).context("Rollback newly published sampling file")?;
+                fs::remove_file(path).context("Rollback newly published preprocessing file")?;
             }
             return Err(error).with_context(|| {
                 format!(

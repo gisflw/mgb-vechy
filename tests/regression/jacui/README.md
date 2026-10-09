@@ -5,7 +5,8 @@ each with three ordered outlets. Large assets remain local and gitignored;
 the tracked configuration, inventory, audit provenance, and historical timing
 records stay unchanged during candidate work except for explicit corrections.
 
-The Rust package implements mini sampling and provides regression tooling.
+The Rust package implements terrain products and mini sampling, and provides
+regression tooling.
 The developer utility is separate from the production `mgb prepro` CLI:
 
 ```bash
@@ -66,13 +67,13 @@ cargo run --release --example jacui -- compare --network bhae \
   --stage sample-minis --output-dir tests/regression/jacui/runs/bhae-sampling
 ```
 
-Sampling works against the current Rust executable. `--stage all` (the default)
-requires the four remaining stages and uses candidate upstream products. Run
+Terrain and sampling work against the current Rust executable. `--stage all`
+(the default) requires the three remaining stages and uses candidate upstream products. Run
 sampling for both networks for scientific validation.
 Candidate commands take the form `<executable prefix> prepro <stage> ...`.
 Repeat `--command-arg` to supply prefix arguments without shell evaluation,
 for example `--command cargo --command-arg=run --command-arg=--release
---command-arg=--`. The sampling option adapter matches the Rust CLI; adapters for pending stages
+--command-arg=--`. The terrain and sampling option adapters match the Rust CLI; adapters for pending stages
 remain provisional.
 
 `run` accepts `--workers` and `--memory-limit-mb`, defaulting to 4 and 4096.
@@ -99,13 +100,16 @@ cargo run --release --example jacui -- compare --network tdxhydro \
   --output-dir tests/regression/jacui/expected/tdxhydro
 ```
 
-Scientific candidate regression is an ignored Rust integration test. Enable sampling regression
-explicitly:
+Terrain runs use the same commands with `--stage terrain-products`. Scientific
+candidate regression is an ignored Rust integration test. Enable terrain
+regression explicitly:
 
 ```bash
-MGB_REGRESSION_COMMAND=target/release/mgb JACUI_STAGE=sample-minis \
+MGB_REGRESSION_COMMAND=target/release/mgb JACUI_STAGE=terrain-products \
   cargo test --test regression jacui_candidate_scientific_regression -- --ignored
 ```
+
+Use `JACUI_STAGE=sample-minis` to test sampling instead.
 
 `MGB_REGRESSION_COMMAND` is an executable path, not shell text; use the developer
 utility for executable-prefix arguments. Explicit runs fail on missing fixtures.

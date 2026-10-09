@@ -16,7 +16,13 @@ GDAL windowed I/O/CRS transforms, GEOS representative points, and native Rust
 statistics and ellipsoidal cell areas. It passes both Jacui sampling comparisons.
 Both captures include the explicitly authorized integer-`sub` schema correction
 recorded in their inventory. [Sampling validation and measurements](mini-sampling-validation.md)
-record the current results. Terrain is the next stage.
+record the sampling results. Terrain is implemented in `prepro::terrain`, with
+DEM/D8 routing, internally masked COGs, and bounded complete-mini workers.
+Admission uses each mini window rather than reserving the largest window for
+every worker. Geographic LTND reuses row edge lengths; staging remains sparse
+and uncompressed until one final masked COG conversion.
+[Terrain validation and measurements](terrain-validation.md) record its checks.
+ROI and aggregation are the next stages.
 
 ## What stays fixed
 
@@ -53,7 +59,7 @@ not a crate per stage or a general workflow framework:
 | `prepro::execution` | Shared GDAL cache budget and safe temporary-output publication. |
 | `cli` / `prepro::cli` | Dispatch modules / parse preprocessing requests and present results. |
 
-Each scientific stage gets one file and module (`sampling.rs` now; terrain,
+Each scientific stage gets one file and module (`sampling.rs` and `terrain.rs` now;
 ROI, aggregation, and preparation when implemented), owning its science,
 validation, parameters, and orchestration. Keep shared GIS and resource helpers
 in `io` and `execution`.
@@ -189,8 +195,8 @@ comparisons come after the two Jacui implementations are useful.
 3. Mini sampling is implemented against captured upstream files, covering
    windowed reads, exact percentiles, HRU percentages, geodesic flooded areas,
    ties, partial nodata, deterministic workers, and oversized-mini rejection.
-4. Implement terrain against the prepared Jacui inputs and synthetic routing
-   fixtures. Preserve directions, confinement, raw-DEM HAND, and geodesic LTND.
+4. Terrain is implemented against prepared Jacui inputs and synthetic routing
+   fixtures, preserving directions, confinement, raw-DEM HAND, and geodesic LTND.
 5. Implement ROI and aggregation with typed topology and geometry adapters.
    Preserve outlet precedence, evolving merges, representative IDs, and dense
    processing order. Use basin-only inputs for the routine performance loop.
@@ -200,8 +206,18 @@ comparisons come after the two Jacui implementations are useful.
    improves the implementation. Python production components are already
    removed; the historical source remains in Git for scientific reference.
 
+Performance is an acceptance requirement for this architecture migration.
+The rust implementation must not increase runtime by any circumstance.
+
+Historical records remain immutable; their single observations are
+provisional local targets, not portable CI thresholds. Record actual worker
+concurrency as well as requested workers and RSS. If a controlled historical
+rerun changes the reference, document the evidence before revising the target.
+
 Each stage is ready when its scientific comparisons and focused edge cases
-pass on both applicable Jacui inputs and its performance has been recorded.
+pass on both applicable Jacui inputs and its measured performance meets the
+migration requirement.
+
 The completed product is a native library/CLI with simpler execution and
 preserved scientific products. The fixture suite survives implementation;
 this temporary architecture document is removed once applied.

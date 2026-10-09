@@ -1,6 +1,6 @@
 # Stage 4: terrain products
 
-Frozen scientific reference for `mgb::prepro`; Rust implementation is pending.
+Implemented by `mgb::prepro::terrain` and `mgb prepro terrain-products`.
 
 Current stage name: `terrain-products`.
 
@@ -25,6 +25,31 @@ See the [shared data contracts](shared_data_contracts.md).
 AGREE depths must be finite and non-negative; the buffer must be a
 non-negative integer. Parameters apply in DEM mode and are not automatically
 rescaled by the preparation conversion factor.
+
+## Usage
+
+```bash
+mgb prepro terrain-products --dem prepared/dem.tif \
+  --grid-catchments prepared/grid_catchments.tif \
+  --grid-segments prepared/grid_segments.tif --output-dir terrain
+```
+
+Use `--direction-source d8 --d8 prepared/d8.tif` for explicit directions and
+`--write-flow-direction` to publish the selected direction raster. DEM mode
+accepts `--agree-sharp`, `--agree-smooth`, and `--agree-buffer`.
+
+The library exposes `TerrainSpec`, `DirectionSource`, `TerrainReport`, and
+`create_terrain_dataset(&TerrainSpec)` through `mgb::prepro`.
+`--workers` defaults to 4; `--memory-limit-mb` defaults to 4096. Actual
+concurrency may be reduced by the allocation budget. Complete mini windows,
+including routing graphs, must fit memory; oversized minis fail with a required
+budget estimate. This is an application allocation budget, not a hard RSS cap.
+
+COGs use lossless ZSTD compression through the installed GDAL driver.
+
+Existing terrain products are never overwritten. Other stage files may share
+the output directory. Products are staged and published after processing and
+COG validation; failures roll back newly published files.
 
 ## Scientific behavior
 
