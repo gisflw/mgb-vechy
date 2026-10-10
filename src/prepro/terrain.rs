@@ -1395,7 +1395,8 @@ pub fn create_terrain_dataset_with_progress(
         if let Some(ds) = ds.as_mut() {
             attach_mask(ds, &validity, &grid)?;
             ds.flush_cache()?;
-            io::finish_cog(ds, &staging.path().join(name), workers, None)?;
+            let resampling = (name != "flow_direction.tif").then_some("AVERAGE");
+            io::finish_cog(ds, &staging.path().join(name), workers, resampling)?;
             let output = Dataset::open(staging.path().join(name))?;
             io::validate_raster(
                 &output,

@@ -193,6 +193,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     let progress = |event| display.update(event);
     match args.command {
         Command::DefineRoi(mut args) => {
+            display.step("define-roi");
             args.overwrite = replacement(
                 &args.output_dir,
                 &[
@@ -230,6 +231,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
             Ok(())
         }
         Command::Aggregate(mut args) => {
+            display.step("aggregate");
             args.overwrite = replacement(
                 &args.output_dir,
                 &[
@@ -266,6 +268,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
             Ok(())
         }
         Command::Prepare(mut args) => {
+            display.step("prepare");
             let mut names: Vec<String> = [
                 "dem.tif",
                 "grid_catchments.tif",
@@ -333,6 +336,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
             Ok(())
         }
         Command::TerrainProducts(mut args) => {
+            display.step("terrain-products");
             args.overwrite = replacement(
                 &args.output_dir,
                 &[
@@ -381,6 +385,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
             Ok(())
         }
         Command::SampleMinis(mut args) => {
+            display.step("sample-minis");
             let names: Vec<String> = [
                 "sampled_minis.csv".into(),
                 "manifest-sample-minis.json".into(),
@@ -557,6 +562,10 @@ impl Display {
         {
             eprint!("\r\x1b[2K{}\n", progress_line(&event, &updated));
         }
+    }
+    fn step(&self, name: &str) {
+        self.finish_progress();
+        eprintln!("===\nRunning {name}");
     }
     fn elapsed(&self, timings: &super::StageTimings) {
         self.finish_progress();

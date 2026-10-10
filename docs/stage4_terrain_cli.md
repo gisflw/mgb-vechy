@@ -121,7 +121,9 @@ connected to matching drainage. Output masks retain the resulting validity.
 | `flow_direction.tif` | Optional canonical-grid `uint8` selected directions: drainage 0, directions 1–8. |
 | `manifest-terrain-products.json` | Checksummed inputs and outputs, parameters, and runtime. |
 
-Rasters are internally masked COGs. Dataset metadata includes `role`,
+Rasters are internally masked COGs. HAND and LTND overviews use average
+resampling to reduce visible nodata holes when zoomed out; full-resolution
+values and validity masks are unchanged. Dataset metadata includes `role`,
 `routing_source`, and `ownership`, whose value is
 `strict aggregated mini catchments; no buffer`. Roles are
 `height above matching drainage`, `along-route distance to matching drainage`,
