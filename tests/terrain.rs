@@ -43,6 +43,7 @@ impl Fixture {
             agree_buffer: 4,
             workers: 4,
             memory_limit_mb: 256,
+            routing_bytes_per_cell: 128,
         };
         raster(&spec.dem, &DEM, &MASK, true, None)?;
         raster(&spec.grid_segments, &SEGMENTS, &MASK, false, None)?;
@@ -129,6 +130,7 @@ fn products_preserve_ownership_masks_metadata_and_worker_determinism() -> Result
         if mode == DirectionSource::D8 {
             fixture.d8(&D8, &MASK)?;
         }
+        fixture.spec.routing_bytes_per_cell = 128;
         fixture.spec.output_dir = fixture.spec.dem.with_file_name(format!("{mode:?}-one"));
         fixture.spec.workers = 1;
         let first = create_terrain_dataset(&fixture.spec)?;
@@ -153,6 +155,7 @@ fn products_preserve_ownership_masks_metadata_and_worker_determinism() -> Result
         );
         fixture.spec.output_dir = fixture.spec.dem.with_file_name(format!("{mode:?}-many"));
         fixture.spec.workers = 4;
+        fixture.spec.routing_bytes_per_cell = 256;
         let second = create_terrain_dataset(&fixture.spec)?;
         assert_eq!(second.workers_used, 2);
         for (left, right) in [
@@ -217,8 +220,12 @@ fn products_preserve_ownership_masks_metadata_and_worker_determinism() -> Result
         let manifest: serde_json::Value = serde_json::from_reader(fs::File::open(first.manifest)?)?;
         assert_eq!(manifest["step"], "terrain-products");
         assert_eq!(manifest["parameters"]["workers_used"], first.workers_used);
+        assert_eq!(manifest["parameters"]["routing_bytes_per_cell"], 128);
         assert!(manifest["elapsed_seconds"].as_f64().unwrap().is_finite());
         assert!(Path::new(manifest["parameters"]["dem"].as_str().unwrap()).is_absolute());
+        let second_manifest: serde_json::Value =
+            serde_json::from_reader(fs::File::open(second.manifest)?)?;
+        assert_eq!(second_manifest["parameters"]["routing_bytes_per_cell"], 256);
     }
     Ok(())
 }
@@ -335,7 +342,16 @@ fn rejects_invalid_inputs_before_publishing() -> Result<()> {
 #[test]
 fn d8_errors_and_memory_admission_leave_no_products() -> Result<()> {
     for kind in [
-        "cycle", "outside", "terminal", "code", "nodata", "missing", "budget", "workers", "sharp",
+        "cycle",
+        "outside",
+        "terminal",
+        "code",
+        "nodata",
+        "missing",
+        "budget",
+        "workers",
+        "routing-bytes",
+        "sharp",
     ] {
         let mut f = Fixture::new()?;
         let mut codes = D8;
@@ -356,6 +372,7 @@ fn d8_errors_and_memory_admission_leave_no_products() -> Result<()> {
             "missing" => f.spec.d8 = None,
             "budget" => f.spec.memory_limit_mb = 1,
             "workers" => f.spec.workers = 0,
+            "routing-bytes" => f.spec.routing_bytes_per_cell = 0,
             "sharp" => f.spec.agree_sharp = f64::NAN,
             _ => {}
         }
@@ -451,7 +468,7 @@ fn oversized_complete_mini_fails_with_required_budget() -> Result<()> {
     capture(&f.spec.dem, &vec![10f32; 2048 * 1024], true, false)?;
     capture(&f.spec.grid_catchments, &owners, false, true)?;
     capture(&f.spec.grid_segments, &owners, false, false)?;
-    f.spec.memory_limit_mb = 256;
+    f.spec.memory_limit_mb = 128;
     let error = create_terrain_dataset(&f.spec).unwrap_err().to_string();
     assert!(error.contains("Mini 1 requires"), "{error}");
     assert!(error.contains("increase --memory-limit-mb"), "{error}");

@@ -40,6 +40,8 @@ pub struct TerrainSpec {
     pub workers: usize,
     /// Application allocation budget in MiB, not a hard RSS ceiling.
     pub memory_limit_mb: usize,
+    /// Reserved routing bytes per cell in a mini's bounding window.
+    pub routing_bytes_per_cell: usize,
     pub overwrite: bool,
     pub io_slots: usize,
 }
@@ -58,7 +60,7 @@ pub struct TerrainReport {
     pub undrained_count: usize,
 }
 
-const ROUTING_BYTES_PER_CELL: usize = 2048;
+pub(super) const DEFAULT_ROUTING_BYTES_PER_CELL: usize = 128;
 const WORKER_BYTES: usize = 32 * MIB;
 
 const DR: [isize; 8] = [-1, -1, 0, 1, 1, 1, 0, -1];
@@ -706,10 +708,13 @@ fn products(
     Ok((hand, ltnd))
 }
 
-fn routing_reservation(window: Window) -> Result<usize> {
-    let cells = window.width.saturating_mul(window.height);
+fn routing_reservation(window: Window, bytes_per_cell: usize) -> Result<usize> {
+    let cells = window
+        .width
+        .checked_mul(window.height)
+        .context("Mini cell count overflow")?;
     cells
-        .checked_mul(ROUTING_BYTES_PER_CELL)
+        .checked_mul(bytes_per_cell)
         .and_then(|bytes| bytes.checked_add(WORKER_BYTES))
         .context("Mini working-memory estimate overflow")
 }
@@ -771,6 +776,19 @@ struct Mini {
     id: i64,
     window: Window,
     owned_cells: usize,
+}
+
+fn mini_spatial_order(minis: &[Mini]) -> Vec<usize> {
+    let mut order: Vec<_> = (0..minis.len()).collect();
+    order.sort_unstable_by_key(|&ordinal| {
+        let mini = minis[ordinal];
+        (
+            mini.window.y / io::BLOCK,
+            mini.window.x / io::BLOCK,
+            mini.id,
+        )
+    });
+    order
 }
 
 fn inspect(spec: &TerrainSpec, datasets: &[Dataset]) -> Result<(Grid, Vec<Mini>)> {
@@ -1080,6 +1098,10 @@ pub fn create_terrain_dataset_with_progress(
         "Workers and memory limit must be positive"
     );
     ensure!(
+        spec.routing_bytes_per_cell > 0,
+        "--routing-bytes-per-cell must be positive"
+    );
+    ensure!(
         spec.agree_sharp.is_finite()
             && spec.agree_sharp >= 0.
             && spec.agree_smooth.is_finite()
@@ -1124,7 +1146,7 @@ pub fn create_terrain_dataset_with_progress(
     let largest = minis
         .iter()
         .try_fold((0, 0), |largest, mini| -> Result<_> {
-            let bytes = routing_reservation(mini.window)?;
+            let bytes = routing_reservation(mini.window, spec.routing_bytes_per_cell)?;
             Ok(if bytes > largest.0 {
                 (bytes, mini.id)
             } else {
@@ -1179,8 +1201,9 @@ pub fn create_terrain_dataset_with_progress(
     };
     let mut validity = staging_raster::<u8>(staging.path(), "validity.tif", &grid)?;
     let mut reports = Vec::with_capacity(minis.len());
+    // Nearby windows reuse GDAL cache tiles during the shared-raster patch writes.
     let state = Mutex::new(Admission {
-        pending: (0..minis.len()).collect(),
+        pending: mini_spatial_order(&minis).into(),
         bytes: 0,
         stopped: false,
         active: 0,
@@ -1222,13 +1245,16 @@ pub fn create_terrain_dataset_with_progress(
                             }
                             let fitting = admission.pending.iter().position(|&ordinal| {
                                 let mini = minis[ordinal];
-                                let bytes = routing_reservation(mini.window).unwrap_or(usize::MAX);
+                                let bytes =
+                                    routing_reservation(mini.window, spec.routing_bytes_per_cell)
+                                        .unwrap_or(usize::MAX);
                                 bytes <= available - admission.bytes
                             });
                             if let Some(position) = fitting {
                                 let ordinal = admission.pending.remove(position).unwrap();
                                 let mini = minis[ordinal];
-                                let bytes = routing_reservation(mini.window)?;
+                                let bytes =
+                                    routing_reservation(mini.window, spec.routing_bytes_per_cell)?;
                                 admission.bytes += bytes;
                                 admission.active += 1;
                                 admission.peak = admission.peak.max(admission.active.min(workers));
@@ -1236,7 +1262,8 @@ pub fn create_terrain_dataset_with_progress(
                             }
                             if admission.active == 0 {
                                 let mini = minis[admission.pending[0]];
-                                let required = routing_reservation(mini.window)?;
+                                let required =
+                                    routing_reservation(mini.window, spec.routing_bytes_per_cell)?;
                                 anyhow::bail!(
                                     "Mini {} requires about {} MiB; increase --memory-limit-mb",
                                     mini.id,
@@ -1424,16 +1451,61 @@ mod tests {
             width: 1024,
             height: 1024,
         };
-        let bytes = routing_reservation(window)?;
-        assert_eq!(bytes, 1024 * 1024 * ROUTING_BYTES_PER_CELL + WORKER_BYTES);
-        assert!(bytes > 2 * 1024 * MIB);
+        let bytes = routing_reservation(window, DEFAULT_ROUTING_BYTES_PER_CELL)?;
+        assert_eq!(
+            bytes,
+            1024 * 1024 * DEFAULT_ROUTING_BYTES_PER_CELL + WORKER_BYTES
+        );
+        assert_eq!(
+            routing_reservation(window, 256)?,
+            1024 * 1024 * 256 + WORKER_BYTES
+        );
+        assert!(bytes > 128 * MIB);
         let enormous = Window {
             width: usize::MAX,
             height: usize::MAX,
             ..window
         };
-        assert!(routing_reservation(enormous).is_err());
+        assert!(routing_reservation(enormous, DEFAULT_ROUTING_BYTES_PER_CELL).is_err());
         Ok(())
+    }
+
+    #[test]
+    fn mini_jobs_are_ordered_by_top_left_raster_tile() {
+        let minis = [
+            Mini {
+                id: 2,
+                window: Window {
+                    x: 900,
+                    y: 600,
+                    width: 10,
+                    height: 10,
+                },
+                owned_cells: 1,
+            },
+            Mini {
+                id: 3,
+                window: Window {
+                    x: 600,
+                    y: 600,
+                    width: 10,
+                    height: 10,
+                },
+                owned_cells: 1,
+            },
+            Mini {
+                id: 1,
+                window: Window {
+                    x: 900,
+                    y: 100,
+                    width: 10,
+                    height: 10,
+                },
+                owned_cells: 1,
+            },
+        ];
+
+        assert_eq!(mini_spatial_order(&minis), [2, 0, 1]);
     }
 
     use serde_json::Value;
@@ -1493,6 +1565,7 @@ mod tests {
             agree_buffer: 4,
             workers: 1,
             memory_limit_mb: 256,
+            routing_bytes_per_cell: DEFAULT_ROUTING_BYTES_PER_CELL,
         };
         let mut ds = output_raster::<f32>(
             directory.path(),

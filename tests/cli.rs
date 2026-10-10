@@ -100,6 +100,18 @@ fn terrain_requires_explicit_inputs_and_rejects_invalid_flags() {
 }
 
 #[test]
+fn terrain_help_exposes_routing_memory_estimate() {
+    let output = Command::new(env!("CARGO_BIN_EXE_mgb"))
+        .args(["prepro", "terrain-products", "--help"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let help = String::from_utf8(output.stdout).unwrap();
+    assert!(help.contains("--routing-bytes-per-cell"));
+    assert!(help.contains("[default: 128]"));
+}
+
+#[test]
 fn preparation_requires_inputs_and_valid_paired_options() {
     for args in [
         vec!["prepro", "prepare"],

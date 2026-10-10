@@ -301,6 +301,7 @@ fn stream_overlay_halo_tight_bounds_and_disconnected_terrain() -> Result<()> {
         agree_buffer: 4,
         workers: 2,
         memory_limit_mb: 256,
+        routing_bytes_per_cell: 128,
     })?;
     assert!(terrain.undrained_count > 0);
     assert_eq!(mask(&terrain.hand)?[10 + 7], 0);

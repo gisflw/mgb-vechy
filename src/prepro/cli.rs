@@ -177,6 +177,11 @@ struct TerrainArgs {
     workers: usize,
     #[arg(long, default_value_t = 4096)]
     memory_limit_mb: usize,
+    #[arg(
+        long,
+        default_value_t = super::terrain::DEFAULT_ROUTING_BYTES_PER_CELL
+    )]
+    routing_bytes_per_cell: usize,
     #[arg(long)]
     overwrite: bool,
     #[arg(long, default_value_t = 2)]
@@ -353,6 +358,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
                     agree_buffer: args.agree_buffer,
                     workers: args.workers,
                     memory_limit_mb: args.memory_limit_mb,
+                    routing_bytes_per_cell: args.routing_bytes_per_cell,
                 },
                 &progress,
             )?;

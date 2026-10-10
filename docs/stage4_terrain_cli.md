@@ -21,6 +21,7 @@ See the [shared data contracts](shared_data_contracts.md).
 | AGREE sharp incision | Additional drainage-cell lowering, default `80.0` m. |
 | AGREE smooth depth | Ramp depth per pixel toward drainage, default `8.0` m. |
 | AGREE buffer | Conditioning radius, default `4` pixels. |
+| `--routing-bytes-per-cell` | Per bounding-box-cell routing reservation, default `128` bytes. |
 
 AGREE depths must be finite and non-negative; the buffer must be a
 non-negative integer. Parameters apply in DEM mode and are not automatically
@@ -46,8 +47,16 @@ memory. A mini that cannot fit the managed working budget fails with its
 estimated requirement. Dataset size does not require loading every mini at once;
 raster inputs and completed output patches are handled with bounded buffers.
 Routing always covers each complete mini, so output window edges never become
-routing boundaries. GDAL/GEOS allocations and process overhead are outside the
-managed working-memory estimate.
+routing boundaries. `--routing-bytes-per-cell` adjusts the per-cell reservation
+used for each mini's bounding rectangle; each worker also reserves a fixed 32
+MiB. The reservation is an admission estimate, not a hard RSS limit, and must
+include headroom appropriate for graph growth and allocator use. GDAL/GEOS
+allocations and process overhead are outside the managed working-memory
+estimate.
+
+Mini jobs are admitted in top-left 512-pixel tile order to improve cache reuse
+when updating shared output rasters. The undrained report remains sorted by mini
+ID.
 
 GDAL uses a 16 MiB block cache during inspection, then targets one quarter of
 the budget (16 MiB–8 GiB). The allocation is capped to leave coordinator buffers
