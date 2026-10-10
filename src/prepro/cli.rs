@@ -197,9 +197,9 @@ pub fn run(args: Args) -> anyhow::Result<()> {
             args.overwrite = replacement(
                 &args.output_dir,
                 &[
+                    "manifest-define-roi.json".into(),
                     "roi_catchments.fgb".into(),
                     "roi_segments.fgb".into(),
-                    "manifest-define-roi.json".into(),
                 ],
                 args.overwrite,
             )?;
@@ -227,7 +227,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
             )?;
             display.elapsed(&report.timings);
             println!("ROI selection complete.");
-            outputs(&[report.catchments, report.segments, report.manifest]);
+            outputs(&[report.manifest, report.catchments, report.segments]);
             Ok(())
         }
         Command::Aggregate(mut args) => {
@@ -235,10 +235,10 @@ pub fn run(args: Args) -> anyhow::Result<()> {
             args.overwrite = replacement(
                 &args.output_dir,
                 &[
+                    "manifest-aggregate.json".into(),
                     "mini_catchments.fgb".into(),
                     "mini_segments.fgb".into(),
                     "source_to_mini.csv".into(),
-                    "manifest-aggregate.json".into(),
                 ],
                 args.overwrite,
             )?;
@@ -260,21 +260,21 @@ pub fn run(args: Args) -> anyhow::Result<()> {
             display.elapsed(&report.timings);
             println!("Aggregation complete.");
             outputs(&[
+                report.manifest,
                 report.catchments,
                 report.segments,
                 report.source_to_mini,
-                report.manifest,
             ]);
             Ok(())
         }
         Command::Prepare(mut args) => {
             display.step("prepare");
             let mut names: Vec<String> = [
+                "manifest-prepare.json",
                 "dem.tif",
                 "grid_catchments.tif",
                 "grid_segments.tif",
                 "d8.tif",
-                "manifest-prepare.json",
             ]
             .into_iter()
             .map(str::to_owned)
@@ -287,7 +287,9 @@ pub fn run(args: Args) -> anyhow::Result<()> {
                     .map(|pair| format!("{}.tif", pair[0])),
             )
             .collect();
-            names.extend(super::execution::preparation_optional(&args.output_dir)?);
+            names.extend(super::execution::preparation_optional(
+                &std::path::absolute(&args.output_dir)?,
+            )?);
             args.overwrite = replacement(&args.output_dir, &names, args.overwrite)?;
             let mut rasters = Vec::new();
             for (values, kind) in [
@@ -323,10 +325,10 @@ pub fn run(args: Args) -> anyhow::Result<()> {
             println!("Raster preparation complete.");
             outputs(
                 &[
+                    report.manifest,
                     report.dem,
                     report.grid_catchments,
                     report.grid_segments,
-                    report.manifest,
                 ]
                 .into_iter()
                 .chain(report.d8)
@@ -340,11 +342,11 @@ pub fn run(args: Args) -> anyhow::Result<()> {
             args.overwrite = replacement(
                 &args.output_dir,
                 &[
+                    "manifest-terrain-products.json",
                     "hand.tif",
                     "ltnd.tif",
                     "flow_direction.tif",
                     "undrained_cells.csv",
-                    "manifest-terrain-products.json",
                 ]
                 .map(str::to_owned),
                 args.overwrite,
@@ -373,10 +375,10 @@ pub fn run(args: Args) -> anyhow::Result<()> {
             println!("Terrain products complete.");
             outputs(
                 &[
+                    report.manifest,
                     report.hand,
                     report.ltnd,
                     report.undrained_cells,
-                    report.manifest,
                 ]
                 .into_iter()
                 .chain(report.flow_direction)
@@ -387,8 +389,8 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         Command::SampleMinis(mut args) => {
             display.step("sample-minis");
             let names: Vec<String> = [
-                "sampled_minis.csv".into(),
                 "manifest-sample-minis.json".into(),
+                "sampled_minis.csv".into(),
             ]
             .into_iter()
             .chain(super::sampling::NODATA_NAMES.map(|n| format!("nodata_{n}.csv")))
@@ -431,7 +433,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
             display.elapsed(&report.timings);
             println!("Sampling complete.");
             outputs(
-                &[report.sampled_minis, report.manifest]
+                &[report.manifest, report.sampled_minis]
                     .into_iter()
                     .chain(report.nodata_reports)
                     .collect::<Vec<_>>(),
@@ -468,7 +470,9 @@ fn replacement(
                     "Output path is a directory: {}",
                     path.display()
                 );
-                existing.push(path);
+                if !existing.contains(&path) {
+                    existing.push(path);
+                }
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error.into()),
@@ -483,7 +487,9 @@ fn replacement(
     );
     eprintln!("Replace existing output files?");
     for path in existing {
-        eprintln!("{}", path.display());
+        if let Some(name) = path.file_name() {
+            eprintln!("{}", name.to_string_lossy());
+        }
     }
     eprint!("[y/N] ");
     std::io::stderr().flush()?;
@@ -497,7 +503,10 @@ fn replacement(
 }
 
 struct Display {
-    state: std::sync::Arc<std::sync::Mutex<Option<(super::StageProgress, std::time::Instant)>>>,
+    state: std::sync::Arc<
+        std::sync::Mutex<Option<(String, super::StageProgress, std::time::Instant)>>,
+    >,
+    stage: std::sync::Mutex<String>,
     stop: std::sync::mpsc::Sender<()>,
     thread: Option<std::thread::JoinHandle<()>>,
     terminal: bool,
@@ -507,7 +516,7 @@ impl Display {
         use std::io::IsTerminal;
         let terminal = std::io::stderr().is_terminal();
         let state = std::sync::Arc::new(std::sync::Mutex::new(
-            None::<(super::StageProgress, std::time::Instant)>,
+            None::<(String, super::StageProgress, std::time::Instant)>,
         ));
         let (stop, receiver) = std::sync::mpsc::channel();
         let shared = state.clone();
@@ -519,9 +528,12 @@ impl Display {
                     .is_err()
                 {
                     if let Ok(state) = shared.lock()
-                        && let Some((event, updated)) = state.as_ref()
+                        && let Some((stage, event, updated)) = state.as_ref()
                     {
-                        eprint!("\r\x1b[2K{}", progress_line(event, updated));
+                        eprint!(
+                            "\r\x1b[2KRunning {stage}: {}",
+                            progress_line(event, updated)
+                        );
                         let _ = std::io::stderr().flush();
                     }
                 }
@@ -529,43 +541,58 @@ impl Display {
         });
         Self {
             state,
+            stage: std::sync::Mutex::new(String::new()),
             stop,
             thread,
             terminal,
         }
     }
     fn update(&self, event: super::StageProgress) {
+        let stage = self
+            .stage
+            .lock()
+            .map(|stage| stage.clone())
+            .unwrap_or_default();
         if let Ok(mut state) = self.state.lock() {
-            if let Some((previous, updated)) = state.as_ref() {
-                if previous.operation != event.operation {
-                    if self.terminal {
-                        eprint!("\r\x1b[2K{}\n", progress_line(previous, updated));
-                    } else {
-                        eprintln!("{}", event.operation);
-                    }
-                } else if previous.phase == event.phase
-                    && previous.completed > event.completed
-                    && previous.total == event.total
-                {
-                    return;
-                }
-            } else if !self.terminal {
-                eprintln!("{}", event.operation);
+            let operation_changed = state
+                .as_ref()
+                .is_none_or(|(_, previous, _)| previous.operation != event.operation);
+            if !operation_changed
+                && let Some((_, previous, _)) = state.as_ref()
+                && previous.phase == event.phase
+                && previous.completed > event.completed
+                && previous.total == event.total
+            {
+                return;
             }
-            *state = Some((event, std::time::Instant::now()));
+            let updated = std::time::Instant::now();
+            let line = format!("Running {stage}: {}", progress_line(&event, &updated));
+            *state = Some((stage, event, updated));
+            if !self.terminal && operation_changed {
+                use std::io::Write;
+                eprint!("\r{line}");
+                let _ = std::io::stderr().flush();
+            }
         }
     }
     fn finish_progress(&self) {
         if let Ok(mut state) = self.state.lock()
-            && let Some((event, updated)) = state.take()
-            && self.terminal
+            && let Some((stage, event, updated)) = state.take()
         {
-            eprint!("\r\x1b[2K{}\n", progress_line(&event, &updated));
+            if self.terminal {
+                eprint!(
+                    "\r\x1b[2KRunning {stage}: {}",
+                    progress_line(&event, &updated)
+                );
+            }
+            eprintln!();
         }
     }
     fn step(&self, name: &str) {
         self.finish_progress();
-        eprintln!("===\nRunning {name}");
+        if let Ok(mut stage) = self.stage.lock() {
+            *stage = name.to_owned();
+        }
     }
     fn elapsed(&self, timings: &super::StageTimings) {
         self.finish_progress();
@@ -601,12 +628,16 @@ impl Drop for Display {
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
-        if self.terminal {
-            eprintln!();
-        }
         if let Ok(state) = self.state.lock()
-            && let Some((event, updated)) = state.as_ref()
+            && let Some((stage, event, updated)) = state.as_ref()
         {
+            if self.terminal {
+                eprint!(
+                    "\r\x1b[2KRunning {stage}: {}",
+                    progress_line(event, updated)
+                );
+            }
+            eprintln!();
             let mut timings = event.timings.clone();
             let seconds = updated.elapsed().as_secs_f64();
             match event.phase {
