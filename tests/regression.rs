@@ -56,6 +56,7 @@ fn options(output: PathBuf) -> RunOptions {
         command_arg: vec![],
         workers: 4,
         memory_limit_mb: 4096,
+        io_slots: None,
     }
 }
 
@@ -147,6 +148,15 @@ fn commands_use_prepro_and_correct_upstream_and_outlet_order() {
     ] {
         assert!(aggregate.args.iter().any(|arg| arg == flag));
     }
+    assert!(!aggregate.args.iter().any(|arg| arg == "--io-slots"));
+    opts.io_slots = Some(12);
+    let aggregate = invocation(temp.path(), &opts, Stage::Aggregate).unwrap();
+    assert!(
+        aggregate
+            .args
+            .windows(2)
+            .any(|args| { args[0] == "--io-slots" && args[1] == "12" })
+    );
     let prepare = invocation(temp.path(), &opts, Stage::Prepare).unwrap();
     let flags: Vec<_> = prepare
         .args
@@ -241,6 +251,7 @@ for file in $files; do : > "$out/$file"; done
     let report = run(temp.path(), &opts).unwrap();
     let measurements = report["measurements"].as_array().unwrap();
     assert_eq!(measurements.len(), 5);
+    assert!(report["pipeline_wall_seconds"].as_f64().unwrap() >= 0.);
     for (measurement, stage) in measurements.iter().zip(Stage::All.stages()) {
         assert_eq!(measurement["stage"], stage.name());
         assert_eq!(measurement["exit_code"], 0);
@@ -276,6 +287,7 @@ fn failures_keep_measurements_and_missing_inputs_fail_before_outputs() {
         serde_json::from_slice(&fs::read(opts.output_dir.join("benchmark.json")).unwrap()).unwrap();
     assert_eq!(report["measurements"].as_array().unwrap().len(), 1);
     assert_eq!(report["measurements"][0]["exit_code"], 1);
+    assert!(report["pipeline_wall_seconds"].as_f64().unwrap() >= 0.);
     opts.output_dir = temp.path().join("runs/missing-input");
     fs::remove_file(temp.path().join("input/bhae/catchments.fgb")).unwrap();
     assert!(

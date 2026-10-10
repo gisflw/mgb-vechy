@@ -34,6 +34,9 @@ pub struct RoiSpec {
     pub workers: usize,
     /// Conservative application allocation budget, not a hard process RSS ceiling.
     pub memory_limit_mb: usize,
+    pub overwrite: bool,
+    pub io_slots: usize,
+    pub batch_size: usize,
 }
 
 #[derive(Debug)]
@@ -43,6 +46,7 @@ pub struct RoiReport {
     pub manifest: PathBuf,
     pub source_count: usize,
     pub workers_used: usize,
+    pub timings: super::execution::StageTimings,
 }
 
 struct Raw {
@@ -52,8 +56,19 @@ struct Raw {
 }
 
 /// Select the upstream union and publish normalized, spatially indexed vectors.
-/// Existing products are never overwritten; invalid inputs publish no products.
+/// Replacements require `overwrite`; invalid inputs publish no products.
 pub fn define_roi_dataset(spec: &RoiSpec) -> Result<RoiReport> {
+    define_roi_dataset_with_progress(spec, &|_| {})
+}
+
+pub fn define_roi_dataset_with_progress(
+    spec: &RoiSpec,
+    progress: super::execution::ProgressCallback<'_>,
+) -> Result<RoiReport> {
+    let mut reporter = super::execution::Reporter::new(progress);
+    let io_slots = super::execution::IoSlots::new(spec.io_slots)?;
+    ensure!(spec.batch_size > 0, "Batch size must be positive");
+
     let mut spec = spec.clone();
     let mut budget = VectorBudget::new(spec.memory_limit_mb, spec.workers)?;
     ensure!(
@@ -70,6 +85,16 @@ pub fn define_roi_dataset(spec: &RoiSpec) -> Result<RoiReport> {
             "roi_segments.fgb",
             "manifest-define-roi.json",
         ],
+        spec.overwrite,
+    )?;
+    super::execution::protect_inputs(
+        &spec.output_dir,
+        &[
+            "roi_catchments.fgb".into(),
+            "roi_segments.fgb".into(),
+            "manifest-define-roi.json".into(),
+        ],
+        &[&spec.catchments, &spec.segments],
     )?;
     let _cache = CacheBudget::new()?;
     let segments = Provider::open(
@@ -91,6 +116,7 @@ pub fn define_roi_dataset(spec: &RoiSpec) -> Result<RoiReport> {
     let mut ignored = [c"OGR_GEOMETRY".as_ptr(), std::ptr::null()];
     let status = unsafe { gdal_sys::OGR_L_SetIgnoredFields(layer.c_layer(), ignored.as_mut_ptr()) };
     ensure!(status == 0, "Cannot select topology fields");
+    let _output = super::execution::OutputDirectory::new(&spec.output_dir)?;
     let mut raw = Vec::new();
     let mut lookup = HashMap::new();
     for feature in layer.features() {
@@ -177,6 +203,11 @@ pub fn define_roi_dataset(spec: &RoiSpec) -> Result<RoiReport> {
             water_course: row.id.clone(),
         });
     }
+    drop(raw);
+    drop(lookup);
+    drop(upstream);
+    drop(sub);
+    drop(outlets);
     let ids: Vec<_> = rows.iter().map(|r| r.id.clone()).collect();
     let selected_lookup: HashMap<_, _> = ids
         .iter()
@@ -194,67 +225,104 @@ pub fn define_roi_dataset(spec: &RoiSpec) -> Result<RoiReport> {
         })
         .collect();
     let order = topological_order(&ids, &downstream)?;
-    let segment_geometry = selected_geometry(&segments, id_field, &selected_lookup, &mut budget)?;
+    budget.retain_only(
+        rows.len()
+            .checked_mul(1024)
+            .context("Selected topology allocation overflow")?,
+    )?;
+    budget.reserve(
+        rows.len()
+            .checked_mul(32)
+            .context("Feature ID allocation overflow")?,
+    )?;
+    let segment_geometry = selected_geometry(&segments, id_field, &selected_lookup)?;
     let catchment_layer = catchments.layer()?;
     let catchment_field = vector::field(&catchment_layer, &spec.id_col)?;
     ensure!(
         vector::id_type(&catchment_layer, catchment_field)? == ty,
         "Source catchment and segment ID types differ"
     );
-    let catchment_geometry =
-        selected_geometry(&catchments, catchment_field, &selected_lookup, &mut budget)?;
+    let catchment_geometry = selected_geometry(&catchments, catchment_field, &selected_lookup)?;
     let largest = segment_geometry
+        .bytes
         .iter()
-        .chain(&catchment_geometry)
-        .map(Vec::len)
+        .chain(&catchment_geometry.bytes)
+        .copied()
         .max()
         .unwrap_or(0);
-    let workers = budget.workers(largest, rows.len() * 2)?;
-    let target_wkt = target.to_wkt()?;
+    let workers = budget.workers(
+        largest
+            .checked_mul(4)
+            .and_then(|n| n.checked_add(4 * super::execution::MIB))
+            .context("Geometry worker allocation overflow")?,
+        rows.len() * 2,
+    )?;
     let jobs = rows.len() * 2;
-    let processed = vector::parallel(jobs, workers, |worker, workers| {
-        let source_segment = spatial_ref(&segments.crs)?;
-        let source_catchment = spatial_ref(&catchments.crs)?;
-        let target = spatial_ref(&target_wkt)?;
+    let row_count = rows.len();
+    reporter.enter("processing", "Transforming selected geometry");
+    let output_rows = std::sync::Mutex::new(rows);
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let completed = std::sync::atomic::AtomicUsize::new(0);
+    let batch = spec.batch_size.min(jobs.div_ceil(workers * 4)).max(1);
+    vector::parallel(jobs, workers, |_, _| {
+        let segment_source = Provider::open(
+            &spec.segments,
+            spec.segments_layer.as_deref(),
+            spec.segments_source_crs.as_deref(),
+        )?;
+        let catchment_source = Provider::open(
+            &spec.catchments,
+            spec.catchments_layer.as_deref(),
+            spec.catchments_source_crs.as_deref(),
+        )?;
+        let mut segment_layer = segment_source.layer()?;
+        let mut catchment_layer = catchment_source.layer()?;
         let metrics = [
-            GeodesicMetric::new(&source_segment)?,
-            GeodesicMetric::new(&source_catchment)?,
+            GeodesicMetric::new(&spatial_ref(&segments.crs)?)?,
+            GeodesicMetric::new(&spatial_ref(&catchments.crs)?)?,
         ];
-        let transforms = [
-            CoordTransform::new(&source_segment, &target)?,
-            CoordTransform::new(&source_catchment, &target)?,
-        ];
-        let mut values = Vec::new();
-        for job in (worker..jobs).step_by(workers) {
-            let polygon = job >= rows.len();
-            let i = job % rows.len();
-            let bytes = if polygon {
-                &catchment_geometry[i]
-            } else {
-                &segment_geometry[i]
-            };
-            vector::validate_geometry(bytes, polygon)
-                .with_context(|| format!("Invalid selected geometry at {}", ids[i].key()))?;
-            let geometry = gdal::vector::Geometry::from_wkb(bytes)?;
-            let k = usize::from(polygon);
-            let metric = metrics[k].measure(&geometry, polygon)?;
-            let transformed = geometry.transform(&transforms[k])?;
-            values.push((job, metric, transformed.wkb()?));
+        loop {
+            let start = next.fetch_add(batch, std::sync::atomic::Ordering::Relaxed);
+            if start >= jobs {
+                break;
+            }
+            for job in start..(start + batch).min(jobs) {
+                let polygon = job >= row_count;
+                let i = job % row_count;
+                let (layer, fid) = if polygon {
+                    (&mut catchment_layer, catchment_geometry.fids[i])
+                } else {
+                    (&mut segment_layer, segment_geometry.fids[i])
+                };
+                let _permit = io_slots.acquire()?;
+                let feature = layer
+                    .feature(fid)
+                    .with_context(|| format!("Selected feature {} disappeared", ids[i].key()))?;
+                drop(_permit);
+                let bytes = feature
+                    .geometry()
+                    .context("Selected source has no geometry")?
+                    .wkb()?;
+                vector::validate_geometry(&bytes, polygon)
+                    .with_context(|| format!("Invalid selected geometry at {}", ids[i].key()))?;
+                let geometry = gdal::vector::Geometry::from_wkb(&bytes)?;
+                let k = usize::from(polygon);
+                let metric = metrics[k].measure(&geometry, polygon)?;
+                output_rows
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("ROI row lock poisoned"))?[i]
+                    .metrics[if polygon { 2 } else { 0 }] = metric;
+                reporter.advance(
+                    completed.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1,
+                    Some(jobs),
+                );
+            }
         }
-        Ok(values)
+        Ok(())
     })?;
-    let mut output_segment = vec![Vec::new(); rows.len()];
-    let mut output_catchment = vec![Vec::new(); rows.len()];
-    for (job, metric, bytes) in processed.into_iter().flatten() {
-        let polygon = job >= rows.len();
-        let i = job % rows.len();
-        rows[i].metrics[if polygon { 2 } else { 0 }] = metric;
-        if polygon {
-            output_catchment[i] = bytes;
-        } else {
-            output_segment[i] = bytes;
-        }
-    }
+    let mut rows = output_rows
+        .into_inner()
+        .map_err(|_| anyhow::anyhow!("ROI row lock poisoned"))?;
     for row in &mut rows {
         row.metrics[1] = row.metrics[0];
         row.metrics[3] = row.metrics[2];
@@ -283,6 +351,7 @@ pub fn define_roi_dataset(spec: &RoiSpec) -> Result<RoiReport> {
             rows[*main].water_course = rows[*i].water_course.clone();
         }
     }
+    reporter.enter("finalizing", "Writing indexed ROI vectors");
     fs::create_dir_all(&spec.output_dir)?;
     spec.output_dir = fs::canonicalize(&spec.output_dir)?;
     let staging = tempfile::tempdir_in(&spec.output_dir)?;
@@ -293,22 +362,42 @@ pub fn define_roi_dataset(spec: &RoiSpec) -> Result<RoiReport> {
         ty
     };
     let schema = vector::roi_schema(output_ty);
-    for (name, geometries, geometry_type) in [
+    for (name, provider, geometry_ids, geometry_type) in [
         (
             "roi_catchments.fgb",
-            &output_catchment,
+            &catchments,
+            &catchment_geometry,
             catchments.geometry_type,
         ),
-        ("roi_segments.fgb", &output_segment, segments.geometry_type),
+        (
+            "roi_segments.fgb",
+            &segments,
+            &segment_geometry,
+            segments.geometry_type,
+        ),
     ] {
+        let layer = provider.layer()?;
+        let source = spatial_ref(&provider.crs)?;
+        let transform = CoordTransform::new(&source, &target)?;
         vector::write_vector(
             &staging.path().join(name),
             &target,
             &schema,
             geometry_type,
             true,
-            rows.iter().zip(geometries).map(|(row, geometry)| {
-                Ok((vector::roi_values(row, output_ty)?, geometry.as_slice()))
+            rows.iter().enumerate().map(|(i, row)| {
+                let _permit = io_slots.acquire()?;
+                let feature = layer
+                    .feature(geometry_ids.fids[i])
+                    .with_context(|| format!("Selected feature {} disappeared", row.id.key()))?;
+                drop(_permit);
+                let bytes = feature
+                    .geometry()
+                    .context("Selected source has no geometry")?
+                    .wkb()?;
+                let transformed =
+                    gdal::vector::Geometry::from_wkb(&bytes)?.transform(&transform)?;
+                Ok((vector::roi_values(row, output_ty)?, transformed.wkb()?))
             }),
         )?;
     }
@@ -319,8 +408,11 @@ pub fn define_roi_dataset(spec: &RoiSpec) -> Result<RoiReport> {
         &spec,
         &["roi_catchments.fgb", "roi_segments.fgb"],
         workers,
+        reporter.elapsed_seconds(),
     )?;
+    let timings = reporter.finish();
     Ok(RoiReport {
+        timings,
         catchments: spec.output_dir.join("roi_catchments.fgb"),
         segments: spec.output_dir.join("roi_segments.fgb"),
         manifest,
@@ -329,14 +421,21 @@ pub fn define_roi_dataset(spec: &RoiSpec) -> Result<RoiReport> {
     })
 }
 
+struct GeometryIds {
+    fids: Vec<u64>,
+    bytes: Vec<usize>,
+}
+
 fn selected_geometry(
     provider: &Provider,
     field: usize,
     lookup: &HashMap<SourceId, usize>,
-    budget: &mut VectorBudget,
-) -> Result<Vec<Vec<u8>>> {
+) -> Result<GeometryIds> {
     let mut layer = provider.layer()?;
-    let mut result = vec![None; lookup.len()];
+    let mut result = GeometryIds {
+        fids: vec![u64::MAX; lookup.len()],
+        bytes: vec![0; lookup.len()],
+    };
     for feature in layer.features() {
         let Some(id) = vector::source_id(vector::value(&feature, field)?)? else {
             continue;
@@ -345,19 +444,21 @@ fn selected_geometry(
             continue;
         };
         ensure!(
-            result[*i].is_none(),
+            result.fids[*i] == u64::MAX,
             "Duplicate selected catchment/segment ID: {}",
             id.key()
         );
         let geometry = feature
             .geometry()
-            .context("Selected source has no geometry")?
-            .wkb()?;
-        budget.geometry(geometry.len())?;
-        result[*i] = Some(geometry);
+            .context("Selected source has no geometry")?;
+        // The feature owns this geometry for the lifetime of the WKB size query.
+        let bytes = unsafe { gdal_sys::OGR_G_WkbSizeEx(geometry.c_geometry()) };
+        result.fids[*i] = feature.fid().context("Selected source has no feature ID")?;
+        result.bytes[*i] = bytes;
     }
-    result
-        .into_iter()
-        .map(|bytes| bytes.context("Selected catchment/segment is missing"))
-        .collect()
+    ensure!(
+        result.fids.iter().all(|&fid| fid != u64::MAX),
+        "Selected catchment/segment is missing"
+    );
+    Ok(result)
 }

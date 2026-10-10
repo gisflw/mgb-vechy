@@ -4,7 +4,7 @@ use super::{
     io::{self, attach_mask, read, staging_raster, windows},
     model::{Grid, Window},
 };
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, ensure};
 use gdal::{Dataset, Metadata, raster::GdalType};
 use geographiclib_rs::{Geodesic, InverseGeodesic};
 use serde::Serialize;
@@ -40,6 +40,8 @@ pub struct TerrainSpec {
     pub workers: usize,
     /// Application allocation budget in MiB, not a hard RSS ceiling.
     pub memory_limit_mb: usize,
+    pub overwrite: bool,
+    pub io_slots: usize,
 }
 
 #[derive(Debug)]
@@ -52,6 +54,7 @@ pub struct TerrainReport {
     pub mini_count: usize,
     /// Peak number of concurrent admitted mini workers.
     pub workers_used: usize,
+    pub timings: super::execution::StageTimings,
     pub undrained_count: usize,
 }
 
@@ -703,12 +706,33 @@ fn products(
     Ok((hand, ltnd))
 }
 
+fn routing_reservation(window: Window) -> Result<usize> {
+    let cells = window.width.saturating_mul(window.height);
+    cells
+        .checked_mul(ROUTING_BYTES_PER_CELL)
+        .and_then(|bytes| bytes.checked_add(WORKER_BYTES))
+        .context("Mini working-memory estimate overflow")
+}
+
 struct Admission {
-    next: usize,
+    pending: std::collections::VecDeque<usize>,
     bytes: usize,
     stopped: bool,
     active: usize,
     peak: usize,
+}
+
+struct CancelWorkers<'a> {
+    state: &'a Mutex<Admission>,
+    ready: &'a Condvar,
+}
+impl Drop for CancelWorkers<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.stopped = true;
+        }
+        self.ready.notify_all();
+    }
 }
 
 struct Patch {
@@ -742,7 +766,14 @@ fn open_inputs(spec: &TerrainSpec) -> Result<Vec<Dataset>> {
         .map(|p| Ok(Dataset::open(p)?))
         .collect()
 }
-fn inspect(spec: &TerrainSpec, datasets: &[Dataset]) -> Result<(Grid, Vec<(i64, Window)>)> {
+#[derive(Clone, Copy)]
+struct Mini {
+    id: i64,
+    window: Window,
+    owned_cells: usize,
+}
+
+fn inspect(spec: &TerrainSpec, datasets: &[Dataset]) -> Result<(Grid, Vec<Mini>)> {
     let grid = io::canonical_grid(&datasets[0])?;
     for (i, path) in input_paths(spec).into_iter().enumerate() {
         io::validate_raster(
@@ -765,6 +796,7 @@ fn inspect(spec: &TerrainSpec, datasets: &[Dataset]) -> Result<(Grid, Vec<(i64, 
         .collect();
     let mut bounds = vec![(usize::MAX, usize::MAX, 0, 0); minis.len()];
     let mut drainage = vec![0usize; minis.len()];
+    let mut owned_cells = vec![0usize; minis.len()];
     let mut last_owner = None;
     for window in windows(Window {
         x: 0,
@@ -802,6 +834,7 @@ fn inspect(spec: &TerrainSpec, datasets: &[Dataset]) -> Result<(Grid, Vec<(i64, 
             if segment == owner {
                 drainage[index] += 1;
             }
+            owned_cells[index] += 1;
             let x = window.x + i % window.width;
             let y = window.y + i / window.width;
             let b = &mut bounds[index];
@@ -818,6 +851,15 @@ fn inspect(spec: &TerrainSpec, datasets: &[Dataset]) -> Result<(Grid, Vec<(i64, 
         );
         ensure!(drainage[i] > 0, "Mini {id} has no matching drainage");
     }
+    let minis = minis
+        .into_iter()
+        .zip(owned_cells)
+        .map(|((id, window), owned_cells)| Mini {
+            id,
+            window,
+            owned_cells,
+        })
+        .collect();
     Ok((grid, minis))
 }
 fn process_mini(
@@ -826,13 +868,24 @@ fn process_mini(
     grid: &Grid,
     id: i64,
     window: Window,
+    expected_owned: usize,
+    slots: &super::execution::IoSlots,
 ) -> Result<Patch> {
-    let dem = read(&datasets[0], window)?;
-    let owners = read(&datasets[1], window)?;
-    let segments = read(&datasets[2], window)?;
+    let (dem, owners, segments) = {
+        let _permit = slots.acquire()?;
+        (
+            read(&datasets[0], window)?,
+            read(&datasets[1], window)?,
+            read(&datasets[2], window)?,
+        )
+    };
     let owned: Vec<_> = (0..window.width * window.height)
         .map(|i| owners.value(i) == Some(id as f64))
         .collect();
+    ensure!(
+        owned.iter().filter(|&&value| value).count() == expected_owned,
+        "Mini {id} ownership changed during routing"
+    );
     let drainage: Vec<_> = owned
         .iter()
         .enumerate()
@@ -875,7 +928,10 @@ fn process_mini(
         }
         DirectionSource::D8 => {
             let routable = connected(&owned, &drainage, window.width);
-            let d8 = read(&datasets[3], window)?;
+            let d8 = {
+                let _permit = slots.acquire()?;
+                read(&datasets[3], window)?
+            };
             validate_d8(
                 d8.values.data(),
                 d8.mask.data(),
@@ -938,18 +994,9 @@ fn output_names(flow: bool) -> Vec<String> {
     names
 }
 fn check_collisions(spec: &TerrainSpec) -> Result<()> {
-    for name in output_names(spec.write_flow_direction) {
-        match fs::symlink_metadata(spec.output_dir.join(&name)) {
-            Ok(_) => bail!(
-                "Terrain product already exists: {}",
-                spec.output_dir.join(name).display()
-            ),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e.into()),
-        }
-    }
-    Ok(())
+    super::execution::check_outputs(&spec.output_dir, &output_names(true), spec.overwrite)
 }
+
 fn output_raster<T: GdalType>(
     directory: &Path,
     name: &str,
@@ -1016,9 +1063,19 @@ fn write_patch<T: GdalType + Copy>(ds: &mut Dataset, patch: &Patch, values: &[T]
     Ok(())
 }
 
-/// Create confined terrain products without overwriting existing stage products.
-/// Complete-mini routing must fit the allocation budget; GDAL's shared cache is restored on exit.
+/// Create confined terrain products with complete-mini resident routing.
+/// Replacements require `overwrite`; GDAL's shared cache is restored on exit.
 pub fn create_terrain_dataset(spec: &TerrainSpec) -> Result<TerrainReport> {
+    create_terrain_dataset_with_progress(spec, &|_| {})
+}
+
+pub fn create_terrain_dataset_with_progress(
+    spec: &TerrainSpec,
+    progress: super::execution::ProgressCallback<'_>,
+) -> Result<TerrainReport> {
+    let mut reporter = super::execution::Reporter::new(progress);
+    let io_slots = super::execution::IoSlots::new(spec.io_slots)?;
+
     ensure!(
         spec.workers > 0 && spec.memory_limit_mb > 0,
         "Workers and memory limit must be positive"
@@ -1060,43 +1117,30 @@ pub fn create_terrain_dataset(spec: &TerrainSpec) -> Result<TerrainReport> {
     let datasets = open_inputs(&spec)?;
     let (grid, minis) = inspect(&spec, &datasets)?;
     drop(datasets);
-    let largest = minis
-        .iter()
-        .try_fold(0usize, |largest, (_, w)| -> Result<usize> {
-            Ok(largest.max(
-                w.width
-                    .checked_mul(w.height)
-                    .context("Mini size overflow")?,
-            ))
-        })?;
-    // shortcut: routing windows must fit RAM, add paged routing only when oversized minis are needed.
-    // Reserve worst-case eight directed edges/cell, graph/heap capacity, routing arrays and GDAL overhead.
-    let worker_bytes = largest
-        .checked_mul(ROUTING_BYTES_PER_CELL)
-        .and_then(|v| v.checked_add(WORKER_BYTES))
-        .context("Mini allocation overflow")?;
-    let coordinator = largest
-        .checked_mul(32)
-        .and_then(|v| v.checked_add(CACHE_BYTES + 32 * MIB))
-        .and_then(|v| {
-            minis
-                .len()
-                .checked_mul(8192)
-                .and_then(|metadata| v.checked_add(metadata))
-        })
-        .context("Coordinator allocation overflow")?;
+    let coordinator = CACHE_BYTES
+        + 32 * MIB
+        + minis
+            .len()
+            .checked_mul(8192)
+            .context("Coordinator allocation overflow")?;
     let available = budget
         .checked_sub(coordinator)
         .context("Memory budget cannot hold terrain coordinator")?;
     ensure!(
-        worker_bytes <= available,
-        "Oversized mini requires at least {} MiB; increase --memory-limit-mb",
-        worker_bytes.saturating_add(coordinator).div_ceil(MIB)
+        available >= WORKER_BYTES,
+        "Memory budget cannot hold one mini"
     );
     let workers = spec.workers.min(minis.len()).min(available / WORKER_BYTES);
     fs::create_dir_all(&spec.output_dir)?;
     spec.output_dir = fs::canonicalize(&spec.output_dir)?;
     check_collisions(&spec)?;
+    let mut inputs = vec![
+        spec.dem.as_path(),
+        spec.grid_catchments.as_path(),
+        spec.grid_segments.as_path(),
+    ];
+    inputs.extend(spec.d8.as_deref());
+    super::execution::protect_inputs(&spec.output_dir, &output_names(true), &inputs)?;
     let staging = tempfile::tempdir_in(&spec.output_dir)?;
     let mut hand = output_raster::<f32>(
         staging.path(),
@@ -1126,14 +1170,19 @@ pub fn create_terrain_dataset(spec: &TerrainSpec) -> Result<TerrainReport> {
     let mut validity = staging_raster::<u8>(staging.path(), "validity.tif", &grid)?;
     let mut reports = Vec::with_capacity(minis.len());
     let state = Mutex::new(Admission {
-        next: 0,
+        pending: (0..minis.len()).collect(),
         bytes: 0,
         stopped: false,
         active: 0,
         peak: 0,
     });
     let ready = Condvar::new();
+    reporter.enter("processing", "Routing mini basins");
     thread::scope(|scope| -> Result<()> {
+        let _cancel = CancelWorkers {
+            state: &state,
+            ready: &ready,
+        };
         let (sender, receiver) = mpsc::sync_channel(0);
         let mut handles = Vec::new();
         for _ in 0..workers {
@@ -1143,32 +1192,46 @@ pub fn create_terrain_dataset(spec: &TerrainSpec) -> Result<TerrainReport> {
             let minis = &minis;
             let state = &state;
             let ready = &ready;
+            let io_slots = &io_slots;
             handles.push(scope.spawn(move || -> Result<()> {
                 let datasets = match open_inputs(spec) {
                     Ok(d) => d,
                     Err(e) => {
-                        let _ = sender.send(Err(e));
+                        let _ = sender.send((0, Err(e)));
                         return Ok(());
                     }
                 };
                 loop {
-                    let (id, window, bytes) = {
+                    let (id, window, owned, bytes) = {
                         let mut admission = state
                             .lock()
                             .map_err(|_| anyhow::anyhow!("Terrain admission lock poisoned"))?;
                         loop {
-                            if admission.stopped || admission.next >= minis.len() {
+                            if admission.stopped || admission.pending.is_empty() {
                                 return Ok(());
                             }
-                            let (id, window) = minis[admission.next];
-                            let bytes = window.width * window.height * ROUTING_BYTES_PER_CELL
-                                + WORKER_BYTES;
-                            if bytes <= available - admission.bytes {
-                                admission.next += 1;
+                            let fitting = admission.pending.iter().position(|&ordinal| {
+                                let mini = minis[ordinal];
+                                let bytes = routing_reservation(mini.window).unwrap_or(usize::MAX);
+                                bytes <= available - admission.bytes
+                            });
+                            if let Some(position) = fitting {
+                                let ordinal = admission.pending.remove(position).unwrap();
+                                let mini = minis[ordinal];
+                                let bytes = routing_reservation(mini.window)?;
                                 admission.bytes += bytes;
                                 admission.active += 1;
-                                admission.peak = admission.peak.max(admission.active);
-                                break (id, window, bytes);
+                                admission.peak = admission.peak.max(admission.active.min(workers));
+                                break (mini.id, mini.window, mini.owned_cells, bytes);
+                            }
+                            if admission.active == 0 {
+                                let mini = minis[admission.pending[0]];
+                                let required = routing_reservation(mini.window)?;
+                                anyhow::bail!(
+                                    "Mini {} requires about {} MiB; increase --memory-limit-mb",
+                                    mini.id,
+                                    required.div_ceil(MIB)
+                                );
                             }
                             admission = ready
                                 .wait(admission)
@@ -1176,18 +1239,16 @@ pub fn create_terrain_dataset(spec: &TerrainSpec) -> Result<TerrainReport> {
                         }
                     };
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        process_mini(spec, &datasets, grid, id, window)
+                        process_mini(spec, &datasets, grid, id, window, owned, io_slots)
                     }))
                     .map_err(|_| anyhow::anyhow!("Terrain worker panicked"))
                     .and_then(|r| r)
                     .with_context(|| format!("Route mini {id}"));
                     let failed = result.is_err();
-                    let disconnected = sender.send(result).is_err();
+                    let disconnected = sender.send((bytes, result)).is_err();
                     let mut admission = state
                         .lock()
                         .map_err(|_| anyhow::anyhow!("Terrain admission lock poisoned"))?;
-                    admission.bytes -= bytes;
-                    admission.active -= 1;
                     if failed || disconnected {
                         admission.stopped = true;
                     }
@@ -1201,8 +1262,15 @@ pub fn create_terrain_dataset(spec: &TerrainSpec) -> Result<TerrainReport> {
         }
         drop(sender);
         let mut failure = None;
-        for result in receiver {
+        for (bytes, result) in receiver {
             if failure.is_some() {
+                drop(result);
+                let mut admission = state
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("Terrain admission lock poisoned"))?;
+                admission.bytes -= bytes;
+                admission.active -= usize::from(bytes > 0);
+                ready.notify_all();
                 continue;
             }
             match result.and_then(|patch| {
@@ -1212,7 +1280,9 @@ pub fn create_terrain_dataset(spec: &TerrainSpec) -> Result<TerrainReport> {
                 if let Some(flow) = &mut flow {
                     write_patch(flow, &patch, &patch.direction)?;
                 }
-                reports.push((patch.id, patch.undrained, patch.total));
+                let report = (patch.id, patch.undrained, patch.total);
+                reports.push(report);
+                reporter.advance(reports.len(), Some(minis.len()));
                 Ok(())
             }) {
                 Ok(()) => {}
@@ -1225,6 +1295,12 @@ pub fn create_terrain_dataset(spec: &TerrainSpec) -> Result<TerrainReport> {
                     ready.notify_all();
                 }
             }
+            let mut admission = state
+                .lock()
+                .map_err(|_| anyhow::anyhow!("Terrain admission lock poisoned"))?;
+            admission.bytes -= bytes;
+            admission.active -= usize::from(bytes > 0);
+            ready.notify_all();
         }
         for handle in handles {
             if let Err(e) = handle
@@ -1242,6 +1318,7 @@ pub fn create_terrain_dataset(spec: &TerrainSpec) -> Result<TerrainReport> {
         ensure!(reports.len() == minis.len(), "Incomplete terrain results");
         Ok(())
     })?;
+    reporter.enter("finalizing", "Compressing terrain COGs");
     let workers_used = state
         .lock()
         .map_err(|_| anyhow::anyhow!("Terrain admission lock poisoned"))?
@@ -1265,12 +1342,6 @@ pub fn create_terrain_dataset(spec: &TerrainSpec) -> Result<TerrainReport> {
         }
     }
     csv.flush()?;
-    let mut parameters = serde_json::to_value(&spec)?;
-    parameters["workers_used"] = serde_json::json!(workers_used);
-    serde_json::to_writer_pretty(
-        File::create(staging.path().join("manifest-terrain-products.json"))?,
-        &serde_json::json!({"step":"terrain-products","parameters":parameters}),
-    )?;
     for (name, mut ds) in [
         ("hand.tif", Some(hand)),
         ("ltnd.tif", Some(ltnd)),
@@ -1294,12 +1365,30 @@ pub fn create_terrain_dataset(spec: &TerrainSpec) -> Result<TerrainReport> {
             )?;
         }
     }
+    let mut parameters = serde_json::to_value(&spec)?;
+    parameters["workers_used"] = serde_json::json!(workers_used);
+    serde_json::to_writer_pretty(
+        File::create(staging.path().join("manifest-terrain-products.json"))?,
+        &serde_json::json!({
+            "step": "terrain-products",
+            "parameters": parameters,
+            "elapsed_seconds": reporter.elapsed_seconds()
+        }),
+    )?;
     publish(
         staging.path(),
         &spec.output_dir,
         &output_names(spec.write_flow_direction),
+        spec.overwrite,
+        &if spec.write_flow_direction {
+            vec![]
+        } else {
+            vec!["flow_direction.tif".into()]
+        },
     )?;
+    let timings = reporter.finish();
     Ok(TerrainReport {
+        timings,
         hand: spec.output_dir.join("hand.tif"),
         ltnd: spec.output_dir.join("ltnd.tif"),
         flow_direction: spec
@@ -1316,8 +1405,28 @@ pub fn create_terrain_dataset(spec: &TerrainSpec) -> Result<TerrainReport> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn admission_estimates_complete_mini_working_set() -> Result<()> {
+        let window = Window {
+            x: 0,
+            y: 0,
+            width: 1024,
+            height: 1024,
+        };
+        let bytes = routing_reservation(window)?;
+        assert_eq!(bytes, 1024 * 1024 * ROUTING_BYTES_PER_CELL + WORKER_BYTES);
+        assert!(bytes > 2 * 1024 * MIB);
+        let enormous = Window {
+            width: usize::MAX,
+            height: usize::MAX,
+            ..window
+        };
+        assert!(routing_reservation(enormous).is_err());
+        Ok(())
+    }
+
     use serde_json::Value;
-    fn floats(value: &Value) -> Vec<f64> {
+    pub(super) fn floats(value: &Value) -> Vec<f64> {
         value
             .as_array()
             .unwrap()
@@ -1330,7 +1439,7 @@ mod tests {
             })
             .collect()
     }
-    fn bools(value: &Value) -> Vec<bool> {
+    pub(super) fn bools(value: &Value) -> Vec<bool> {
         value
             .as_array()
             .unwrap()
@@ -1359,6 +1468,8 @@ mod tests {
             wkt: gdal::spatial_ref::SpatialRef::from_epsg(3857)?.to_wkt()?,
         };
         let spec = TerrainSpec {
+            overwrite: false,
+            io_slots: 2,
             dem: PathBuf::new(),
             grid_catchments: PathBuf::new(),
             grid_segments: PathBuf::new(),

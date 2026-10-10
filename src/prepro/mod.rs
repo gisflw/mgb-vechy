@@ -20,3 +20,10 @@ pub mod preparation;
 pub use preparation::{
     D8Encoding, NamedRaster, PreparationReport, PreparationSpec, RasterKind, prepare_dataset,
 };
+
+pub use aggregation::aggregate_roi_dataset_with_progress;
+pub use execution::{ProgressCallback, StageProgress, StageTimings};
+pub use preparation::prepare_dataset_with_progress;
+pub use roi::define_roi_dataset_with_progress;
+pub use sampling::sample_minibasins_with_progress;
+pub use terrain::create_terrain_dataset_with_progress;

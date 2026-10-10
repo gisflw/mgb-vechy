@@ -22,6 +22,16 @@ enum Commands {
     /// Run a candidate preprocessing executable and record benchmarks.
     Run(jacui::runner::RunOptions),
     /// Compare candidate products with a frozen reference.
+    CompareProducts {
+        #[arg(long)]
+        reference_dir: PathBuf,
+        #[arg(long)]
+        output_dir: PathBuf,
+        #[arg(long)]
+        legacy_sub: bool,
+        #[arg(long, value_enum, default_value = "all")]
+        stage: jacui::Stage,
+    },
     Compare {
         #[arg(long, value_enum)]
         network: jacui::Network,
@@ -38,6 +48,12 @@ fn main() -> anyhow::Result<()> {
     match cli.command {
         Commands::Verify => jacui::verify(&fixture),
         Commands::Run(options) => jacui::runner::run(&fixture, &options).map(|_| ()),
+        Commands::CompareProducts {
+            reference_dir,
+            output_dir,
+            legacy_sub,
+            stage,
+        } => jacui::compare::compare_products(&reference_dir, &output_dir, stage, legacy_sub),
         Commands::Compare {
             network,
             stage,

@@ -87,8 +87,9 @@ Field defaults are `id`, `id_down`, and `strahler_order`. Optional
 Integer source IDs normalize to int64 without changing values; real and string
 IDs retain their type. ROI geometry layer types retain the source declaration.
 
-`--workers` and `--memory-limit-mb` default to 4 and 4096. Topology and selected
-geometry stay resident; conservative accounting reduces geometry concurrency
-or rejects inputs that cannot fit. The budget is not a hard RSS ceiling.
-Existing stage products are never overwritten; failed publication rolls back
-new files. Other stages can share the output directory.
+`--workers` and `--memory-limit-mb` default to 4 and 4096. Whole-source topology
+selection and geometry stores use disk when their resident quotas are exceeded.
+Selected topology currently requires resident space; this remaining limit is
+tracked in `.dev/pr/execution-validation.md`. Geometry concurrency is admitted
+against the managed working budget, which is separate from process RSS.
+See [execution controls](execution.md) for replacement, progress, and I/O limits.

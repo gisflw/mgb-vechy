@@ -41,15 +41,19 @@ accepts `--agree-sharp`, `--agree-smooth`, and `--agree-buffer`.
 The library exposes `TerrainSpec`, `DirectionSource`, `TerrainReport`, and
 `create_terrain_dataset(&TerrainSpec)` through `mgb::prepro`.
 `--workers` defaults to 4; `--memory-limit-mb` defaults to 4096. Actual
-concurrency may be reduced by the allocation budget. Complete mini windows,
-including routing graphs, must fit memory; oversized minis fail with a required
-budget estimate. This is an application allocation budget, not a hard RSS cap.
+concurrency may be reduced so each admitted task can route one complete mini in
+memory. A mini that cannot fit the managed working budget fails with its
+estimated requirement. Dataset size does not require loading every mini at once;
+raster inputs and completed output patches are handled with bounded buffers.
+Routing always covers each complete mini, so output window edges never become
+routing boundaries. GDAL/GEOS allocations and process overhead are outside the
+managed working-memory estimate.
 
 COGs use lossless ZSTD compression through the installed GDAL driver.
 
-Existing terrain products are never overwritten. Other stage files may share
-the output directory. Products are staged and published after processing and
-COG validation; failures roll back newly published files.
+Products are staged and published after processing and COG validation;
+publication failures restore replacements. Other stage files may share the
+output directory. See [execution controls](execution.md).
 
 ## Scientific behavior
 

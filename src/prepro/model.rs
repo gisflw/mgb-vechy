@@ -31,7 +31,9 @@ pub(crate) struct Grid {
 }
 
 /// Source IDs keep their value and type; scientific ties use their string form.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
 pub(crate) enum SourceId {
     Integer(i64),
     Real(u64),

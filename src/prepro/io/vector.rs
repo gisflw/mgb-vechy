@@ -238,13 +238,30 @@ pub(crate) fn roi_schema(ty: u32) -> Vec<(&'static str, u32)> {
         .collect()
 }
 
-pub(crate) fn write_vector<'a>(
+pub(crate) fn write_vector<B: AsRef<[u8]>>(
     path: &Path,
     crs: &SpatialRef,
     schema: &[(&str, u32)],
     geometry_type: u32,
     indexed: bool,
-    rows: impl Iterator<Item = Result<(Vec<Option<FieldValue>>, &'a [u8])>>,
+    rows: impl Iterator<Item = Result<(Vec<Option<FieldValue>>, B)>>,
+) -> Result<()> {
+    write_vector_stream(path, crs, schema, geometry_type, indexed, |append| {
+        for row in rows {
+            let (values, geometry) = row?;
+            append(values, geometry.as_ref())?;
+        }
+        Ok(())
+    })
+}
+
+pub(crate) fn write_vector_stream(
+    path: &Path,
+    crs: &SpatialRef,
+    schema: &[(&str, u32)],
+    geometry_type: u32,
+    indexed: bool,
+    write_rows: impl FnOnce(&mut dyn FnMut(Vec<Option<FieldValue>>, &[u8]) -> Result<()>) -> Result<()>,
 ) -> Result<()> {
     let mut dataset = DriverManager::get_driver_by_name("FlatGeobuf")?.create_vector_only(path)?;
     let layer = dataset.create_layer(LayerOptions {
@@ -264,8 +281,7 @@ pub(crate) fn write_vector<'a>(
     for (name, ty) in schema {
         FieldDefn::new(name, *ty)?.add_to_layer(&layer)?;
     }
-    for row in rows {
-        let (values, bytes) = row?;
+    let mut append = |values: Vec<Option<FieldValue>>, bytes: &[u8]| -> Result<()> {
         let mut feature = Feature::new(layer.defn())?;
         for (i, value) in values.iter().enumerate() {
             match value {
@@ -275,7 +291,9 @@ pub(crate) fn write_vector<'a>(
         }
         feature.set_geometry(Geometry::from_wkb(bytes)?)?;
         feature.create(&layer)?;
-    }
+        Ok(())
+    };
+    write_rows(&mut append)?;
     dataset.flush_cache()?;
     Ok(())
 }
@@ -342,31 +360,41 @@ impl GeodesicMetric {
             }
             return Ok(value);
         }
-        let points: Vec<_> = (0..geometry.point_count())
-            .map(|i| geometry.get_point(i as i32))
-            .collect();
-        ensure!(
-            points
-                .iter()
-                .all(|(x, y, _)| x.is_finite() && y.is_finite()),
-            "Non-finite geometry coordinates"
-        );
+        let count = geometry.point_count();
+        let point = |i| -> Result<(f64, f64, f64)> {
+            let point = geometry.get_point(i as i32);
+            ensure!(
+                point.0.is_finite() && point.1.is_finite(),
+                "Non-finite geometry coordinates"
+            );
+            Ok(point)
+        };
         if polygon {
             let mut area = PolygonArea::new(&self.geodesic, Winding::CounterClockwise);
-            for (x, y, _) in points {
+            for i in 0..count {
+                let (x, y, _) = point(i)?;
                 area.add_point(y, x);
             }
             Ok(area.compute(true).1)
         } else {
-            Ok(points
-                .windows(2)
-                .map(|p| -> f64 { self.geodesic.inverse(p[0].1, p[0].0, p[1].1, p[1].0) })
-                .sum())
+            let mut value = 0.;
+            if count > 0 {
+                let mut previous = point(0)?;
+                for i in 1..count {
+                    let current = point(i)?;
+                    let step: f64 = self
+                        .geodesic
+                        .inverse(previous.1, previous.0, current.1, current.0);
+                    value += step;
+                    previous = current;
+                }
+            }
+            Ok(value)
         }
     }
 }
 
-// shortcut: vector topology and selected WKB stay resident; add paging only for measured larger datasets.
+// shortcut: vector topology metadata must fit the managed budget; revisit only if the supported datasets outgrow it.
 pub(crate) struct VectorBudget {
     limit: usize,
     retained: usize,
@@ -391,6 +419,10 @@ impl VectorBudget {
             requested: workers,
         })
     }
+    pub fn retain_only(&mut self, bytes: usize) -> Result<()> {
+        self.retained = CACHE_BYTES;
+        self.reserve(bytes)
+    }
     pub fn reserve(&mut self, bytes: usize) -> Result<()> {
         self.retained = self
             .retained
@@ -398,28 +430,24 @@ impl VectorBudget {
             .context("Vector allocation overflow")?;
         ensure!(
             self.retained <= self.limit - 8 * MIB,
-            "Vector inputs exceed application memory budget; increase --memory-limit-mb"
+            "Vector metadata requires about {} MiB; increase --memory-limit-mb",
+            self.retained.saturating_add(8 * MIB).div_ceil(MIB)
         );
         Ok(())
     }
-    pub fn geometry(&mut self, bytes: usize) -> Result<()> {
-        self.reserve(
-            bytes
-                .checked_mul(4)
-                .context("Geometry allocation overflow")?,
-        )
+    pub fn available(&self) -> usize {
+        self.limit - self.retained - 8 * MIB
     }
     pub fn workers(&self, largest: usize, jobs: usize) -> Result<usize> {
-        let worker = largest
-            .checked_mul(24)
-            .and_then(|v| v.checked_add(8 * MIB))
-            .context("Geometry workspace overflow")?;
-        let available = self.limit - self.retained;
+        let available = self.available();
         ensure!(
-            worker <= available,
-            "Oversized geometry group exceeds memory budget; increase --memory-limit-mb"
+            largest <= available,
+            "One geometry task requires about {} MiB; increase --memory-limit-mb",
+            largest.div_ceil(MIB)
         );
-        Ok(self.requested.min(jobs).min(available / worker))
+        ensure!(jobs > 0, "No vector jobs to process");
+        let workers = self.requested.min(jobs).min(available / largest.max(1));
+        Ok(workers)
     }
 }
 
@@ -458,15 +486,13 @@ pub(crate) fn parallel<T: Send>(
     })
 }
 
-pub(crate) fn output_paths(output: &Path, names: &[&str]) -> Result<PathBuf> {
+pub(crate) fn output_paths(output: &Path, names: &[&str], overwrite: bool) -> Result<PathBuf> {
     let output = std::path::absolute(output)?;
-    for name in names {
-        ensure!(
-            !output.join(name).try_exists()?,
-            "Output already exists: {}",
-            output.join(name).display()
-        );
-    }
+    super::super::execution::check_outputs(
+        &output,
+        &names.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+        overwrite,
+    )?;
     Ok(output)
 }
 
@@ -477,20 +503,34 @@ pub(crate) fn finish(
     parameters: &impl Serialize,
     products: &[&str],
     workers_used: usize,
+    elapsed_seconds: f64,
 ) -> Result<PathBuf> {
     let name = format!("manifest-{stage}.json");
     let mut parameters = serde_json::to_value(parameters)?;
     parameters["workers_used"] = serde_json::json!(workers_used);
     serde_json::to_writer_pretty(
         File::create(staging.join(&name))?,
-        &serde_json::json!({"step":stage,"parameters":parameters}),
+        &serde_json::json!({
+            "step": stage,
+            "parameters": parameters,
+            "elapsed_seconds": elapsed_seconds
+        }),
     )?;
     let names: Vec<_> = products
         .iter()
         .map(|s| s.to_string())
         .chain([name.clone()])
         .collect();
-    publish(staging, output, &names)?;
+    let overwrite = parameters["overwrite"].as_bool().unwrap_or(false);
+    let remove = if stage == "prepare" {
+        super::super::execution::preparation_optional(output)?
+            .into_iter()
+            .filter(|name| !names.contains(name))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    publish(staging, output, &names, overwrite, &remove)?;
     Ok(output.join(name))
 }
 
@@ -552,14 +592,14 @@ mod tests {
     }
 
     #[test]
-    fn memory_rejects_overflow_resident_inputs_and_oversized_groups() -> Result<()> {
+    fn memory_admits_geometry_tasks_and_rejects_overflow() -> Result<()> {
         assert!(VectorBudget::new(usize::MAX, 1).is_err());
         assert!(VectorBudget::new(24, 0).is_err());
         assert!(VectorBudget::new(1, 1).is_err());
         let mut budget = VectorBudget::new(64, 4)?;
-        assert_eq!(budget.workers(1, 4)?, 4);
-        assert!(budget.workers(3 * MIB, 4).is_err());
-        assert!(budget.geometry(usize::MAX).is_err());
+        assert_eq!(budget.workers(20 * MIB, 4)?, 2);
+        assert_eq!(budget.workers(40 * MIB, 4)?, 1);
+        assert!(budget.reserve(usize::MAX).is_err());
         assert!(budget.reserve(64 * MIB).is_err());
         Ok(())
     }

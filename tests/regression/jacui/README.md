@@ -87,6 +87,9 @@ for example `--command cargo --command-arg=run --command-arg=--release
 --command-arg=--`. All stage adapters match the Rust CLI.
 
 `run` accepts `--workers` and `--memory-limit-mb`, defaulting to 4 and 4096.
+Optional `--io-slots` is passed to the candidate executable; omit it when
+testing the CLI default. The historical Rust binary has no I/O-slot option, so
+set it to the worker count when matching its effective maximum I/O concurrency.
 Outputs must go to a fresh, empty directory. Inputs and expected products,
 including other networks and symlink aliases, are protected from candidate
 writes. Candidate runs never read or write scratch. `--fixture PATH` globally
@@ -130,9 +133,10 @@ The dataset capture omits flow-direction products; the
 
 ## Performance evidence
 
-Each candidate stage writes a log. `benchmark.json` records wall time, exit
-status, revision, platform, resource settings, workers used from each stage manifest, executable arguments, and timing
-of failed invocations too. On Linux, `max_process_rss_kib` is `wait4`'s maximum
+Each candidate stage writes a log. `benchmark.json` records stage and whole-run
+wall time, exit status, revision, platform, resource settings, workers used from
+each stage manifest, executable arguments, and timing of failed invocations
+too. On Linux, `max_process_rss_kib` is `wait4`'s maximum
 individual-process RSS including completed descendants, not summed concurrent
 RSS. Other platforms record null for this Linux-specific metric.
 

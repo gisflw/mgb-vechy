@@ -29,6 +29,8 @@ impl Fixture {
         let dir = tempfile::tempdir()?;
         let root = dir.path();
         let spec = TerrainSpec {
+            overwrite: false,
+            io_slots: 2,
             dem: root.join("dem.tif"),
             grid_catchments: root.join("grid_catchments.tif"),
             grid_segments: root.join("grid_segments.tif"),
@@ -215,6 +217,7 @@ fn products_preserve_ownership_masks_metadata_and_worker_determinism() -> Result
         let manifest: serde_json::Value = serde_json::from_reader(fs::File::open(first.manifest)?)?;
         assert_eq!(manifest["step"], "terrain-products");
         assert_eq!(manifest["parameters"]["workers_used"], first.workers_used);
+        assert!(manifest["elapsed_seconds"].as_f64().unwrap().is_finite());
         assert!(Path::new(manifest["parameters"]["dem"].as_str().unwrap()).is_absolute());
     }
     Ok(())
@@ -352,7 +355,6 @@ fn d8_errors_and_memory_admission_leave_no_products() -> Result<()> {
         match kind {
             "missing" => f.spec.d8 = None,
             "budget" => f.spec.memory_limit_mb = 1,
-            "oversized" => f.spec.memory_limit_mb = 64,
             "workers" => f.spec.workers = 0,
             "sharp" => f.spec.agree_sharp = f64::NAN,
             _ => {}
@@ -401,32 +403,29 @@ fn memory_budget_reduces_concurrency_without_changing_products() -> Result<()> {
 }
 
 #[test]
-fn admission_waits_for_large_minis_and_cancels_on_failure() -> Result<()> {
+fn oversized_complete_mini_fails_with_required_budget() -> Result<()> {
     fn capture<T: Copy + GdalType>(path: &Path, data: &[T], dem: bool, index: bool) -> Result<()> {
-        if path.exists() {
-            fs::remove_file(path)?;
-        }
         let mut ds = DriverManager::get_driver_by_name("MEM")?
-            .create_with_band_type::<T, _>("", 640, 256, 1)?;
-        ds.set_geo_transform(&[0., 1., 0., 256., 0., -1.])?;
+            .create_with_band_type::<T, _>("", 2048, 1024, 1)?;
+        ds.set_geo_transform(&[0., 1., 0., 1024., 0., -1.])?;
         ds.set_spatial_ref(&SpatialRef::from_epsg(3857)?)?;
         if dem {
             ds.set_metadata_item("units", "m", "")?;
+        }
+        if index {
+            ds.set_metadata_item("mini_index", "[[1,0,0,1024,1024],[2,1024,0,2048,1024]]", "")?;
+        }
+        let mut band = ds.rasterband(1)?;
+        if dem {
             assert_eq!(
-                unsafe {
-                    gdal_sys::GDALSetRasterUnitType(ds.rasterband(1)?.c_rasterband(), c"m".as_ptr())
-                },
+                unsafe { gdal_sys::GDALSetRasterUnitType(band.c_rasterband(), c"m".as_ptr()) },
                 0
             );
         }
-        if index {
-            ds.set_metadata_item("mini_index", "[[1,0,0,320,256],[2,320,0,640,256]]", "")?;
-        }
-        let mut band = ds.rasterband(1)?;
         band.write(
             (0, 0),
-            (640, 256),
-            &mut Buffer::new((640, 256), data.to_vec()),
+            (2048, 1024),
+            &mut Buffer::new((2048, 1024), data.to_vec()),
         )?;
         band.create_mask_band(true)?;
         band.open_mask_band()?.fill(255., None)?;
@@ -438,26 +437,42 @@ fn admission_waits_for_large_minis_and_cancels_on_failure() -> Result<()> {
         .flush_cache()?;
         Ok(())
     }
+
     let mut f = Fixture::new()?;
-    let owners: Vec<i32> = (0..640 * 256)
-        .map(|i| if i % 640 < 320 { 1 } else { 2 })
+    let owners: Vec<i32> = (0..2048 * 1024)
+        .map(|i| if i % 2048 < 1024 { 1 } else { 2 })
         .collect();
-    capture(&f.spec.dem, &vec![10f32; 640 * 256], true, false)?;
+    capture(&f.spec.dem, &vec![10f32; 2048 * 1024], true, false)?;
     capture(&f.spec.grid_catchments, &owners, false, true)?;
     capture(&f.spec.grid_segments, &owners, false, false)?;
-    let d8 = f.spec.dem.with_file_name("d8.tif");
-    capture(&d8, &vec![0u8; 640 * 256], false, false)?;
-    f.spec.d8 = Some(d8.clone());
+    f.spec.memory_limit_mb = 256;
+    let error = create_terrain_dataset(&f.spec).unwrap_err().to_string();
+    assert!(error.contains("Mini 1 requires"), "{error}");
+    assert!(error.contains("increase --memory-limit-mb"), "{error}");
+    assert!(!f.spec.output_dir.join("hand.tif").exists());
+    Ok(())
+}
+
+#[test]
+fn cancellation_and_invalid_d8_publish_no_products() -> Result<()> {
+    let mut f = Fixture::new()?;
+    f.d8(&D8, &MASK)?;
     f.spec.direction_source = DirectionSource::D8;
-    f.spec.workers = 2;
-    f.spec.memory_limit_mb = 384;
-    f.spec.write_flow_direction = false;
-    let result = create_terrain_dataset(&f.spec)?;
-    assert_eq!(result.workers_used, 1);
-    assert_eq!(result.undrained_count, 0);
-    let mut invalid = vec![0u8; 640 * 256];
+    f.spec.output_dir = f.spec.dem.with_file_name("cancelled");
+    assert!(
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            mgb::prepro::create_terrain_dataset_with_progress(&f.spec, &|event| {
+                if event.phase == "processing" && event.completed > 0 {
+                    panic!("cancelled by caller");
+                }
+            })
+        }))
+        .is_err()
+    );
+    assert_eq!(fs::read_dir(&f.spec.output_dir)?.count(), 0);
+    let mut invalid = D8;
     invalid[0] = 9;
-    capture(&d8, &invalid, false, false)?;
+    f.d8(&invalid, &MASK)?;
     f.spec.output_dir = f.spec.dem.with_file_name("failed");
     assert!(create_terrain_dataset(&f.spec).is_err());
     assert_eq!(fs::read_dir(&f.spec.output_dir)?.count(), 0);

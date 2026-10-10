@@ -105,20 +105,22 @@ all eight input paths, an output directory, and positive worker/memory limits.
 The report returns output paths, mini count, and actual worker count.
 
 Worker and memory defaults above apply to the CLI. Concurrency decreases when
-necessary to fit the application allocation budget. Inputs are read in windows;
-exact samples for one mini must fit the budget. At least 48 MiB is needed for
-GIS cache and raster windows, plus mini samples and coordinator records. This
-is not a hard RSS ceiling. Sampling temporarily caps GDAL's process-wide block
-cache at 16 MiB and restores its previous limit afterward; concurrent sampling
-calls are serialized while that shared limit is in use.
+necessary to fit the managed working budget. Fitting jobs share a single tiled
+scan. Otherwise, each admitted task samples one complete mini in memory and
+streams ordered results to the staged CSV; the dataset is never accumulated in
+memory. A mini that cannot fit the budget fails with its estimated requirement.
+At least 48 MiB is needed for the GIS cache and one sampling worker, plus
+coordinator metadata. The configured GDAL block cache uses one quarter of the
+budget, with a 16 MiB minimum and 8 GiB maximum, and its previous limit is
+restored afterward. Library calls serialize while configuring this process-wide
+cache.
 
 Rows are written in ascending mini-ID order. `sub` is an integer column;
 floating `sub` fields are rejected. Missing-data reports use owned cells as
 their denominator, including for DEM and segment-grid coverage.
 
-Existing sampling products, including diagnostic reports and symlinks, are
-never overwritten. Unrelated upstream files may share the output directory.
-Files are staged there and published without replacing existing files; a failed
-publication removes only newly published products. A completed scan missing
-required statistics retains its nodata reports but writes no sampled CSV or
-success manifest. Correct inputs and use a fresh sampling destination to retry.
+Sampling stages its products and restores replaced files if publication fails.
+A completed scan missing required statistics publishes only nodata reports and
+removes stale success products when replacement is authorized. Successful retries
+remove stale diagnostic files. See [execution controls](execution.md) for prompts
+and `--overwrite`. Unrelated upstream files may share the output directory.

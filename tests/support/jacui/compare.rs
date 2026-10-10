@@ -36,11 +36,28 @@ fn product_names(directory: &Path) -> Result<BTreeSet<String>> {
 }
 
 pub fn compare(root: &Path, network: Network, stage: Stage, output: &Path) -> Result<()> {
-    let expected = root.join("expected").join(network.name());
+    compare_products(
+        &root.join("expected").join(network.name()),
+        output,
+        stage,
+        false,
+    )?;
+    if matches!(stage, Stage::All | Stage::DefineRoi) {
+        check_outlets(root, network, output)?;
+    }
+    Ok(())
+}
+
+pub fn compare_products(
+    expected: &Path,
+    output: &Path,
+    stage: Stage,
+    legacy_sub: bool,
+) -> Result<()> {
     let mut required: BTreeSet<String> = stage.products().into_iter().map(str::to_owned).collect();
     if matches!(stage, Stage::All | Stage::SampleMinis) {
         required.extend(
-            product_names(&expected)?
+            product_names(expected)?
                 .into_iter()
                 .filter(|name| name.starts_with("nodata_")),
         );
@@ -62,12 +79,24 @@ pub fn compare(root: &Path, network: Network, stage: Stage, output: &Path) -> Re
             reference.display()
         );
         let result = match actual.extension().and_then(|s| s.to_str()) {
-            Some("fgb") => compare_vector(&actual, &reference),
+            Some("fgb") => {
+                if legacy_sub {
+                    compare_vector_legacy_sub(&actual, &reference)
+                } else {
+                    compare_vector(&actual, &reference)
+                }
+            }
             Some("tif") => compare_raster(&actual, &reference),
-            _ => compare_csv(&actual, &reference, name == "sampled_minis.csv"),
+            _ => {
+                if legacy_sub {
+                    compare_csv_legacy_sub(&actual, &reference, name == "sampled_minis.csv")
+                } else {
+                    compare_csv(&actual, &reference, name == "sampled_minis.csv")
+                }
+            }
         };
-        result.with_context(|| format!("{}/{name}", network.name()))?;
-        println!("Compared {}/{name}", network.name());
+        result.with_context(|| name.to_string())?;
+        println!("Compared {name}");
     }
     for step in stage.stages() {
         let path = output.join(format!("manifest-{}.json", step.name()));
@@ -80,9 +109,6 @@ pub fn compare(root: &Path, network: Network, stage: Stage, output: &Path) -> Re
             "Invalid audit envelope: {}",
             path.display()
         );
-    }
-    if matches!(stage, Stage::All | Stage::DefineRoi) {
-        check_outlets(root, network, output)?;
     }
     Ok(())
 }
@@ -121,6 +147,19 @@ fn csv_type<'a>(values: impl Iterator<Item = &'a str>) -> CsvType {
 }
 
 pub fn compare_csv(actual: &Path, reference: &Path, sort_id: bool) -> Result<()> {
+    compare_csv_impl(actual, reference, sort_id, false)
+}
+
+pub fn compare_csv_legacy_sub(actual: &Path, reference: &Path, sort_id: bool) -> Result<()> {
+    compare_csv_impl(actual, reference, sort_id, true)
+}
+
+fn compare_csv_impl(
+    actual: &Path,
+    reference: &Path,
+    sort_id: bool,
+    legacy_sub: bool,
+) -> Result<()> {
     let read = |path: &Path| -> Result<(csv::StringRecord, Vec<csv::StringRecord>)> {
         let mut reader = csv::Reader::from_path(path)?;
         Ok((
@@ -151,7 +190,32 @@ pub fn compare_csv(actual: &Path, reference: &Path, sort_id: bool) -> Result<()>
         sort(&mut right)?;
     }
     for column in 0..headers.len() {
-        let kind = csv_type(right.iter().map(|row| &row[column]));
+        let mut kind = csv_type(right.iter().map(|row| &row[column]));
+        if legacy_sub && &headers[column] == "sub" && kind == CsvType::Float {
+            for row in &mut right {
+                let value: f64 = row[column].parse()?;
+                ensure!(
+                    value.is_finite()
+                        && value.fract() == 0.
+                        && value >= i64::MIN as f64
+                        && value < -(i64::MIN as f64),
+                    "Non-integral legacy sub"
+                );
+                let fields: Vec<String> = row
+                    .iter()
+                    .enumerate()
+                    .map(|(i, field)| {
+                        if i == column {
+                            (value as i64).to_string()
+                        } else {
+                            field.to_owned()
+                        }
+                    })
+                    .collect();
+                *row = fields.into();
+            }
+            kind = CsvType::Integer;
+        }
         ensure!(
             csv_type(left.iter().map(|row| &row[column])) == kind,
             "CSV type differs for {}",
@@ -225,6 +289,14 @@ pub fn geometry_equal(a: &[u8], b: &[u8]) -> Result<bool> {
 }
 
 pub fn compare_vector(actual: &Path, reference: &Path) -> Result<()> {
+    compare_vector_impl(actual, reference, false)
+}
+
+pub fn compare_vector_legacy_sub(actual: &Path, reference: &Path) -> Result<()> {
+    compare_vector_impl(actual, reference, true)
+}
+
+fn compare_vector_impl(actual: &Path, reference: &Path, legacy_sub: bool) -> Result<()> {
     let a = Dataset::open(actual)?;
     let b = Dataset::open(reference)?;
     ensure!(
@@ -260,8 +332,23 @@ pub fn compare_vector(actual: &Path, reference: &Path) -> Result<()> {
             })
             .collect::<Vec<_>>()
     };
+    let actual_schema = schema(&a);
+    let mut reference_schema = schema(&b);
+    let sub = reference_schema.iter().position(|field| field.0 == "sub");
+    let adapt_sub = legacy_sub
+        && sub.is_some_and(|i| reference_schema[i].1 == gdal::vector::OGRFieldType::OFTReal);
+    if adapt_sub {
+        let i = sub.unwrap();
+        ensure!(
+            actual_schema
+                .get(i)
+                .is_some_and(|field| field.1 == gdal::vector::OGRFieldType::OFTInteger64),
+            "Candidate sub must be int64"
+        );
+        reference_schema[i].1 = gdal::vector::OGRFieldType::OFTInteger64;
+    }
     ensure!(
-        schema(&a) == schema(&b),
+        actual_schema == reference_schema,
         "Vector field names/types/order differ: {:?} vs {:?}",
         schema(&a),
         schema(&b)
@@ -281,6 +368,22 @@ pub fn compare_vector(actual: &Path, reference: &Path) -> Result<()> {
     );
     let mut a = vector_rows(&mut a)?;
     let mut b = vector_rows(&mut b)?;
+    if adapt_sub {
+        let i = sub.unwrap();
+        for row in &mut b {
+            let Some(FieldValue::RealValue(value)) = row.fields[i] else {
+                anyhow::bail!("Null legacy sub");
+            };
+            ensure!(
+                value.is_finite()
+                    && value.fract() == 0.
+                    && value >= i64::MIN as f64
+                    && value < -(i64::MIN as f64),
+                "Non-integral legacy sub"
+            );
+            row.fields[i] = Some(FieldValue::Integer64Value(value as i64));
+        }
+    }
     ensure!(a.len() == b.len(), "Vector row counts differ");
     for rows in [&a, &b] {
         ensure!(

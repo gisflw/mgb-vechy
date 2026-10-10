@@ -20,13 +20,16 @@ normalization. Names match `[a-z][a-z0-9_-]*`; `dem`, `d8`, `grid_catchments`,
 
 `--workers` defaults to 4 and `--memory-limit-mb` to 4096. The application
 allocation budget bounds resident geometry, worker scratch, queued results, and
-GDAL cache; it is not a hard RSS ceiling. Concurrency is reduced to fit, and
-inputs or collision workspaces that cannot fit fail explicitly.
+configured GIS caches; it is separate from process RSS. Windows are generated
+lazily. Larger geometry collections use a disk spatial index and local geometry
+loading; collision contenders are batched without changing ancestry rules.
+Mini metadata currently requires resident space; the remaining limit is tracked
+in `.dev/pr/execution-validation.md`.
 
 The report includes output paths, mini count, and peak processing concurrency.
-The manifest records absolute input paths and `workers_used`. Existing stage
-products are never overwritten; failures publish no preparation products.
-Other stages may share the output directory.
+The manifest records absolute input paths and `workers_used`. Stale optional
+products recorded by the previous preparation manifest are removed on successful
+replacement. See [execution controls](execution.md) for publication and progress.
 
 Clip aligned rasters and establish mini ownership and matching drainage on a
 canonical DEM grid. See the [shared data contracts](shared_data_contracts.md).

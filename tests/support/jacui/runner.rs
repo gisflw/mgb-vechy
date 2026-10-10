@@ -1,7 +1,7 @@
 use super::{Network, Stage};
 use anyhow::{Context, Result, bail, ensure};
 use clap::Args;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
     collections::BTreeMap,
@@ -30,6 +30,8 @@ pub struct RunOptions {
     pub workers: u32,
     #[arg(long, default_value = "4096", value_parser = clap::value_parser!(u32).range(1..))]
     pub memory_limit_mb: u32,
+    #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
+    pub io_slots: Option<u32>,
 }
 
 #[derive(Deserialize)]
@@ -169,6 +171,9 @@ pub fn invocation(root: &Path, options: &RunOptions, stage: Stage) -> Result<Inv
     }
     value("--workers", options.workers.to_string());
     value("--memory-limit-mb", options.memory_limit_mb.to_string());
+    if let Some(io_slots) = options.io_slots {
+        value("--io-slots", io_slots.to_string());
+    }
     args.extend([
         OsString::from("--output-dir"),
         options.output_dir.clone().into_os_string(),
@@ -259,13 +264,15 @@ pub fn run(root: &Path, options: &RunOptions) -> Result<Value> {
         "network": options.network.name(), "command": [options.command.as_os_str().to_string_lossy()],
         "command_args": options.command_arg.iter().map(|s| s.to_string_lossy()).collect::<Vec<_>>(),
         "workers": options.workers, "memory_limit_mb": options.memory_limit_mb,
+        "io_slots": options.io_slots,
         "platform": format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
         "cpu_count": std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1),
         "recorded_at": chrono::Utc::now().to_rfc3339(),
         "revision": String::from_utf8_lossy(&revision.stdout).trim(), "measurements": []
     });
+    let pipeline_started = Instant::now();
     for stage in options.stage.stages() {
-        let result = || -> Result<(i32, Option<i64>)> {
+        let result = || -> Result<(i32, Usage)> {
             let invocation = invocation(&root, &options, stage)?;
             for path in &invocation.inputs {
                 ensure!(path.is_file(), "Stage input missing: {}", path.display());
@@ -283,19 +290,24 @@ pub fn run(root: &Path, options: &RunOptions) -> Result<Value> {
         };
         let started = Instant::now();
         let result = result();
-        let (code, rss) = result.as_ref().copied().unwrap_or((-1, None));
+        let (code, usage) = result.as_ref().copied().unwrap_or((-1, Usage::default()));
         let wall_seconds = started.elapsed().as_secs_f64();
-        let workers_used = File::open(output.join(format!("manifest-{}.json", stage.name())))
+        let manifest = File::open(output.join(format!("manifest-{}.json", stage.name())))
             .ok()
-            .and_then(|file| serde_json::from_reader::<_, Value>(file).ok())
-            .and_then(|manifest| manifest["parameters"]["workers_used"].as_u64());
+            .and_then(|file| serde_json::from_reader::<_, Value>(file).ok());
+        let workers_used = manifest
+            .as_ref()
+            .and_then(|m| m["parameters"]["workers_used"].as_u64());
         let measurement = json!({"stage": stage.name(), "wall_seconds": wall_seconds, "workers_used": workers_used,
-            "max_process_rss_kib": rss, "exit_code": code,
+            "max_process_rss_kib": usage.max_process_rss_kib, "cpu_seconds": usage.cpu_seconds,
+            "read_bytes": usage.read_bytes, "write_bytes": usage.write_bytes,
+            "exit_code": code,
             "error": result.as_ref().err().map(|error| format!("{error:#}"))});
         report["measurements"]
             .as_array_mut()
             .unwrap()
             .push(measurement);
+        report["pipeline_wall_seconds"] = json!(pipeline_started.elapsed().as_secs_f64());
         fs::write(
             output.join("benchmark.json"),
             serde_json::to_string_pretty(&report)? + "\n",
@@ -312,8 +324,16 @@ pub fn run(root: &Path, options: &RunOptions) -> Result<Value> {
     Ok(report)
 }
 
+#[derive(Clone, Copy, Default, Serialize)]
+struct Usage {
+    max_process_rss_kib: Option<i64>,
+    cpu_seconds: Option<f64>,
+    read_bytes: Option<i64>,
+    write_bytes: Option<i64>,
+}
+
 #[cfg(target_os = "linux")]
-fn wait_with_usage(child: std::process::Child) -> Result<(i32, Option<i64>)> {
+fn wait_with_usage(child: std::process::Child) -> Result<(i32, Usage)> {
     let mut status = 0;
     let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
     loop {
@@ -335,10 +355,19 @@ fn wait_with_usage(child: std::process::Child) -> Result<(i32, Option<i64>)> {
     } else {
         -libc::WTERMSIG(status)
     };
-    Ok((code, Some(usage.ru_maxrss)))
+    let seconds = |t: libc::timeval| t.tv_sec as f64 + t.tv_usec as f64 / 1_000_000.;
+    Ok((
+        code,
+        Usage {
+            max_process_rss_kib: Some(usage.ru_maxrss),
+            cpu_seconds: Some(seconds(usage.ru_utime) + seconds(usage.ru_stime)),
+            read_bytes: Some(usage.ru_inblock * 512),
+            write_bytes: Some(usage.ru_oublock * 512),
+        },
+    ))
 }
 
 #[cfg(not(target_os = "linux"))]
-fn wait_with_usage(mut child: std::process::Child) -> Result<(i32, Option<i64>)> {
-    Ok((child.wait()?.code().unwrap_or(-1), None))
+fn wait_with_usage(mut child: std::process::Child) -> Result<(i32, Usage)> {
+    Ok((child.wait()?.code().unwrap_or(-1), Usage::default()))
 }

@@ -74,6 +74,8 @@ fn raster<T: Copy + GdalType>(
 fn fixture() -> Result<(tempfile::TempDir, PreparationSpec)> {
     let root = tempfile::tempdir()?;
     let spec = PreparationSpec {
+        overwrite: false,
+        io_slots: 2,
         dem: root.path().join("source.tif"),
         mini_catchments: root.path().join("catchments.fgb"),
         mini_segments: root.path().join("segments.fgb"),
@@ -190,6 +192,7 @@ fn scaling_only_dem_types_masks_units_index_and_manifest() -> Result<()> {
     let manifest: Value = serde_json::from_slice(&fs::read(&report.manifest)?)?;
     assert_eq!(manifest["step"], "prepare");
     assert_eq!(manifest["parameters"]["workers_used"], 1);
+    assert!(manifest["elapsed_seconds"].as_f64().unwrap().is_finite());
     assert_eq!(
         manifest["parameters"]["dem"],
         fs::canonicalize(&spec.dem)?.to_str().unwrap()
@@ -284,6 +287,8 @@ fn stream_overlay_halo_tight_bounds_and_disconnected_terrain() -> Result<()> {
         serde_json::json!([[1, 0., 0., 9., 8.], [2, 5., 4., 6., 6.]])
     );
     let terrain = create_terrain_dataset(&TerrainSpec {
+        overwrite: false,
+        io_slots: 2,
         dem: report.dem,
         grid_catchments: report.grid_catchments,
         grid_segments: report.grid_segments,
@@ -660,5 +665,44 @@ fn rejects_multiple_bands_null_fields_and_mismatched_vector_ids_or_crs() -> Resu
     )?;
     assert!(prepare_dataset(&spec).is_err());
     empty_output(&spec)?;
+    Ok(())
+}
+
+#[test]
+fn replacement_removes_previous_optional_rasters_and_preserves_inputs() -> Result<()> {
+    let (_root, mut spec) = fixture()?;
+    let raster_path = spec.dem.with_file_name("land-source.tif");
+    raster(&raster_path, 2, 2, vec![1i32; 4], None)?;
+    spec.rasters.push(NamedRaster {
+        name: "land".into(),
+        path: raster_path.clone(),
+        kind: RasterKind::Categorical,
+    });
+    prepare_dataset(&spec)?;
+    fs::write(spec.output_dir.join("unrelated.txt"), "keep")?;
+    spec.overwrite = true;
+    spec.rasters.clear();
+    let events = std::sync::Mutex::new(Vec::new());
+    let report = mgb::prepro::prepare_dataset_with_progress(&spec, &|event| {
+        events.lock().unwrap().push(event)
+    })?;
+    assert!(!spec.output_dir.join("land.tif").exists());
+    assert!(raster_path.exists());
+    assert_eq!(
+        fs::read_to_string(spec.output_dir.join("unrelated.txt"))?,
+        "keep"
+    );
+    let events = events.into_inner().unwrap();
+    for phase in ["preparing", "processing", "finalizing"] {
+        assert!(events.iter().any(|e| e.phase == phase));
+    }
+    assert!(report.timings.total > 0.);
+    spec.dem = report.dem;
+    assert!(
+        prepare_dataset(&spec)
+            .unwrap_err()
+            .to_string()
+            .contains("input")
+    );
     Ok(())
 }

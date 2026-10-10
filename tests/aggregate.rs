@@ -23,6 +23,9 @@ fn geometry_union_centroids_and_worker_determinism() -> Result<()> {
     let (temp, spec) = fixture()?;
     let roi = define_roi_dataset(&spec)?;
     let mut aggregation = AggregationSpec {
+        overwrite: false,
+        io_slots: 2,
+        batch_size: 10000,
         roi_catchments: roi.catchments,
         roi_segments: roi.segments,
         output_dir: temp.path().join("minis"),
@@ -34,6 +37,9 @@ fn geometry_union_centroids_and_worker_determinism() -> Result<()> {
     let minis = aggregate_roi_dataset(&aggregation)?;
     assert_eq!(minis.source_count, 4);
     assert_eq!(minis.mini_count, 3);
+    let manifest: serde_json::Value =
+        serde_json::from_reader(std::fs::File::open(&minis.manifest)?)?;
+    assert!(manifest["elapsed_seconds"].as_f64().unwrap().is_finite());
     assert!(
         !Dataset::open(&minis.catchments)?
             .layer(0)?
@@ -125,6 +131,9 @@ fn accepts_normalized_source_identifier_types() -> Result<()> {
         sources(&spec.segments, false, ty, &rows, None)?;
         let roi = define_roi_dataset(&spec)?;
         let aggregation = AggregationSpec {
+            overwrite: false,
+            io_slots: 2,
+            batch_size: 10000,
             roi_catchments: roi.catchments,
             roi_segments: roi.segments,
             output_dir: temp.path().join("minis"),
@@ -144,6 +153,9 @@ fn rejects_invalid_thresholds_without_products() -> Result<()> {
     let roi = define_roi_dataset(&spec)?;
     for threshold in [-1., f64::NAN, f64::INFINITY] {
         let aggregation = AggregationSpec {
+            overwrite: false,
+            io_slots: 2,
+            batch_size: 10000,
             roi_catchments: roi.catchments.clone(),
             roi_segments: roi.segments.clone(),
             output_dir: temp.path().join("bad-threshold"),
@@ -240,6 +252,9 @@ fn geometric_union_preserves_summed_metrics_and_rejects_malformed_roi() -> Resul
     normalized(&catches, true, 4326, &rows, false)?;
     normalized(&segments, false, 4326, &rows, false)?;
     let spec = AggregationSpec {
+        overwrite: false,
+        io_slots: 2,
+        batch_size: 10000,
         roi_catchments: catches,
         roi_segments: segments,
         output_dir: temp.path().join("minis"),

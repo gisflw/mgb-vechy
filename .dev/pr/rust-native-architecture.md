@@ -80,16 +80,17 @@ boundary. Keep geometry and CRS operations explicit where external libraries
 supply them.
 
 One CPU pool and a coherent application-memory budget are enough initially.
-Bound live raster windows and queued results, reuse buffers, and spill exact
-samples or intermediate products when needed. Scientific reduction order must
-be independent of completion order. Add shared abstractions when stages need
-them; do not reproduce the Python executor's contracts as a Rust framework.
+Bound live raster windows and queued results, reuse buffers, and process one
+complete mini per admitted terrain or sampling job. Scientific reduction order
+must be independent of completion order. Add shared abstractions when stages
+need them; do not reproduce the Python executor's contracts as a Rust framework.
 
 A dataset larger than RAM and a single oversized mini are different problems.
-Use windowed raster access and complete-mini routing first. Report an
-unsupported oversized unit clearly rather than splitting routing in a way
-that changes connectivity. Paged graphs, external sorting, spill queues, and
-external geometry algorithms belong in later work supported by measured need.
+Use windowed raster access and complete-mini routing so the full dataset is not
+resident at once. Report an unsupported oversized mini clearly rather than
+splitting routing in a way that changes connectivity. Do not add paged graphs,
+external sorting, spill queues, or external geometry algorithms without a new
+measured requirement.
 The initial Jacui cases establish behavior and performance, not universal
 larger-than-memory coverage or a hard RSS ceiling.
 

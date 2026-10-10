@@ -13,9 +13,10 @@ use gdal::{
 use geos::{Geom, Geometry, GeometryTypes};
 use serde::Serialize;
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, VecDeque},
     fs::{self, File},
     path::{Path, PathBuf},
+    sync::{Condvar, Mutex, mpsc},
     thread,
 };
 /// Explicit inputs to mini sampling. Raster values are already in metres.
@@ -34,6 +35,9 @@ pub struct SamplingSpec {
     pub workers: usize,
     /// Application allocation budget in MiB, not a hard process RSS ceiling.
     pub memory_limit_mb: usize,
+    pub overwrite: bool,
+    pub io_slots: usize,
+    pub batch_size: usize,
 }
 
 impl SamplingSpec {
@@ -56,7 +60,9 @@ pub struct SamplingReport {
     pub manifest: PathBuf,
     pub nodata_reports: Vec<PathBuf>,
     pub mini_count: usize,
+    /// Peak number of concurrently admitted mini jobs.
     pub workers_used: usize,
+    pub timings: super::execution::StageTimings,
 }
 
 pub(crate) const NODATA_NAMES: [&str; 5] = ["dem", "grid_segments", "hand", "ltnd", "hru"];
@@ -78,6 +84,7 @@ impl Mini {
     }
 }
 
+#[derive(Clone)]
 pub(crate) struct Statistics {
     pub reach_slope: f64,
     pub reach_elevation: f64,
@@ -87,6 +94,7 @@ pub(crate) struct Statistics {
     pub flooded_area: [f64; 100],
 }
 
+#[derive(Clone)]
 pub(crate) struct MiniResult {
     pub id: i64,
     pub total_cells: usize,
@@ -96,11 +104,22 @@ pub(crate) struct MiniResult {
 }
 /// Sample explicit mini, terrain, and HRU inputs into deterministic CSV products.
 ///
-/// Existing sampling products are never overwritten. A completed scan missing
+/// Replacements require `overwrite`. A completed scan missing
 /// required statistics publishes only nodata reports and returns an error.
 /// The application budget is conservative, not a hard RSS limit. During the
 /// run GDAL's process-wide block-cache limit is capped and restored on exit.
 pub fn sample_minibasins(spec: &SamplingSpec) -> Result<SamplingReport> {
+    sample_minibasins_with_progress(spec, &|_| {})
+}
+
+pub fn sample_minibasins_with_progress(
+    spec: &SamplingSpec,
+    progress: super::execution::ProgressCallback<'_>,
+) -> Result<SamplingReport> {
+    let mut reporter = super::execution::Reporter::new(progress);
+    let io_slots = super::execution::IoSlots::new(spec.io_slots)?;
+    ensure!(spec.batch_size > 0, "Batch size must be positive");
+
     ensure!(
         spec.workers > 0 && spec.memory_limit_mb > 0,
         "Workers and memory limit must be positive"
@@ -113,7 +132,7 @@ pub fn sample_minibasins(spec: &SamplingSpec) -> Result<SamplingReport> {
         budget >= CACHE_BYTES + WORKER_BYTES,
         "Memory budget needs at least 48 MiB for GIS cache and raster windows"
     );
-    check_collisions(&spec.output_dir)?;
+    check_collisions(&spec.output_dir, spec.overwrite)?;
     let mut spec = spec.clone();
     for path in [
         &mut spec.mini_catchments,
@@ -129,75 +148,68 @@ pub fn sample_minibasins(spec: &SamplingSpec) -> Result<SamplingReport> {
             .with_context(|| format!("Input unavailable: {}", path.display()))?;
     }
     spec.output_dir = std::path::absolute(&spec.output_dir)?;
-    let _cache = CacheBudget::new()?;
+    let mut inputs: Vec<_> = spec.rasters().into_iter().map(Path::to_owned).collect();
+    inputs.extend([spec.mini_catchments.clone(), spec.mini_segments.clone()]);
+    let _output = super::execution::OutputDirectory::new(&spec.output_dir)?;
+    spec.output_dir = fs::canonicalize(&spec.output_dir)?;
+    check_collisions(&spec.output_dir, spec.overwrite)?;
+    let input_refs: Vec<_> = inputs.iter().map(PathBuf::as_path).collect();
+    super::execution::protect_inputs(&spec.output_dir, &sampling_names(), &input_refs)?;
+    let staging = tempfile::tempdir_in(&spec.output_dir)?;
+    let cache_bytes = (budget / 4).clamp(CACHE_BYTES, 8 * 1024 * MIB);
+    let _cache = CacheBudget::with_limit(cache_bytes)?;
     let (grid, minis) = inspect(&spec)?;
-    let largest = minis.iter().try_fold(0, |maximum, mini| -> Result<usize> {
-        let bytes = mini
-            .owned_cells
-            .checked_mul(24)
-            .and_then(|v| v.checked_add(WORKER_BYTES))
-            .context("Mini allocation size overflow")?;
-        Ok(maximum.max(bytes))
-    })?;
     let coordinator = minis
         .len()
         .checked_mul(8192)
-        .and_then(|v| v.checked_add(CACHE_BYTES))
-        .context("Coordinator allocation size overflow")?;
+        .and_then(|v| v.checked_add(cache_bytes))
+        .context("Coordinator allocation overflow")?;
     let available = budget
         .checked_sub(coordinator)
         .context("Memory budget cannot hold mini metadata")?;
     ensure!(
-        largest <= available,
-        "Oversized mini requires at least {} MiB including buffers; increase --memory-limit-mb",
-        (largest + coordinator).div_ceil(MIB)
+        available >= WORKER_BYTES + 128 * 1024,
+        "Memory budget cannot hold sampling windows"
     );
-    let workers = spec.workers.min(minis.len()).min(available / largest);
-    let mut results = thread::scope(|scope| -> Result<Vec<MiniResult>> {
-        let mut handles = Vec::with_capacity(workers);
-        for worker in 0..workers {
-            let spec = &spec;
-            let grid = &grid;
-            let minis = &minis;
-            handles.push(scope.spawn(move || -> Result<Vec<MiniResult>> {
-                let datasets = open_rasters(spec)?;
-                let areas = io::CellAreas::new(grid)?;
-                minis
-                    .iter()
-                    .skip(worker)
-                    .step_by(workers)
-                    .map(|mini| sample_mini(mini, &datasets, &areas))
-                    .collect()
-            }));
-        }
-        let mut results = Vec::with_capacity(minis.len());
-        let mut error = None;
-        for handle in handles {
-            match handle
-                .join()
-                .map_err(|_| anyhow::anyhow!("Sampling worker panicked"))
-                .and_then(|r| r)
-            {
-                Ok(values) => results.extend(values),
-                Err(e) => {
-                    if error.is_none() {
-                        error = Some(e);
-                    }
-                }
-            }
-        }
-        if let Some(error) = error {
-            return Err(error);
-        }
-        Ok(results)
-    })?;
-    results.sort_unstable_by_key(|r| r.id);
-    let failures: Vec<_> = results.iter().flat_map(|r| r.failures.iter()).collect();
-    fs::create_dir_all(&spec.output_dir)?;
-    spec.output_dir = fs::canonicalize(&spec.output_dir)?;
-    check_collisions(&spec.output_dir)?;
-    let staging = tempfile::tempdir_in(&spec.output_dir)?;
-    let mut files = write_nodata(staging.path(), &results)?;
+    let block_size = if available >= 256 * MIB {
+        1024
+    } else {
+        io::BLOCK
+    };
+    let worker_bytes = if block_size == 1024 {
+        80 * MIB
+    } else {
+        WORKER_BYTES
+    };
+    ensure!(
+        available >= worker_bytes,
+        "Memory budget cannot hold one sampling worker"
+    );
+    let workers = spec.workers.min(minis.len()).min(available / worker_bytes);
+    let rasters = SamplingRasters {
+        datasets: open_rasters_threaded(&spec, (workers / spec.io_slots).clamp(1, 4))?
+            .into_iter()
+            .map(std::sync::Mutex::new)
+            .collect(),
+        slots: &io_slots,
+        cpus: super::execution::IoSlots::new(workers)?,
+        decode_threads: (workers / spec.io_slots).clamp(1, 4),
+        block_size,
+    };
+    reporter.enter("processing", "Sampling mini basins");
+    let mut output = SampleOutput::new(staging.path())?;
+    let workers_used = sample_minis_bounded(
+        &grid,
+        &minis,
+        &rasters,
+        available,
+        worker_bytes,
+        workers,
+        &reporter,
+        &mut output,
+    )?;
+    reporter.enter("finalizing", "Writing samples and diagnostics");
+    let (mut files, failure) = output.finish(staging.path(), minis.len())?;
     if !files.is_empty() {
         eprintln!(
             "Warning: Nodata cells were found in {}",
@@ -208,13 +220,17 @@ pub fn sample_minibasins(spec: &SamplingSpec) -> Result<SamplingReport> {
                 .join(", ")
         );
     }
-    if !failures.is_empty() {
-        publish(staging.path(), &spec.output_dir, &files)?;
-        let message = failures
-            .into_iter()
-            .map(String::as_str)
-            .collect::<Vec<_>>()
-            .join("; ");
+    if let Some(message) = failure {
+        publish(
+            staging.path(),
+            &spec.output_dir,
+            &files,
+            spec.overwrite,
+            &sampling_names()
+                .into_iter()
+                .filter(|name| !files.contains(name))
+                .collect::<Vec<_>>(),
+        )?;
         if files.is_empty() {
             bail!("{message}");
         }
@@ -223,12 +239,15 @@ pub fn sample_minibasins(spec: &SamplingSpec) -> Result<SamplingReport> {
             spec.output_dir.display()
         );
     }
-    write_sampled(staging.path(), &minis, &results)?;
     let mut parameters = serde_json::to_value(&spec)?;
-    parameters["workers_used"] = serde_json::json!(workers);
+    parameters["workers_used"] = serde_json::json!(workers_used);
     serde_json::to_writer_pretty(
         File::create(staging.path().join("manifest-sample-minis.json"))?,
-        &serde_json::json!({"step": "sample-minis", "parameters": parameters}),
+        &serde_json::json!({
+            "step": "sample-minis",
+            "parameters": parameters,
+            "elapsed_seconds": reporter.elapsed_seconds()
+        }),
     )?;
     let nodata_reports = files
         .iter()
@@ -238,23 +257,331 @@ pub fn sample_minibasins(spec: &SamplingSpec) -> Result<SamplingReport> {
         "sampled_minis.csv".into(),
         "manifest-sample-minis.json".into(),
     ]);
-    publish(staging.path(), &spec.output_dir, &files)?;
+    publish(
+        staging.path(),
+        &spec.output_dir,
+        &files,
+        spec.overwrite,
+        &sampling_names()
+            .into_iter()
+            .filter(|name| !files.contains(name))
+            .collect::<Vec<_>>(),
+    )?;
+    let timings = reporter.finish();
     Ok(SamplingReport {
+        timings,
         sampled_minis: spec.output_dir.join("sampled_minis.csv"),
         manifest: spec.output_dir.join("manifest-sample-minis.json"),
         nodata_reports,
         mini_count: minis.len(),
-        workers_used: workers,
+        workers_used,
     })
 }
 
-fn sample_mini(mini: &Mini, datasets: &[Dataset], areas: &io::CellAreas) -> Result<MiniResult> {
+struct SampleAdmission {
+    pending: VecDeque<usize>,
+    bytes: usize,
+    active: usize,
+    peak: usize,
+    consumed: usize,
+    stopped: bool,
+}
+
+fn sample_reservation(mini: &Mini, worker_bytes: usize) -> Result<usize> {
+    let window_cells = mini
+        .window
+        .width
+        .checked_mul(mini.window.height)
+        .context("Mini sampling window overflow")?;
+    let raster_buffers = window_cells
+        .checked_mul(6 * (std::mem::size_of::<f64>() + std::mem::size_of::<u8>()))
+        .context("Mini sampling raster allocation overflow")?;
+    let accumulator_buffers = mini
+        .owned_cells
+        .checked_mul(3 * std::mem::size_of::<f64>())
+        .context("Mini sampling accumulator allocation overflow")?;
+    raster_buffers
+        .checked_add(accumulator_buffers)
+        .and_then(|bytes| bytes.checked_add(worker_bytes))
+        .and_then(|bytes| bytes.checked_add(2048))
+        .context("Mini sampling allocation overflow")
+}
+
+fn ensure_sample_fits(mini: &Mini, available: usize, worker_bytes: usize) -> Result<usize> {
+    let required = sample_reservation(mini, worker_bytes)?;
+    ensure!(
+        required <= available,
+        "Mini {} requires about {} MiB for sampling; increase --memory-limit-mb",
+        mini.id(),
+        required.div_ceil(MIB)
+    );
+    Ok(required)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn sample_minis_bounded(
+    grid: &Grid,
+    minis: &[Mini],
+    rasters: &SamplingRasters<'_>,
+    available: usize,
+    worker_bytes: usize,
+    workers: usize,
+    reporter: &super::execution::Reporter<'_>,
+    output: &mut SampleOutput,
+) -> Result<usize> {
+    let reservation = |ordinal: usize| sample_reservation(&minis[ordinal], worker_bytes);
+    for mini in minis {
+        ensure_sample_fits(mini, available, worker_bytes)?;
+    }
+    let state = Mutex::new(SampleAdmission {
+        pending: (0..minis.len()).collect(),
+        bytes: 0,
+        active: 0,
+        peak: 0,
+        consumed: 0,
+        stopped: false,
+    });
+    let ready = Condvar::new();
+    thread::scope(|scope| -> Result<usize> {
+        let (sender, receiver) = mpsc::sync_channel(0);
+        let mut handles = Vec::new();
+        for _ in 0..workers {
+            let sender = sender.clone();
+            let state = &state;
+            let ready = &ready;
+            handles.push(scope.spawn(move || {
+                let run = || -> Result<()> {
+                    let areas = io::CellAreas::new(grid)?;
+                    loop {
+                        let (ordinal, bytes) = {
+                            let mut admission = state.lock().map_err(|_| {
+                                anyhow::anyhow!("Sampling admission lock poisoned")
+                            })?;
+                            loop {
+                                if admission.stopped || admission.pending.is_empty() {
+                                    return Ok(());
+                                }
+                                let ordinal = *admission.pending.front().unwrap();
+                                let within_window = ordinal
+                                    < admission.consumed + workers.saturating_mul(2);
+                                let bytes = reservation(ordinal)?;
+                                if within_window && bytes <= available - admission.bytes {
+                                    admission.pending.pop_front();
+                                    admission.bytes += bytes;
+                                    admission.active += 1;
+                                    admission.peak = admission.peak.max(admission.active.min(workers));
+                                    break (ordinal, bytes);
+                                }
+                                if admission.active == 0 && within_window {
+                                    ensure_sample_fits(&minis[ordinal], available, worker_bytes)?;
+                                    bail!(
+                                        "Cannot admit mini {} under the current sampling memory reservations",
+                                        minis[ordinal].id()
+                                    );
+                                }
+                                admission = ready.wait(admission).map_err(|_| {
+                                    anyhow::anyhow!("Sampling admission lock poisoned")
+                                })?;
+                            }
+                        };
+                        let result = sample_mini(&minis[ordinal], rasters, &areas)
+                            .with_context(|| format!("Sample mini {}", minis[ordinal].id()));
+                        let failed = result.is_err();
+                        let disconnected = sender.send((ordinal, bytes, result)).is_err();
+                        let mut admission = state
+                            .lock()
+                            .map_err(|_| anyhow::anyhow!("Sampling admission lock poisoned"))?;
+                        if failed || disconnected {
+                            admission.stopped = true;
+                        }
+                        ready.notify_all();
+                        if failed || disconnected {
+                            return Ok(());
+                        }
+                    }
+                };
+                if let Err(error) = run() {
+                    if let Ok(mut admission) = state.lock() {
+                        admission.stopped = true;
+                    }
+                    let _ = sender.send((usize::MAX, 0, Err(error)));
+                    ready.notify_all();
+                }
+            }));
+        }
+        drop(sender);
+        let mut error = None;
+        let mut completed = 0;
+        let mut pending = BTreeMap::<usize, (usize, Result<MiniResult>)>::new();
+        for (ordinal, bytes, result) in receiver {
+            if ordinal == usize::MAX {
+                if error.is_none() {
+                    error = result.err();
+                }
+                state
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("Sampling admission lock poisoned"))?
+                    .stopped = true;
+                ready.notify_all();
+                continue;
+            }
+            if error.is_some() {
+                release_sample(&state, &ready, bytes)?;
+                continue;
+            }
+            pending.insert(ordinal, (bytes, result));
+            while let Some((bytes, result)) = pending.remove(&completed) {
+                match result {
+                    Ok(result) => {
+                        if let Err(e) = output.add(&minis[completed], result) {
+                            error = Some(e);
+                        } else {
+                            completed += 1;
+                            let mut admission = state
+                                .lock()
+                                .map_err(|_| anyhow::anyhow!("Sampling admission lock poisoned"))?;
+                            admission.consumed = completed;
+                            admission.bytes -= bytes;
+                            admission.active -= 1;
+                            ready.notify_all();
+                            reporter.advance(completed, Some(minis.len()));
+                            continue;
+                        }
+                    }
+                    Err(e) => error = Some(e),
+                }
+                release_sample(&state, &ready, bytes)?;
+                if error.is_some() {
+                    state
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("Sampling admission lock poisoned"))?
+                        .stopped = true;
+                    ready.notify_all();
+                    for (_, (bytes, _)) in std::mem::take(&mut pending) {
+                        release_sample(&state, &ready, bytes)?;
+                    }
+                    break;
+                }
+            }
+        }
+        for handle in handles {
+            if handle.join().is_err() && error.is_none() {
+                error = Some(anyhow::anyhow!("Sampling worker panicked"));
+            }
+        }
+        if let Some(error) = error {
+            return Err(error);
+        }
+        ensure!(completed == minis.len(), "Incomplete sampling results");
+        let peak = state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Sampling admission lock poisoned"))?
+            .peak;
+        Ok(peak)
+    })
+}
+
+fn release_sample(state: &Mutex<SampleAdmission>, ready: &Condvar, bytes: usize) -> Result<()> {
+    if bytes == 0 {
+        return Ok(());
+    }
+    let mut admission = state
+        .lock()
+        .map_err(|_| anyhow::anyhow!("Sampling admission lock poisoned"))?;
+    admission.bytes -= bytes;
+    admission.active -= 1;
+    ready.notify_all();
+    Ok(())
+}
+
+struct SamplingRasters<'a> {
+    datasets: Vec<std::sync::Mutex<Dataset>>,
+    slots: &'a super::execution::IoSlots,
+    cpus: super::execution::IoSlots,
+    decode_threads: usize,
+    block_size: usize,
+}
+impl SamplingRasters<'_> {
+    fn read_one(&self, index: usize, window: Window) -> Result<io::RasterBlock> {
+        let dataset = self.datasets[index]
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Raster read lock poisoned"))?;
+        let _io = self.slots.acquire()?;
+        let _cpu = self.cpus.acquire_many(self.decode_threads)?;
+        read(&dataset, window)
+    }
+    fn read(&self, window: Window, id: i64) -> Result<Option<Vec<io::RasterBlock>>> {
+        let owners = self.read_one(1, window)?;
+        if !(0..window.width * window.height).any(|cell| owners.value(cell) == Some(id as f64)) {
+            return Ok(None);
+        }
+        let mut owners = Some(owners);
+        (0..self.datasets.len())
+            .map(|index| {
+                if index == 1 {
+                    Ok(owners.take().unwrap())
+                } else {
+                    self.read_one(index, window)
+                }
+            })
+            .collect::<Result<Vec<_>>>()
+            .map(Some)
+    }
+}
+
+enum MiniLookup {
+    Dense(Vec<usize>),
+    Sparse(BTreeMap<i64, usize>),
+}
+impl MiniLookup {
+    fn new(minis: &[Mini]) -> Self {
+        let maximum = minis.iter().map(Mini::id).max().unwrap_or(0);
+        if maximum <= minis.len().saturating_mul(4) as i64 {
+            let mut ids = vec![usize::MAX; maximum as usize + 1];
+            for (i, mini) in minis.iter().enumerate() {
+                ids[mini.id() as usize] = i;
+            }
+            Self::Dense(ids)
+        } else {
+            Self::Sparse(
+                minis
+                    .iter()
+                    .enumerate()
+                    .map(|(i, mini)| (mini.id(), i))
+                    .collect(),
+            )
+        }
+    }
+    fn get(&self, id: i64) -> Option<usize> {
+        match self {
+            Self::Dense(ids) => usize::try_from(id)
+                .ok()
+                .and_then(|id| ids.get(id).copied())
+                .filter(|&id| id != usize::MAX),
+            Self::Sparse(ids) => ids.get(&id).copied(),
+        }
+    }
+}
+
+fn sample_mini(
+    mini: &Mini,
+    rasters: &SamplingRasters<'_>,
+    areas: &io::CellAreas,
+) -> Result<MiniResult> {
     let mut accumulator = Accumulator::new(mini.owned_cells);
-    for window in windows(mini.window) {
-        let blocks = datasets
-            .iter()
-            .map(|source| read(source, window))
-            .collect::<Result<Vec<_>>>()?;
+    let bounds = Window {
+        x: mini.window.x / rasters.block_size * rasters.block_size,
+        y: mini.window.y / rasters.block_size * rasters.block_size,
+        width: mini.window.x + mini.window.width
+            - mini.window.x / rasters.block_size * rasters.block_size,
+        height: mini.window.y + mini.window.height
+            - mini.window.y / rasters.block_size * rasters.block_size,
+    };
+    for window in io::windows_sized(bounds, rasters.block_size) {
+        let Some(blocks) = rasters.read(window, mini.id())? else {
+            continue;
+        };
+        let _cpu = rasters.cpus.acquire()?;
         let mut row_area = None;
         for cell in 0..window.width * window.height {
             if blocks[1].value(cell) != Some(mini.id() as f64) {
@@ -282,52 +609,20 @@ fn sample_mini(mini: &Mini, datasets: &[Dataset], areas: &io::CellAreas) -> Resu
         "Mini {} ownership changed during sampling",
         mini.id()
     );
-    Ok(accumulator.finish(mini.id(), mini.reach_length))
+    accumulator.finish(mini.id(), mini.reach_length)
 }
 
-fn check_collisions(output: &Path) -> Result<()> {
-    for name in std::iter::once("sampled_minis.csv".to_owned())
-        .chain(std::iter::once("manifest-sample-minis.json".to_owned()))
-        .chain(NODATA_NAMES.map(|n| format!("nodata_{n}.csv")))
-    {
-        match fs::symlink_metadata(output.join(&name)) {
-            Ok(_) => bail!(
-                "Sampling product already exists: {}",
-                output.join(name).display()
-            ),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e.into()),
-        }
-    }
-    Ok(())
+fn check_collisions(output: &Path, overwrite: bool) -> Result<()> {
+    super::execution::check_outputs(output, &sampling_names(), overwrite)
 }
-
-fn write_nodata(directory: &Path, results: &[MiniResult]) -> Result<Vec<String>> {
-    let mut files = Vec::new();
-    for (i, name) in NODATA_NAMES.iter().enumerate() {
-        if !results.iter().any(|r| r.nodata[i] > 0) {
-            continue;
-        }
-        let name = format!("nodata_{name}.csv");
-        let mut writer = csv::Writer::from_path(directory.join(&name))?;
-        writer.write_record([
-            "mini_id",
-            "nodata_cells",
-            "total_cells",
-            "percentage_nodata",
-        ])?;
-        for result in results.iter().filter(|r| r.nodata[i] > 0) {
-            writer.write_record([
-                result.id.to_string(),
-                result.nodata[i].to_string(),
-                result.total_cells.to_string(),
-                float(100. * result.nodata[i] as f64 / result.total_cells as f64),
-            ])?;
-        }
-        writer.flush()?;
-        files.push(name);
-    }
-    Ok(files)
+fn sampling_names() -> Vec<String> {
+    [
+        "sampled_minis.csv".into(),
+        "manifest-sample-minis.json".into(),
+    ]
+    .into_iter()
+    .chain(NODATA_NAMES.map(|n| format!("nodata_{n}.csv")))
+    .collect()
 }
 
 // Keep floating columns recognizably floating even when every value is integral.
@@ -335,14 +630,120 @@ fn float(value: f64) -> String {
     format!("{value:?}")
 }
 
-fn write_sampled(directory: &Path, minis: &[Mini], results: &[MiniResult]) -> Result<()> {
-    let classes: Vec<_> = (0..100)
-        .filter(|i| {
-            results
-                .iter()
-                .any(|r| r.statistics.as_ref().unwrap().hru_counts[*i] > 0)
+struct SampleOutput {
+    raw: csv::Writer<File>,
+    nodata: Vec<csv::Writer<File>>,
+    nodata_present: [bool; 5],
+    classes: [bool; 100],
+    failure: Option<String>,
+    failure_count: usize,
+    results: usize,
+}
+
+impl SampleOutput {
+    fn new(directory: &Path) -> Result<Self> {
+        let headers = sample_headers(0..100);
+        let mut raw = csv::Writer::from_path(directory.join(".sampled_minis.raw.csv"))?;
+        raw.write_record(headers)?;
+        let mut nodata = Vec::with_capacity(NODATA_NAMES.len());
+        for name in NODATA_NAMES {
+            let mut writer = csv::Writer::from_path(directory.join(format!("nodata_{name}.csv")))?;
+            writer.write_record([
+                "mini_id",
+                "nodata_cells",
+                "total_cells",
+                "percentage_nodata",
+            ])?;
+            nodata.push(writer);
+        }
+        Ok(Self {
+            raw,
+            nodata,
+            nodata_present: [false; 5],
+            classes: [false; 100],
+            failure: None,
+            failure_count: 0,
+            results: 0,
         })
-        .collect();
+    }
+
+    fn add(&mut self, mini: &Mini, result: MiniResult) -> Result<()> {
+        ensure!(mini.id() == result.id, "Sampling result ID mismatch");
+        self.results += 1;
+        for (i, &count) in result.nodata.iter().enumerate() {
+            if count == 0 {
+                continue;
+            }
+            self.nodata_present[i] = true;
+            self.nodata[i].write_record([
+                result.id.to_string(),
+                count.to_string(),
+                result.total_cells.to_string(),
+                float(100. * count as f64 / result.total_cells as f64),
+            ])?;
+        }
+        let Some(statistics) = result.statistics else {
+            self.failure_count += 1;
+            if self.failure.is_none() {
+                self.failure = result
+                    .failures
+                    .into_iter()
+                    .next()
+                    .or_else(|| Some(format!("Mini {} has incomplete statistics", mini.id())));
+            }
+            return Ok(());
+        };
+        for (present, &count) in self.classes.iter_mut().zip(&statistics.hru_counts) {
+            *present |= count > 0;
+        }
+        self.raw
+            .write_record(sample_row(mini, &statistics, 0..100))?;
+        Ok(())
+    }
+
+    fn finish(
+        mut self,
+        directory: &Path,
+        mini_count: usize,
+    ) -> Result<(Vec<String>, Option<String>)> {
+        self.raw.flush()?;
+        drop(self.raw);
+        for writer in &mut self.nodata {
+            writer.flush()?;
+        }
+        drop(self.nodata);
+        let files: Vec<_> = NODATA_NAMES
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| self.nodata_present[*i])
+            .map(|(_, name)| format!("nodata_{name}.csv"))
+            .collect();
+        for (i, name) in NODATA_NAMES.iter().enumerate() {
+            if !self.nodata_present[i] {
+                fs::remove_file(directory.join(format!("nodata_{name}.csv")))?;
+            }
+        }
+        if self.failure_count == 0 {
+            ensure!(self.results == mini_count, "Incomplete sampling results");
+            write_sampled(directory, &self.classes)?;
+        } else {
+            fs::remove_file(directory.join(".sampled_minis.raw.csv"))?;
+        }
+        let failure = self.failure.map(|message| {
+            if self.failure_count > 1 {
+                format!(
+                    "{message} ({} additional mini failures)",
+                    self.failure_count - 1
+                )
+            } else {
+                message
+            }
+        });
+        Ok((files, failure))
+    }
+}
+
+fn sample_headers(classes: impl Iterator<Item = usize>) -> Vec<String> {
     let mut headers: Vec<_> = ATTRIBUTES.iter().map(|name| (*name).to_owned()).collect();
     headers.extend(
         [
@@ -355,44 +756,64 @@ fn write_sampled(directory: &Path, minis: &[Mini], results: &[MiniResult]) -> Re
         ]
         .map(str::to_owned),
     );
-    headers.extend(classes.iter().map(|id| format!("hru_{}", id + 1)));
+    headers.extend(classes.map(|id| format!("hru_{}", id + 1)));
     headers.extend((1..=100).map(|stage| format!("flooded_area_{stage}")));
+    headers
+}
+
+fn sample_row(
+    mini: &Mini,
+    stats: &Statistics,
+    classes: impl Iterator<Item = usize>,
+) -> Vec<String> {
+    let mut row: Vec<_> = mini
+        .attributes
+        .integers
+        .iter()
+        .map(i64::to_string)
+        .collect();
+    row.extend(mini.attributes.metrics.iter().map(|v| float(*v)));
+    row.extend(
+        [
+            mini.longitude,
+            mini.latitude,
+            stats.reach_slope,
+            stats.reach_elevation,
+            stats.tributary_length,
+            stats.tributary_slope,
+        ]
+        .map(float),
+    );
+    let total = stats.hru_counts.iter().sum::<u64>() as f64;
+    row.extend(classes.map(|i| float(100. * stats.hru_counts[i] as f64 / total)));
+    row.extend(stats.flooded_area.map(float));
+    row
+}
+
+fn write_sampled(directory: &Path, classes: &[bool; 100]) -> Result<()> {
+    let raw_path = directory.join(".sampled_minis.raw.csv");
+    let mut reader = csv::Reader::from_path(&raw_path)?;
+    let headers = reader.headers()?.clone();
+    let keep: Vec<_> = headers
+        .iter()
+        .enumerate()
+        .filter_map(|(i, header)| {
+            let class = header
+                .strip_prefix("hru_")
+                .and_then(|value| value.parse::<usize>().ok());
+            class
+                .is_none_or(|class| (1..=100).contains(&class) && classes[class - 1])
+                .then_some(i)
+        })
+        .collect();
     let mut writer = csv::Writer::from_path(directory.join("sampled_minis.csv"))?;
-    writer.write_record(headers)?;
-    for (mini, result) in minis.iter().zip(results) {
-        ensure!(mini.id() == result.id, "Sampling result ID mismatch");
-        let s = result
-            .statistics
-            .as_ref()
-            .context("Incomplete sampling statistics")?;
-        let mut row: Vec<_> = mini
-            .attributes
-            .integers
-            .iter()
-            .map(i64::to_string)
-            .collect();
-        row.extend(mini.attributes.metrics.iter().map(|v| float(*v)));
-        row.extend(
-            [
-                mini.longitude,
-                mini.latitude,
-                s.reach_slope,
-                s.reach_elevation,
-                s.tributary_length,
-                s.tributary_slope,
-            ]
-            .map(float),
-        );
-        let total = s.hru_counts.iter().sum::<u64>() as f64;
-        row.extend(
-            classes
-                .iter()
-                .map(|i| float(100. * s.hru_counts[*i] as f64 / total)),
-        );
-        row.extend(s.flooded_area.map(float));
-        writer.write_record(row)?;
+    writer.write_record(keep.iter().map(|&i| &headers[i]))?;
+    for row in reader.records() {
+        let row = row?;
+        writer.write_record(keep.iter().map(|&i| &row[i]))?;
     }
     writer.flush()?;
+    fs::remove_file(raw_path)?;
     Ok(())
 }
 
@@ -451,9 +872,21 @@ fn inspect(spec: &SamplingSpec) -> Result<(Grid, Vec<Mini>)> {
 }
 
 fn open_rasters(spec: &SamplingSpec) -> Result<Vec<Dataset>> {
+    open_rasters_threaded(spec, 1)
+}
+fn open_rasters_threaded(spec: &SamplingSpec, threads: usize) -> Result<Vec<Dataset>> {
+    let option = format!("NUM_THREADS={threads}");
     spec.rasters()
-        .iter()
-        .map(|path| Dataset::open(path).with_context(|| format!("Open raster {}", path.display())))
+        .into_iter()
+        .map(|path| {
+            Ok(Dataset::open_ex(
+                path,
+                gdal::DatasetOptions {
+                    open_options: Some(&[option.as_str()]),
+                    ..Default::default()
+                },
+            )?)
+        })
         .collect()
 }
 
@@ -561,7 +994,7 @@ fn read_vectors(
 }
 
 fn validate_ownership(datasets: &[Dataset], grid: &Grid, minis: &mut [Mini]) -> Result<()> {
-    let ids: BTreeMap<_, _> = minis.iter().enumerate().map(|(i, m)| (m.id(), i)).collect();
+    let ids = MiniLookup::new(minis);
     let mut bounds = vec![(usize::MAX, usize::MAX, 0, 0); minis.len()];
     for window in windows(Window {
         x: 0,
@@ -581,8 +1014,8 @@ fn validate_ownership(datasets: &[Dataset], grid: &Grid, minis: &mut [Mini]) -> 
                 continue;
             };
             let id = owner as i64;
-            let index = *ids
-                .get(&id)
+            let index = ids
+                .get(id)
                 .with_context(|| format!("Ownership contains unknown mini {id}"))?;
             if let Some(segment) = segments.value(cell) {
                 ensure!(
@@ -631,7 +1064,6 @@ struct Accumulator {
 
 impl Accumulator {
     pub fn new(cells: usize) -> Self {
-        // shortcut: exact samples must fit in memory, add disk-backed samples when oversized minis are needed.
         Self {
             total_cells: 0,
             nodata: [0; 5],
@@ -695,7 +1127,7 @@ impl Accumulator {
         Ok(())
     }
 
-    pub fn finish(mut self, id: i64, reach_length: f64) -> MiniResult {
+    pub fn finish(mut self, id: i64, reach_length: f64) -> Result<MiniResult> {
         let mut failures = Vec::new();
         for (valid, name) in [
             (self.hru.iter().sum::<u64>() > 0, "HRU percentages"),
@@ -756,13 +1188,13 @@ impl Accumulator {
             failures.push(format!("Mini {id} produced non-finite statistics"));
             statistics = None;
         }
-        MiniResult {
+        Ok(MiniResult {
             id,
             total_cells: self.total_cells,
             nodata: self.nodata,
             statistics,
             failures,
-        }
+        })
     }
 }
 
@@ -794,7 +1226,7 @@ mod tests {
             )
             .unwrap();
         }
-        let stats = acc.finish(12, 2.).statistics.unwrap();
+        let stats = acc.finish(12, 2.).unwrap().statistics.unwrap();
         assert_eq!(stats.reach_elevation, 15.);
         assert_eq!(stats.reach_slope, 15.);
         assert!((stats.tributary_slope - 0.05).abs() < 1e-15);
@@ -804,13 +1236,43 @@ mod tests {
         assert!((stats.flooded_area[99] - 0.3).abs() < 1e-15);
     }
     #[test]
+    fn oversized_mini_reservation_is_reported_without_overflow() {
+        let mini = Mini {
+            attributes: Attributes {
+                integers: [1; 4],
+                metrics: [1.; 4],
+            },
+            longitude: 0.,
+            latitude: 0.,
+            reach_length: 1.,
+            window: Window {
+                x: 0,
+                y: 0,
+                width: 20,
+                height: 30,
+            },
+            owned_cells: 1_000,
+        };
+        assert_eq!(
+            sample_reservation(&mini, 32 * MIB).unwrap(),
+            32 * MIB + (20 * 30 * 54) + 24_000 + 2048
+        );
+        let required = sample_reservation(&mini, 32 * MIB).unwrap();
+        let error = ensure_sample_fits(&mini, required - 1, 32 * MIB).unwrap_err();
+        assert!(format!("{error:#}").contains("Mini 1 requires about 33 MiB"));
+        let mut too_large = mini;
+        too_large.owned_cells = usize::MAX;
+        assert!(sample_reservation(&too_large, 32 * MIB).is_err());
+    }
+
+    #[test]
     fn missing_pairs_and_invalid_values() {
         let mut acc = Accumulator::new(2);
         acc.add(1, [Some(1.), Some(1.), None, Some(1.), Some(1.)], 1.)
             .unwrap();
         acc.add(1, [Some(1.), Some(1.), Some(2.), None, Some(1.)], 1.)
             .unwrap();
-        let result = acc.finish(1, 1.);
+        let result = acc.finish(1, 1.).unwrap();
         assert!(result.statistics.is_none());
         assert_eq!(result.nodata, [0, 0, 1, 1, 0]);
         assert!(result.failures[0].contains("paired"));
@@ -826,7 +1288,7 @@ mod tests {
             acc.add(1, [Some(dem), Some(1.), Some(1.), Some(1.), Some(1.)], 1.)
                 .unwrap();
         }
-        let result = acc.finish(1, f64::MIN_POSITIVE);
+        let result = acc.finish(1, f64::MIN_POSITIVE).unwrap();
         assert!(result.statistics.is_none());
         assert!(result.failures[0].contains("non-finite"));
     }

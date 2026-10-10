@@ -76,6 +76,9 @@ fn network() -> Vec<(FieldValue, Option<FieldValue>, Option<f64>)> {
 }
 pub fn spec(root: &Path) -> RoiSpec {
     RoiSpec {
+        overwrite: false,
+        io_slots: 2,
+        batch_size: 10000,
         catchments: root.join("catchments.fgb"),
         segments: root.join("segments.fgb"),
         output_dir: root.join("roi"),

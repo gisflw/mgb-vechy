@@ -1,6 +1,5 @@
 //! Shared raster windows, geometry-independent CRS transforms, and cell areas.
-pub(crate) mod vector;
-use super::model::{Grid, Window};
+use super::super::model::{Grid, Window};
 use anyhow::{Context, Result, bail, ensure};
 use gdal::{
     Dataset, DriverManager, Metadata,
@@ -18,16 +17,19 @@ pub(crate) fn spatial_ref(wkt: &str) -> Result<SpatialRef> {
 }
 
 pub(crate) fn windows(bounds: Window) -> impl Iterator<Item = Window> {
+    windows_sized(bounds, BLOCK)
+}
+pub(crate) fn windows_sized(bounds: Window, size: usize) -> impl Iterator<Item = Window> {
     (bounds.y..bounds.y + bounds.height)
-        .step_by(BLOCK)
+        .step_by(size)
         .flat_map(move |y| {
             (bounds.x..bounds.x + bounds.width)
-                .step_by(BLOCK)
+                .step_by(size)
                 .map(move |x| Window {
                     x,
                     y,
-                    width: BLOCK.min(bounds.x + bounds.width - x),
-                    height: BLOCK.min(bounds.y + bounds.height - y),
+                    width: size.min(bounds.x + bounds.width - x),
+                    height: size.min(bounds.y + bounds.height - y),
                 })
         })
 }

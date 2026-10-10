@@ -13,15 +13,18 @@ use gdal::{
 use geos::{Geom, Geometry as GeosGeometry, STRtree, SpatialIndex};
 use serde::Serialize;
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, VecDeque},
     fs,
     path::{Path, PathBuf},
     sync::{
+        Arc, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc,
     },
     thread,
 };
+
+const GEOMETRY_CACHE_BYTES: usize = 8 * MIB;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -57,6 +60,8 @@ pub struct PreparationSpec {
     pub workers: usize,
     /// Application allocation budget in MiB, not a hard RSS ceiling.
     pub memory_limit_mb: usize,
+    pub overwrite: bool,
+    pub io_slots: usize,
 }
 
 #[derive(Debug)]
@@ -69,10 +74,14 @@ pub struct PreparationReport {
     pub manifest: PathBuf,
     pub mini_count: usize,
     pub workers_used: usize,
+    pub timings: super::execution::StageTimings,
 }
 
 struct Mini {
+    #[cfg(test)]
     wkb: Vec<u8>,
+    fid: u64,
+    geometry_bytes: usize,
     bounds: [f64; 4],
     downstream: Option<i32>,
 }
@@ -116,6 +125,7 @@ fn read_minis(
         );
     }
     let mut rows = BTreeMap::new();
+
     for feature in layer.features() {
         let id = integer(vector::value(&feature, id_col)?)?.context("Null mini ID")?;
         ensure!(
@@ -134,16 +144,11 @@ fn read_minis(
         ensure!(!geometry.is_empty(), "Empty mini geometry");
         let wkb = geometry.wkb()?;
         *retained = retained
-            .checked_add(
-                wkb.len()
-                    .checked_mul(4)
-                    .and_then(|v| v.checked_add(256))
-                    .context("Geometry allocation overflow")?,
-            )
-            .context("Geometry allocation overflow")?;
+            .checked_add(256)
+            .context("Mini metadata overflow")?;
         ensure!(
             *retained < budget,
-            "Mini geometry exceeds application memory budget"
+            "Mini metadata exceeds application memory budget"
         );
         vector::validate_geometry(&wkb, polygon)?;
         let e = geometry.envelope();
@@ -155,7 +160,10 @@ fn read_minis(
         rows.insert(
             id,
             Mini {
-                wkb,
+                #[cfg(test)]
+                wkb: Vec::new(),
+                fid: feature.fid().context("Mini has no feature ID")?,
+                geometry_bytes: wkb.len(),
                 bounds,
                 downstream,
             },
@@ -272,29 +280,113 @@ fn source_offset(source: &Dataset, grid: &Grid) -> Result<(usize, usize)> {
 
 struct Index {
     tree: STRtree<usize>,
-    geometries: Vec<GeosGeometry>,
+    _geometries: Vec<GeosGeometry>,
+    exact_geometries: Vec<Option<GeosGeometry>>,
+    exact_wkb: Vec<Option<Vec<u8>>>,
     burns: Vec<Geometry>,
+    ids: Vec<usize>,
 }
+
+struct GeometryCache {
+    entries: HashMap<(bool, u64), Arc<[u8]>>,
+    order: VecDeque<(bool, u64)>,
+    bytes: usize,
+    limit: usize,
+}
+
+impl GeometryCache {
+    fn new(limit: usize) -> Self {
+        Self {
+            entries: HashMap::new(),
+            order: VecDeque::new(),
+            bytes: 0,
+            limit,
+        }
+    }
+
+    fn get(&mut self, polygon: bool, fid: u64) -> Option<Arc<[u8]>> {
+        let key = (polygon, fid);
+        let geometry = self.entries.get(&key)?.clone();
+        if let Some(position) = self.order.iter().position(|&cached| cached == key) {
+            self.order.remove(position);
+        }
+        self.order.push_back(key);
+        Some(geometry)
+    }
+
+    fn insert(&mut self, polygon: bool, fid: u64, wkb: Vec<u8>) -> Arc<[u8]> {
+        if let Some(geometry) = self.get(polygon, fid) {
+            return geometry;
+        }
+        let size = wkb.len().saturating_add(64);
+        if size > self.limit {
+            return Arc::from(wkb);
+        }
+        while self.bytes.saturating_add(size) > self.limit {
+            let Some(oldest) = self.order.pop_front() else {
+                break;
+            };
+            if let Some(geometry) = self.entries.remove(&oldest) {
+                self.bytes -= geometry.len().saturating_add(64);
+            }
+        }
+        let geometry: Arc<[u8]> = Arc::from(wkb);
+        self.bytes += size;
+        let key = (polygon, fid);
+        self.order.push_back(key);
+        self.entries.insert(key, geometry.clone());
+        geometry
+    }
+}
+
+fn geometry_wkb(
+    polygon: bool,
+    fid: u64,
+    layer: &mut gdal::vector::Layer<'_>,
+    slots: &super::execution::IoSlots,
+    cache: &Mutex<GeometryCache>,
+) -> Result<Arc<[u8]>> {
+    if let Some(geometry) = cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(polygon, fid)
+    {
+        return Ok(geometry);
+    }
+    let _permit = slots.acquire()?;
+    let feature = layer
+        .feature(fid)
+        .context("Mini disappeared while preparing raster window")?;
+    let wkb = feature.geometry().context("Missing mini geometry")?.wkb()?;
+    drop(_permit);
+    Ok(cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(polygon, fid, wkb))
+}
+
 impl Index {
+    #[cfg(test)]
     fn new(rows: &[Mini], polygon: bool) -> Result<Self> {
         let mut tree = STRtree::with_capacity(10)?;
         let mut geometries = Vec::with_capacity(rows.len());
+        let mut exact_wkb = Vec::with_capacity(rows.len());
         let mut burns = Vec::with_capacity(rows.len());
         for (i, row) in rows.iter().enumerate() {
             let b = row.bounds;
-            let geometry = if polygon {
-                GeosGeometry::new_from_wkb(&row.wkb)?
-            } else {
-                GeosGeometry::create_rectangle(b[0], b[1], b[2], b[3])?
-            };
+            let geometry = GeosGeometry::create_rectangle(b[0], b[1], b[2], b[3])?;
             tree.insert(&geometry, i);
             geometries.push(geometry);
+            exact_wkb.push(polygon.then(|| row.wkb.clone()));
             burns.push(Geometry::from_wkb(&row.wkb)?);
         }
         Ok(Self {
             tree,
-            geometries,
+            _geometries: geometries,
+            exact_geometries: std::iter::repeat_with(|| None).take(rows.len()).collect(),
+            exact_wkb,
             burns,
+            ids: (0..rows.len()).collect(),
         })
     }
     fn hits(&self, query: &GeosGeometry) -> Vec<usize> {
@@ -302,6 +394,35 @@ impl Index {
         self.tree.query(query, |id| hits.push(*id));
         hits.sort_unstable();
         hits
+    }
+
+    fn bounds(rows: &[Mini]) -> Result<Self> {
+        let mut tree = STRtree::with_capacity(10)?;
+        let mut geometries = Vec::with_capacity(rows.len());
+        for (i, row) in rows.iter().enumerate() {
+            let b = row.bounds;
+            let geometry = GeosGeometry::create_rectangle(b[0], b[1], b[2], b[3])?;
+            tree.insert(&geometry, i);
+            geometries.push(geometry);
+        }
+        Ok(Self {
+            tree,
+            _geometries: geometries,
+            exact_geometries: std::iter::repeat_with(|| None).take(rows.len()).collect(),
+            exact_wkb: std::iter::repeat_with(|| None).take(rows.len()).collect(),
+            burns: Vec::new(),
+            ids: (0..rows.len()).collect(),
+        })
+    }
+
+    fn exact_geometry(&mut self, id: usize) -> Result<&GeosGeometry> {
+        if self.exact_geometries[id].is_none() {
+            let bytes = self.exact_wkb[id]
+                .as_deref()
+                .context("Missing exact geometry for ownership collision")?;
+            self.exact_geometries[id] = Some(GeosGeometry::new_from_wkb(bytes)?);
+        }
+        Ok(self.exact_geometries[id].as_ref().unwrap())
     }
 }
 
@@ -340,7 +461,13 @@ fn burn<T: GdalType + Copy>(
     let labels: Vec<_> = hits
         .iter()
         .rev()
-        .map(|&i| if occupancy { 1. } else { (i + 1) as f64 })
+        .map(|&i| {
+            if occupancy {
+                1.
+            } else {
+                (index.ids[i] + 1) as f64
+            }
+        })
         .collect();
     if !hits.is_empty() {
         rasterize(
@@ -371,7 +498,7 @@ fn burn<T: GdalType + Copy>(
         .to_vec())
 }
 
-fn ownership(index: &Index, hits: &[usize], grid: &Grid) -> Result<Vec<i32>> {
+fn ownership(index: &mut Index, hits: &[usize], grid: &Grid) -> Result<Vec<i32>> {
     let mut owners = burn::<i32>(index, hits, grid, false, false)?;
     let occupancy = burn::<u32>(index, hits, grid, false, true)?;
     for (cell, &count) in occupancy.iter().enumerate() {
@@ -389,14 +516,16 @@ fn ownership(index: &Index, hits: &[usize], grid: &Grid) -> Result<Vec<i32>> {
         let mut interior = None;
         let mut boundary = None;
         for i in index.hits(&point) {
-            if index.geometries[i].contains(&point)? {
+            if index.exact_geometry(i)?.contains(&point)? {
                 ensure!(
                     interior.is_none(),
                     "Mini catchments overlap at raster cell {row},{col}"
                 );
-                interior = Some(i as i32 + 1);
-            } else if index.geometries[i].covers(&point)? {
-                boundary = Some(boundary.map_or(i as i32 + 1, |v: i32| v.min(i as i32 + 1)));
+                interior = Some(index.ids[i] as i32 + 1);
+            } else if index.exact_geometry(i)?.covers(&point)? {
+                boundary = Some(boundary.map_or(index.ids[i] as i32 + 1, |v: i32| {
+                    v.min(index.ids[i] as i32 + 1)
+                }));
             }
         }
         owners[cell] = if let Some(id) = interior.or(boundary) {
@@ -452,30 +581,20 @@ fn drainage(
         .enumerate()
         .filter_map(|(i, &count)| (count > 1).then_some(i))
         .collect();
-    ensure!(
-        cells
-            .len()
-            .checked_mul(hits.len())
-            .and_then(|v| v.checked_mul(16))
-            .context("Collision allocation overflow")?
-            <= workspace,
-        "Segment collision workspace exceeds memory budget"
-    );
-    let mut contenders = vec![Vec::new(); cells.len()];
-    for &id in hits {
-        let mask = burn::<u8>(index, &[id], grid, true, true)?;
-        for (list, &cell) in contenders.iter_mut().zip(&cells) {
-            if mask[cell] != 0 {
-                list.push(id);
+    let batch_cells = (workspace / hits.len().max(1) / 16).max(1);
+    for batch in cells.chunks(batch_cells) {
+        let mut contenders = vec![Vec::new(); batch.len()];
+        for &id in hits {
+            let mask = burn::<u8>(index, &[id], grid, true, true)?;
+            for (list, &cell) in contenders.iter_mut().zip(batch) {
+                if mask[cell] != 0 {
+                    list.push(index.ids[id]);
+                }
             }
         }
-    }
-    let mut winners = HashMap::new();
-    for (&cell, choices) in cells.iter().zip(contenders) {
-        let id = *winners
-            .entry(choices.clone())
-            .or_insert_with(|| winner(&choices, downstream));
-        ids[cell] = id as i32 + 1;
+        for (&cell, choices) in batch.iter().zip(contenders) {
+            ids[cell] = winner(&choices, downstream) as i32 + 1;
+        }
     }
     Ok(ids)
 }
@@ -687,8 +806,18 @@ fn validate_spec(spec: &PreparationSpec) -> Result<usize> {
         .context("Memory budget overflow")
 }
 
-/// Prepare aligned inputs without overwriting existing stage products.
+/// Prepare aligned inputs; replacements require `overwrite`.
 pub fn prepare_dataset(request: &PreparationSpec) -> Result<PreparationReport> {
+    prepare_dataset_with_progress(request, &|_| {})
+}
+
+pub fn prepare_dataset_with_progress(
+    request: &PreparationSpec,
+    progress: super::execution::ProgressCallback<'_>,
+) -> Result<PreparationReport> {
+    let mut reporter = super::execution::Reporter::new(progress);
+    let io_slots = super::execution::IoSlots::new(request.io_slots)?;
+
     let budget = validate_spec(request)?;
     let mut spec = request.clone();
     spec.dem = vector::absolute_input(&spec.dem)?;
@@ -727,9 +856,21 @@ pub fn prepare_dataset(request: &PreparationSpec) -> Result<PreparationReport> {
         "manifest-prepare.json".into(),
     ]);
     let refs: Vec<_> = names.iter().map(String::as_str).collect();
-    spec.output_dir = vector::output_paths(&spec.output_dir, &refs)?;
+    spec.output_dir = vector::output_paths(&spec.output_dir, &refs, spec.overwrite)?;
+    let mut affected = names.clone();
+    affected.extend(super::execution::preparation_optional(&spec.output_dir)?);
+    super::execution::check_outputs(&spec.output_dir, &affected, spec.overwrite)?;
+    let mut inputs = vec![
+        spec.dem.as_path(),
+        spec.mini_catchments.as_path(),
+        spec.mini_segments.as_path(),
+    ];
+    inputs.extend(spec.rasters.iter().map(|r| r.path.as_path()));
+    inputs.extend(spec.d8.as_deref());
+    super::execution::protect_inputs(&spec.output_dir, &affected, &inputs)?;
     let _cache = CacheBudget::new()?;
     let mut retained = CACHE_BYTES + 32 * MIB;
+    fs::create_dir_all(&spec.output_dir)?;
     let (crs, catchments) = read_minis(&spec.mini_catchments, true, budget, &mut retained)?;
     let (segment_crs, segments) = read_minis(&spec.mini_segments, false, budget, &mut retained)?;
     ensure!(
@@ -751,49 +892,81 @@ pub fn prepare_dataset(request: &PreparationSpec) -> Result<PreparationReport> {
         .div_ceil(BLOCK)
         .checked_mul(grid.height.div_ceil(BLOCK))
         .context("Block count overflow")?;
-    let geometry_bytes = catchments
-        .iter()
-        .chain(&segments)
-        .try_fold(0usize, |size, row| {
-            size.checked_add(row.wkb.len())
-                .context("Geometry allocation overflow")
-        })?;
-    // shortcut: vectors stay resident, add external geometry indexing only for inputs beyond this budget.
-    let worker_base = geometry_bytes
-        .checked_mul(16)
-        .and_then(|v| v.checked_add(32 * MIB))
-        .and_then(|v| {
-            sources
-                .len()
-                .checked_mul(15)
-                .and_then(|n| n.checked_add(96))
-                .and_then(|n| n.checked_mul(BLOCK * BLOCK))
-                .and_then(|n| v.checked_add(n))
-        })
-        .context("Preparation allocation overflow")?;
+    let block_bytes = (sources.len() * 15 + 96) * BLOCK * BLOCK;
+    let polygon_bounds = Index::bounds(&catchments)?;
+    let line_bounds = Index::bounds(&segments)?;
+    let mut largest_window_geometry = 0usize;
+    let columns = grid.width.div_ceil(BLOCK);
+    for ordinal in 0..block_count {
+        let x = ordinal % columns * BLOCK;
+        let y = ordinal / columns * BLOCK;
+        let window = Window {
+            x,
+            y,
+            width: BLOCK.min(grid.width - x),
+            height: BLOCK.min(grid.height - y),
+        };
+        let local = block_grid(&grid, window);
+        let t = local.transform;
+        let query = GeosGeometry::create_rectangle(
+            t[0],
+            t[3] + local.height as f64 * t[5],
+            t[0] + local.width as f64 * t[1],
+            t[3],
+        )?;
+        let polygon_bytes = polygon_bounds
+            .hits(&query)
+            .into_iter()
+            .try_fold(0usize, |bytes, id| {
+                bytes.checked_add(catchments[id].geometry_bytes)
+            })
+            .context("Preparation geometry allocation overflow")?;
+        let line_bytes = line_bounds
+            .hits(&query)
+            .into_iter()
+            .try_fold(0usize, |bytes, id| {
+                bytes.checked_add(segments[id].geometry_bytes)
+            })
+            .context("Preparation geometry allocation overflow")?;
+        largest_window_geometry = largest_window_geometry.max(
+            polygon_bytes
+                .checked_add(line_bytes)
+                .context("Preparation geometry allocation overflow")?,
+        );
+    }
+    drop(polygon_bounds);
+    drop(line_bounds);
+    let index_bytes = catchments
+        .len()
+        .checked_add(segments.len())
+        .and_then(|n| n.checked_mul(512))
+        .context("Preparation spatial index allocation overflow")?;
+    let worker_base = block_bytes
+        .checked_add(32 * MIB)
+        .and_then(|bytes| bytes.checked_add(index_bytes))
+        .and_then(|bytes| bytes.checked_add(largest_window_geometry.checked_mul(16)?))
+        .context("Preparation worker allocation overflow")?;
+    let geometry_cache_bytes = (budget / 64).min(GEOMETRY_CACHE_BYTES);
     retained = retained
-        .checked_add(
-            block_count
-                .checked_mul(64)
-                .context("Block allocation overflow")?,
-        )
-        .context("Preparation allocation overflow")?;
+        .checked_add((8 + sources.len() * 5) * BLOCK * BLOCK)
+        .and_then(|bytes| bytes.checked_add(geometry_cache_bytes))
+        .context("Coordinator buffer overflow")?;
     let available = budget
         .checked_sub(retained)
         .context("Memory budget cannot hold preparation inputs")?;
     ensure!(
         worker_base <= available,
-        "Preparation worker exceeds memory budget; increase --memory-limit-mb"
+        "One preparation window requires about {} MiB; increase --memory-limit-mb",
+        worker_base.div_ceil(MIB)
     );
     let workers = spec.workers.min(block_count).min(available / worker_base);
+    ensure!(
+        workers > 0,
+        "Memory budget cannot hold one preparation worker"
+    );
     let collision_workspace = available / workers - worker_base;
-    let blocks: Vec<_> = io::windows(Window {
-        x: 0,
-        y: 0,
-        width: grid.width,
-        height: grid.height,
-    })
-    .collect();
+    let geometry_cache = Mutex::new(GeometryCache::new(geometry_cache_bytes));
+
     fs::create_dir_all(&spec.output_dir)?;
     spec.output_dir = fs::canonicalize(&spec.output_dir)?;
     let staging = tempfile::tempdir_in(&spec.output_dir)?;
@@ -827,8 +1000,10 @@ pub fn prepare_dataset(request: &PreparationSpec) -> Result<PreparationReport> {
     let cancelled = AtomicBool::new(false);
     let active = AtomicUsize::new(0);
     let peak = AtomicUsize::new(0);
+    reporter.enter("processing", "Preparing raster blocks");
+    let mut completed = 0;
     thread::scope(|scope| -> Result<()> {
-        let (sender, receiver) = mpsc::sync_channel(workers);
+        let (sender, receiver) = mpsc::sync_channel(0);
         let mut handles = Vec::new();
         for _ in 0..workers {
             let sender = sender.clone();
@@ -836,38 +1011,54 @@ pub fn prepare_dataset(request: &PreparationSpec) -> Result<PreparationReport> {
                 catchments,
                 segments,
                 grid,
-                blocks,
                 sources,
                 downstream,
                 next,
                 cancelled,
                 active,
                 peak,
+                geometry_cache,
             ) = (
                 &catchments,
                 &segments,
                 &grid,
-                &blocks,
                 &sources,
                 &downstream,
                 &next,
                 &cancelled,
                 &active,
                 &peak,
+                &geometry_cache,
             );
+            let io_slots = &io_slots;
+            let catchment_path = &spec.mini_catchments;
+            let segment_path = &spec.mini_segments;
             let scale = spec.dem_scale;
             handles.push(scope.spawn(move || {
                 let work = || -> Result<()> {
-                    let polygons = Index::new(catchments, true)?;
-                    let lines = Index::new(segments, false)?;
+                    let polygons = Index::bounds(catchments)?;
+                    let lines = Index::bounds(segments)?;
+                    let polygon_provider = vector::Provider::open(catchment_path, None, None)?;
+                    let line_provider = vector::Provider::open(segment_path, None, None)?;
+                    let mut polygon_layer = polygon_provider.layer()?;
+                    let mut line_layer = line_provider.layer()?;
                     let readers = sources
                         .iter()
                         .map(|s| Reader::open(s, grid))
                         .collect::<Result<Vec<_>>>()?;
                     while !cancelled.load(Ordering::Relaxed) {
                         let ordinal = next.fetch_add(1, Ordering::Relaxed);
-                        let Some(&window) = blocks.get(ordinal) else {
+                        if ordinal >= block_count {
                             break;
+                        }
+                        let columns = grid.width.div_ceil(BLOCK);
+                        let x = ordinal % columns * BLOCK;
+                        let y = ordinal / columns * BLOCK;
+                        let window = Window {
+                            x,
+                            y,
+                            width: BLOCK.min(grid.width - x),
+                            height: BLOCK.min(grid.height - y),
                         };
                         peak.fetch_max(
                             active.fetch_add(1, Ordering::Relaxed) + 1,
@@ -882,10 +1073,30 @@ pub fn prepare_dataset(request: &PreparationSpec) -> Result<PreparationReport> {
                                 t[0] + local.width as f64 * t[1],
                                 t[3],
                             )?;
-                            let mut owners = ownership(&polygons, &polygons.hits(&query), &local)?;
+                            let polygon_ids = polygons.hits(&query);
+                            let line_ids = lines.hits(&query);
+                            let mut local_polygons = selected_index(
+                                catchments,
+                                &polygon_ids,
+                                true,
+                                &mut polygon_layer,
+                                io_slots,
+                                geometry_cache,
+                            )?;
+                            let local_lines = selected_index(
+                                segments,
+                                &line_ids,
+                                false,
+                                &mut line_layer,
+                                io_slots,
+                                geometry_cache,
+                            )?;
+                            let polygon_hits: Vec<_> = (0..polygon_ids.len()).collect();
+                            let line_hits: Vec<_> = (0..line_ids.len()).collect();
+                            let mut owners = ownership(&mut local_polygons, &polygon_hits, &local)?;
                             let segments = drainage(
-                                &lines,
-                                &lines.hits(&query),
+                                &local_lines,
+                                &line_hits,
                                 &local,
                                 downstream,
                                 collision_workspace,
@@ -895,6 +1106,7 @@ pub fn prepare_dataset(request: &PreparationSpec) -> Result<PreparationReport> {
                                     *owner = id;
                                 }
                             }
+                            let _permit = io_slots.acquire()?;
                             let rasters = readers
                                 .iter()
                                 .zip(sources)
@@ -962,6 +1174,8 @@ pub fn prepare_dataset(request: &PreparationSpec) -> Result<PreparationReport> {
                     }
                     write_mask(ds, w, patch.mask)?;
                 }
+                completed += 1;
+                reporter.advance(completed, Some(block_count));
                 Ok(())
             }();
             if let Err(error) = reduce {
@@ -981,6 +1195,7 @@ pub fn prepare_dataset(request: &PreparationSpec) -> Result<PreparationReport> {
         }
         Ok(())
     })?;
+    reporter.enter("finalizing", "Compressing preparation COGs");
     let index = bounds
         .iter()
         .enumerate()
@@ -1054,8 +1269,11 @@ pub fn prepare_dataset(request: &PreparationSpec) -> Result<PreparationReport> {
         &spec,
         &products,
         workers_used,
+        reporter.elapsed_seconds(),
     )?;
+    let timings = reporter.finish();
     Ok(PreparationReport {
+        timings,
         dem: spec.output_dir.join("dem.tif"),
         rasters: spec
             .rasters
@@ -1076,6 +1294,37 @@ pub fn prepare_dataset(request: &PreparationSpec) -> Result<PreparationReport> {
     })
 }
 
+fn selected_index(
+    rows: &[Mini],
+    ids: &[usize],
+    polygon: bool,
+    layer: &mut gdal::vector::Layer<'_>,
+    io_slots: &super::execution::IoSlots,
+    geometry_cache: &Mutex<GeometryCache>,
+) -> Result<Index> {
+    let mut tree = STRtree::with_capacity(10)?;
+    let mut geometries = Vec::with_capacity(ids.len());
+    let mut exact_wkb = Vec::with_capacity(ids.len());
+    let mut burns = Vec::with_capacity(ids.len());
+    for (local_id, &id) in ids.iter().enumerate() {
+        let wkb = geometry_wkb(polygon, rows[id].fid, layer, io_slots, geometry_cache)?;
+        let b = rows[id].bounds;
+        let geometry = GeosGeometry::create_rectangle(b[0], b[1], b[2], b[3])?;
+        tree.insert(&geometry, local_id);
+        geometries.push(geometry);
+        exact_wkb.push(polygon.then(|| wkb.to_vec()));
+        burns.push(Geometry::from_wkb(&wkb)?);
+    }
+    Ok(Index {
+        tree,
+        _geometries: geometries,
+        exact_geometries: std::iter::repeat_with(|| None).take(ids.len()).collect(),
+        exact_wkb,
+        burns,
+        ids: ids.to_vec(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1084,11 +1333,34 @@ mod tests {
         let geometry = Geometry::from_wkt(wkt)?;
         let e = geometry.envelope();
         Ok(Mini {
+            #[cfg(test)]
             wkb: geometry.wkb()?,
+            fid: 0,
+            geometry_bytes: 0,
             bounds: [e.MinX, e.MinY, e.MaxX, e.MaxY],
             downstream,
         })
     }
+
+    #[test]
+    fn geometry_cache_is_bounded_and_keeps_recent_entries() {
+        let mut cache = GeometryCache::new(136);
+        cache.insert(true, 1, vec![1; 4]);
+        cache.insert(true, 2, vec![2; 4]);
+        assert_eq!(&*cache.get(true, 1).unwrap(), &[1; 4]);
+        cache.insert(true, 3, vec![3; 4]);
+        assert!(cache.get(true, 2).is_none());
+        assert_eq!(&*cache.get(true, 1).unwrap(), &[1; 4]);
+        assert_eq!(&*cache.get(true, 3).unwrap(), &[3; 4]);
+        assert!(cache.bytes <= cache.limit);
+
+        cache.insert(true, 4, vec![4; 73]);
+        assert!(cache.get(true, 4).is_none());
+        assert!(cache.bytes <= cache.limit);
+        cache.insert(false, 1, vec![5; 4]);
+        assert_eq!(&*cache.get(false, 1).unwrap(), &[5; 4]);
+    }
+
     fn test_grid(width: usize, height: usize) -> Result<Grid> {
         Ok(Grid {
             transform: [0., 1., 0., height as f64, 0., -1.],
@@ -1105,16 +1377,18 @@ mod tests {
             mini("POLYGON ((0 0,1.5 0,1.5 2,0 2,0 0))", None)?,
             mini("POLYGON ((1.5 0,4 0,4 2,1.5 2,1.5 0))", None)?,
         ];
+        let mut index = Index::new(&rows, true)?;
         assert_eq!(
-            ownership(&Index::new(&rows, true)?, &[0, 1], &grid)?,
+            ownership(&mut index, &[0, 1], &grid)?,
             vec![1, 1, 2, 2, 1, 1, 2, 2]
         );
         let rows = vec![
             mini("POLYGON ((0 0,3 0,3 2,0 2,0 0))", None)?,
             mini("POLYGON ((1 0,4 0,4 2,1 2,1 0))", None)?,
         ];
+        let mut index = Index::new(&rows, true)?;
         assert!(
-            ownership(&Index::new(&rows, true)?, &[0, 1], &grid)
+            ownership(&mut index, &[0, 1], &grid)
                 .unwrap_err()
                 .to_string()
                 .contains("overlap")
@@ -1123,8 +1397,9 @@ mod tests {
             mini("POLYGON ((0 0,1.5 0,1.5 2,0 2,0 0))", None)?,
             mini("POLYGON ((1 0,4 0,4 2,1 2,1 0))", None)?,
         ];
+        let mut index = Index::new(&rows, true)?;
         assert_eq!(
-            ownership(&Index::new(&rows, true)?, &[0, 1], &grid)?,
+            ownership(&mut index, &[0, 1], &grid)?,
             vec![1, 2, 2, 2, 1, 2, 2, 2]
         );
         let grid = test_grid(3, 3)?;
@@ -1132,8 +1407,9 @@ mod tests {
             "POLYGON ((0 0,3 0,3 3,0 3,0 0),(1 1,1 2,2 2,2 1,1 1))",
             None,
         )?];
+        let mut index = Index::new(&rows, true)?;
         assert_eq!(
-            ownership(&Index::new(&rows, true)?, &[0], &grid)?,
+            ownership(&mut index, &[0], &grid)?,
             vec![1, 1, 1, 1, 0, 1, 1, 1, 1]
         );
         Ok(())
@@ -1160,7 +1436,10 @@ mod tests {
             drainage(&index, &[0, 2], &grid, &[Some(1), Some(2), None], MIB)?,
             vec![3, 3]
         );
-        assert!(drainage(&index, &[0, 1, 2], &grid, &[None, None, None], 0).is_err());
+        assert_eq!(
+            drainage(&index, &[0, 1, 2], &grid, &[None, None, None], 0)?,
+            drainage(&index, &[0, 1, 2], &grid, &[None, None, None], usize::MAX)?
+        );
         Ok(())
     }
 

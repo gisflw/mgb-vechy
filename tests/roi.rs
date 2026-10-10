@@ -38,6 +38,7 @@ fn ordered_outlets_and_worker_determinism() -> Result<()> {
     );
     let manifest: serde_json::Value = serde_json::from_reader(std::fs::File::open(&roi.manifest)?)?;
     assert_eq!(manifest["step"], "define-roi");
+    assert!(manifest["elapsed_seconds"].as_f64().unwrap().is_finite());
     assert!(Path::new(manifest["parameters"]["catchments"].as_str().unwrap()).is_absolute());
     spec.output_dir = temp.path().join("serial-roi");
     spec.memory_limit_mb = 32;

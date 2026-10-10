@@ -39,6 +39,9 @@ impl Fixture {
         let directory = tempfile::tempdir()?;
         let root = directory.path();
         let spec = SamplingSpec {
+            overwrite: false,
+            io_slots: 2,
+            batch_size: 10000,
             mini_catchments: root.join("mini_catchments.fgb"),
             mini_segments: root.join("mini_segments.fgb"),
             dem: root.join("dem.tif"),
@@ -261,6 +264,7 @@ fn sampling_values_order_and_worker_determinism() -> Result<()> {
         manifest["parameters"]["workers_used"],
         parallel.workers_used
     );
+    assert!(manifest["elapsed_seconds"].as_f64().unwrap().is_finite());
     assert!(Path::new(manifest["parameters"]["dem"].as_str().unwrap()).is_absolute());
     Ok(())
 }
@@ -375,7 +379,7 @@ fn output_protection_and_memory_admission() -> Result<()> {
     fixture.failure("48 MiB");
     assert!(!fixture.spec.output_dir.exists());
     fixture.spec.memory_limit_mb = 48;
-    fixture.failure("Oversized mini");
+    fixture.failure("sampling windows");
     fixture.spec.memory_limit_mb = 64;
     fixture.spec.workers = 4;
     let result = sample_minibasins(&fixture.spec)?;

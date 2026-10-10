@@ -88,8 +88,7 @@ mgb prepro aggregate --roi-catchments output/roi_catchments.fgb \
 ```
 
 Both thresholds are required. `--workers` and `--memory-limit-mb` default to
-4 and 4096. Topology decisions are sequential; complete geometric unions run
-in bounded threads. Topology and source WKB stay resident. Inputs or individual
-union groups that exceed conservative allocation estimates fail explicitly;
-the application budget is not a hard RSS ceiling. Existing stage products are
-never overwritten, and failed publication rolls back new files.
+4 and 4096. Topology decisions are sequential; complete mini geometries are
+unioned in bounded batches and written in deterministic order. Source geometry
+is fetched by feature ID as needed. A mini that cannot fit the working-memory
+budget fails with its estimated requirement. See [execution controls](execution.md).

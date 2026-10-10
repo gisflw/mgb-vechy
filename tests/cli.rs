@@ -94,3 +94,127 @@ fn preparation_requires_inputs_and_valid_paired_options() {
         );
     }
 }
+
+fn replacement_command(output: &std::path::Path) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_mgb"));
+    command.args([
+        "prepro",
+        "define-roi",
+        "--catchments",
+        "missing-catchments.fgb",
+        "--segments",
+        "missing-segments.fgb",
+        "--crs",
+        "EPSG:4326",
+        "--outlet-id",
+        "1",
+        "--output-dir",
+    ]);
+    command.arg(output);
+    command
+}
+
+#[test]
+fn unattended_replacement_requires_explicit_flag() {
+    let dir = tempfile::tempdir().unwrap();
+    let product = dir.path().join("roi_segments.fgb");
+    std::fs::write(&product, b"preserved").unwrap();
+    let output = replacement_command(dir.path()).output().unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("use --overwrite"));
+    let output = replacement_command(dir.path())
+        .arg("--overwrite")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("Input unavailable"));
+    assert_eq!(std::fs::read(product).unwrap(), b"preserved");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn terminal_replacement_defaults_to_no_and_accepts_yes() {
+    use std::{
+        fs::File,
+        io::{Read, Write},
+        os::fd::FromRawFd,
+        process::Stdio,
+        time::{Duration, Instant},
+    };
+    for (answer, expected) in [
+        ("\n", "Replacement declined"),
+        ("n\n", "Replacement declined"),
+        ("yes\n", "Input unavailable"),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let product = dir.path().join("roi_segments.fgb");
+        std::fs::write(&product, b"preserved").unwrap();
+        let (mut master, mut slave) = (-1, -1);
+        // SAFETY: openpty initializes both descriptors; no optional terminal settings are supplied.
+        assert_eq!(
+            unsafe {
+                libc::openpty(
+                    &mut master,
+                    &mut slave,
+                    std::ptr::null_mut(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                )
+            },
+            0
+        );
+        // SAFETY: these successful openpty descriptors each have one owning File.
+        let mut master = unsafe { File::from_raw_fd(master) };
+        let slave = unsafe { File::from_raw_fd(slave) };
+        let mut child = replacement_command(dir.path())
+            .stdin(Stdio::from(slave.try_clone().unwrap()))
+            .stderr(Stdio::from(slave))
+            .stdout(Stdio::null())
+            .spawn()
+            .unwrap();
+        use std::os::fd::AsRawFd;
+        // SAFETY: fcntl changes only the owned master descriptor's blocking mode.
+        assert_eq!(
+            unsafe { libc::fcntl(master.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK) },
+            0
+        );
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut bytes = Vec::new();
+        let mut answered = false;
+        loop {
+            let mut buffer = [0; 4096];
+            if let Ok(count) = master.read(&mut buffer) {
+                bytes.extend_from_slice(&buffer[..count]);
+            }
+            if !answered && String::from_utf8_lossy(&bytes).contains("[y/N]") {
+                master.write_all(answer.as_bytes()).unwrap();
+                answered = true;
+            }
+            if child.try_wait().unwrap().is_some() {
+                while let Ok(count) = master.read(&mut buffer) {
+                    if count == 0 {
+                        break;
+                    }
+                    bytes.extend_from_slice(&buffer[..count]);
+                }
+                break;
+            }
+            if Instant::now() >= deadline {
+                child.kill().unwrap();
+                child.wait().unwrap();
+                panic!(
+                    "Replacement prompt timed out: {}",
+                    String::from_utf8_lossy(&bytes)
+                );
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(answered);
+        assert!(
+            String::from_utf8_lossy(&bytes).contains(expected),
+            "{}",
+            String::from_utf8_lossy(&bytes)
+        );
+        assert_eq!(std::fs::read(product).unwrap(), b"preserved");
+    }
+}
