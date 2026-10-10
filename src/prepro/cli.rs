@@ -149,8 +149,6 @@ struct SampleArgs {
     overwrite: bool,
     #[arg(long, default_value_t = 2)]
     io_slots: usize,
-    #[arg(long, default_value_t = 10000)]
-    batch_size: usize,
 }
 
 #[derive(ClapArgs)]
@@ -381,7 +379,6 @@ pub fn run(args: Args) -> anyhow::Result<()> {
                 &SamplingSpec {
                     overwrite: args.overwrite,
                     io_slots: args.io_slots,
-                    batch_size: args.batch_size,
                     mini_catchments: args.mini_catchments,
                     mini_segments: args.mini_segments,
                     dem: args.dem,

@@ -1,9 +1,9 @@
 # Execution controls
 
 All five Rust preprocessing commands accept `--overwrite`, `--workers` (default
-4), `--memory-limit-mb` (default 4096), and `--io-slots` (default 2). ROI,
-aggregation, and sampling also accept `--batch-size` (default 10000). Resource
-settings must be positive. Stage-specific admission may reduce worker counts.
+4), `--memory-limit-mb` (default 4096), and `--io-slots` (default 2). ROI and
+aggregation also accept `--batch-size` (default 10000). Resource settings must
+be positive. Stage-specific admission may reduce worker counts.
 
 When outputs already exist, terminals ask `[y/N]`; Enter declines. Unattended
 runs fail with instructions to pass `--overwrite`. Replacement stages and

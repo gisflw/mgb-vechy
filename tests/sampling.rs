@@ -41,7 +41,6 @@ impl Fixture {
         let spec = SamplingSpec {
             overwrite: false,
             io_slots: 2,
-            batch_size: 10000,
             mini_catchments: root.join("mini_catchments.fgb"),
             mini_segments: root.join("mini_segments.fgb"),
             dem: root.join("dem.tif"),
@@ -265,6 +264,12 @@ fn sampling_values_order_and_worker_determinism() -> Result<()> {
         parallel.workers_used
     );
     assert!(manifest["elapsed_seconds"].as_f64().unwrap().is_finite());
+    assert!(
+        !manifest["parameters"]
+            .as_object()
+            .unwrap()
+            .contains_key("batch_size")
+    );
     assert!(Path::new(manifest["parameters"]["dem"].as_str().unwrap()).is_absolute());
     Ok(())
 }

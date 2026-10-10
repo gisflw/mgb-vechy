@@ -105,10 +105,11 @@ all eight input paths, an output directory, and positive worker/memory limits.
 The report returns output paths, mini count, and actual worker count.
 
 Worker and memory defaults above apply to the CLI. Concurrency decreases when
-necessary to fit the managed working budget. Fitting jobs share a single tiled
-scan. Otherwise, each admitted task samples one complete mini in memory and
-streams ordered results to the staged CSV; the dataset is never accumulated in
-memory. A mini that cannot fit the budget fails with its estimated requirement.
+necessary to fit the managed working budget. Each admitted mini is read only
+within its own bounds in bounded tiles; its owned-cell accumulator and bounded
+tile buffers are reserved along with coordinator overhead. Results stream in
+mini-ID order to the staged CSV; the dataset is never accumulated in memory.
+A mini that cannot fit the budget fails with its estimated requirement.
 At least 48 MiB is needed for the GIS cache and one sampling worker, plus
 coordinator metadata. The configured GDAL block cache uses one quarter of the
 budget, with a 16 MiB minimum and 8 GiB maximum, and its previous limit is

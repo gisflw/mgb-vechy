@@ -37,7 +37,6 @@ pub struct SamplingSpec {
     pub memory_limit_mb: usize,
     pub overwrite: bool,
     pub io_slots: usize,
-    pub batch_size: usize,
 }
 
 impl SamplingSpec {
@@ -118,7 +117,6 @@ pub fn sample_minibasins_with_progress(
 ) -> Result<SamplingReport> {
     let mut reporter = super::execution::Reporter::new(progress);
     let io_slots = super::execution::IoSlots::new(spec.io_slots)?;
-    ensure!(spec.batch_size > 0, "Batch size must be positive");
 
     ensure!(
         spec.workers > 0 && spec.memory_limit_mb > 0,
@@ -201,12 +199,12 @@ pub fn sample_minibasins_with_progress(
     let workers_used = sample_minis_bounded(
         &grid,
         &minis,
-        &rasters,
         available,
         worker_bytes,
         workers,
         &reporter,
         &mut output,
+        |mini, areas| sample_mini(mini, &rasters, areas),
     )?;
     reporter.enter("finalizing", "Writing samples and diagnostics");
     let (mut files, failure) = output.finish(staging.path(), minis.len())?;
@@ -280,6 +278,7 @@ pub fn sample_minibasins_with_progress(
 
 struct SampleAdmission {
     pending: VecDeque<usize>,
+    reservations: BTreeMap<usize, usize>,
     bytes: usize,
     active: usize,
     peak: usize,
@@ -288,21 +287,12 @@ struct SampleAdmission {
 }
 
 fn sample_reservation(mini: &Mini, worker_bytes: usize) -> Result<usize> {
-    let window_cells = mini
-        .window
-        .width
-        .checked_mul(mini.window.height)
-        .context("Mini sampling window overflow")?;
-    let raster_buffers = window_cells
-        .checked_mul(6 * (std::mem::size_of::<f64>() + std::mem::size_of::<u8>()))
-        .context("Mini sampling raster allocation overflow")?;
     let accumulator_buffers = mini
         .owned_cells
         .checked_mul(3 * std::mem::size_of::<f64>())
         .context("Mini sampling accumulator allocation overflow")?;
-    raster_buffers
-        .checked_add(accumulator_buffers)
-        .and_then(|bytes| bytes.checked_add(worker_bytes))
+    accumulator_buffers
+        .checked_add(worker_bytes)
         .and_then(|bytes| bytes.checked_add(2048))
         .context("Mini sampling allocation overflow")
 }
@@ -322,12 +312,12 @@ fn ensure_sample_fits(mini: &Mini, available: usize, worker_bytes: usize) -> Res
 fn sample_minis_bounded(
     grid: &Grid,
     minis: &[Mini],
-    rasters: &SamplingRasters<'_>,
     available: usize,
     worker_bytes: usize,
     workers: usize,
     reporter: &super::execution::Reporter<'_>,
     output: &mut SampleOutput,
+    job: impl Fn(&Mini, &io::CellAreas) -> Result<MiniResult> + Sync,
 ) -> Result<usize> {
     let reservation = |ordinal: usize| sample_reservation(&minis[ordinal], worker_bytes);
     for mini in minis {
@@ -335,6 +325,7 @@ fn sample_minis_bounded(
     }
     let state = Mutex::new(SampleAdmission {
         pending: (0..minis.len()).collect(),
+        reservations: BTreeMap::new(),
         bytes: 0,
         active: 0,
         peak: 0,
@@ -349,6 +340,7 @@ fn sample_minis_bounded(
             let sender = sender.clone();
             let state = &state;
             let ready = &ready;
+            let job = &job;
             handles.push(scope.spawn(move || {
                 let run = || -> Result<()> {
                     let areas = io::CellAreas::new(grid)?;
@@ -363,9 +355,14 @@ fn sample_minis_bounded(
                                 }
                                 let ordinal = *admission.pending.front().unwrap();
                                 let within_window = ordinal
-                                    < admission.consumed + workers.saturating_mul(2);
+                                    < admission.consumed.saturating_add(workers.saturating_mul(2));
                                 let bytes = reservation(ordinal)?;
-                                if within_window && bytes <= available - admission.bytes {
+                                if within_window && bytes <= available.saturating_sub(admission.bytes) {
+                                    ensure!(
+                                        !admission.reservations.contains_key(&ordinal),
+                                        "Sampling mini {ordinal} already has a reservation"
+                                    );
+                                    admission.reservations.insert(ordinal, bytes);
                                     admission.pending.pop_front();
                                     admission.bytes += bytes;
                                     admission.active += 1;
@@ -384,14 +381,21 @@ fn sample_minis_bounded(
                                 })?;
                             }
                         };
-                        let result = sample_mini(&minis[ordinal], rasters, &areas)
+                        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            job(&minis[ordinal], &areas)
+                        }))
+                            .map_err(|_| anyhow::anyhow!("Sampling worker panicked"))
+                            .and_then(|result| result)
                             .with_context(|| format!("Sample mini {}", minis[ordinal].id()));
                         let failed = result.is_err();
+                        if failed {
+                            if let Ok(mut admission) = state.lock() {
+                                admission.stopped = true;
+                            }
+                            ready.notify_all();
+                        }
                         let disconnected = sender.send((ordinal, bytes, result)).is_err();
-                        let mut admission = state
-                            .lock()
-                            .map_err(|_| anyhow::anyhow!("Sampling admission lock poisoned"))?;
-                        if failed || disconnected {
+                        if disconnected && let Ok(mut admission) = state.lock() {
                             admission.stopped = true;
                         }
                         ready.notify_all();
@@ -416,17 +420,22 @@ fn sample_minis_bounded(
         for (ordinal, bytes, result) in receiver {
             if ordinal == usize::MAX {
                 if error.is_none() {
-                    error = result.err();
+                    error = Some(result.err().unwrap_or_else(|| {
+                        anyhow::anyhow!("Sampling worker failed without an error")
+                    }));
                 }
                 state
                     .lock()
                     .map_err(|_| anyhow::anyhow!("Sampling admission lock poisoned"))?
                     .stopped = true;
                 ready.notify_all();
+                for (ordinal, (bytes, _)) in std::mem::take(&mut pending) {
+                    release_sample(&state, &ready, ordinal, bytes)?;
+                }
                 continue;
             }
             if error.is_some() {
-                release_sample(&state, &ready, bytes)?;
+                release_sample(&state, &ready, ordinal, bytes)?;
                 continue;
             }
             pending.insert(ordinal, (bytes, result));
@@ -441,8 +450,7 @@ fn sample_minis_bounded(
                                 .lock()
                                 .map_err(|_| anyhow::anyhow!("Sampling admission lock poisoned"))?;
                             admission.consumed = completed;
-                            admission.bytes -= bytes;
-                            admission.active -= 1;
+                            release_sample_reservation(&mut admission, completed - 1, bytes)?;
                             ready.notify_all();
                             reporter.advance(completed, Some(minis.len()));
                             continue;
@@ -450,15 +458,15 @@ fn sample_minis_bounded(
                     }
                     Err(e) => error = Some(e),
                 }
-                release_sample(&state, &ready, bytes)?;
+                release_sample(&state, &ready, completed, bytes)?;
                 if error.is_some() {
                     state
                         .lock()
                         .map_err(|_| anyhow::anyhow!("Sampling admission lock poisoned"))?
                         .stopped = true;
                     ready.notify_all();
-                    for (_, (bytes, _)) in std::mem::take(&mut pending) {
-                        release_sample(&state, &ready, bytes)?;
+                    for (ordinal, (bytes, _)) in std::mem::take(&mut pending) {
+                        release_sample(&state, &ready, ordinal, bytes)?;
                     }
                     break;
                 }
@@ -469,27 +477,77 @@ fn sample_minis_bounded(
                 error = Some(anyhow::anyhow!("Sampling worker panicked"));
             }
         }
+        for (ordinal, (bytes, _)) in std::mem::take(&mut pending) {
+            release_sample(&state, &ready, ordinal, bytes)?;
+        }
+        let outstanding = state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Sampling admission lock poisoned"))?
+            .reservations
+            .clone();
+        if !outstanding.is_empty() {
+            if error.is_none() {
+                error = Some(anyhow::anyhow!(
+                    "Sampling workers ended with outstanding mini reservations"
+                ));
+            }
+            for (ordinal, bytes) in outstanding {
+                release_sample(&state, &ready, ordinal, bytes)?;
+            }
+        }
+        let admission = state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Sampling admission lock poisoned"))?;
+        let peak = admission.peak;
+        ensure!(
+            admission.bytes == 0 && admission.active == 0 && admission.reservations.is_empty(),
+            "Sampling results left memory reservations outstanding"
+        );
+        drop(admission);
         if let Some(error) = error {
             return Err(error);
         }
         ensure!(completed == minis.len(), "Incomplete sampling results");
-        let peak = state
-            .lock()
-            .map_err(|_| anyhow::anyhow!("Sampling admission lock poisoned"))?
-            .peak;
         Ok(peak)
     })
 }
 
-fn release_sample(state: &Mutex<SampleAdmission>, ready: &Condvar, bytes: usize) -> Result<()> {
+fn release_sample_reservation(
+    admission: &mut SampleAdmission,
+    ordinal: usize,
+    bytes: usize,
+) -> Result<()> {
+    if bytes == 0 {
+        return Ok(());
+    }
+    ensure!(
+        admission.reservations.remove(&ordinal) == Some(bytes),
+        "Sampling mini {ordinal} reservation was not held"
+    );
+    admission.bytes = admission
+        .bytes
+        .checked_sub(bytes)
+        .context("Sampling reservation accounting underflow")?;
+    admission.active = admission
+        .active
+        .checked_sub(1)
+        .context("Sampling active job accounting underflow")?;
+    Ok(())
+}
+
+fn release_sample(
+    state: &Mutex<SampleAdmission>,
+    ready: &Condvar,
+    ordinal: usize,
+    bytes: usize,
+) -> Result<()> {
     if bytes == 0 {
         return Ok(());
     }
     let mut admission = state
         .lock()
         .map_err(|_| anyhow::anyhow!("Sampling admission lock poisoned"))?;
-    admission.bytes -= bytes;
-    admission.active -= 1;
+    release_sample_reservation(&mut admission, ordinal, bytes)?;
     ready.notify_all();
     Ok(())
 }
@@ -569,15 +627,7 @@ fn sample_mini(
     areas: &io::CellAreas,
 ) -> Result<MiniResult> {
     let mut accumulator = Accumulator::new(mini.owned_cells);
-    let bounds = Window {
-        x: mini.window.x / rasters.block_size * rasters.block_size,
-        y: mini.window.y / rasters.block_size * rasters.block_size,
-        width: mini.window.x + mini.window.width
-            - mini.window.x / rasters.block_size * rasters.block_size,
-        height: mini.window.y + mini.window.height
-            - mini.window.y / rasters.block_size * rasters.block_size,
-    };
-    for window in io::windows_sized(bounds, rasters.block_size) {
+    for window in mini_windows(mini, rasters.block_size) {
         let Some(blocks) = rasters.read(window, mini.id())? else {
             continue;
         };
@@ -610,6 +660,10 @@ fn sample_mini(
         mini.id()
     );
     accumulator.finish(mini.id(), mini.reach_length)
+}
+
+fn mini_windows(mini: &Mini, size: usize) -> impl Iterator<Item = Window> {
+    io::windows_sized(mini.window, size)
 }
 
 fn check_collisions(output: &Path, overwrite: bool) -> Result<()> {
@@ -1208,6 +1262,104 @@ fn percentile(sorted: &[f64], fraction: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Barrier};
+
+    fn mini(id: i64) -> Mini {
+        Mini {
+            attributes: Attributes {
+                integers: [id, -1, 0, 1],
+                metrics: [1.; 4],
+            },
+            longitude: 0.,
+            latitude: 0.,
+            reach_length: 1.,
+            window: Window {
+                x: id as usize,
+                y: 0,
+                width: 1,
+                height: 1,
+            },
+            owned_cells: 1,
+        }
+    }
+
+    fn injected_job_failure(failure_id: i64, panic: bool) {
+        let directory = tempfile::tempdir().unwrap();
+        let minis: Vec<_> = (0..4).map(mini).collect();
+        let grid = Grid {
+            transform: [0., 0.01, 0., 0., 0., -0.01],
+            width: 8,
+            height: 8,
+            wkt: SpatialRef::from_epsg(4326).unwrap().to_wkt().unwrap(),
+        };
+        let bytes = sample_reservation(&minis[0], 1024).unwrap();
+        let mut output = SampleOutput::new(directory.path()).unwrap();
+        let no_progress = |_| {};
+        let reporter = super::super::execution::Reporter::new(&no_progress);
+        let barrier = Arc::new(Barrier::new(minis.len()));
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let result = sample_minis_bounded(
+            &grid,
+            &minis,
+            bytes * minis.len(),
+            1024,
+            minis.len(),
+            &reporter,
+            &mut output,
+            |mini, _areas| {
+                barrier.wait();
+                if mini.id() == 0 && failure_id != 0 {
+                    let (lock, ready) = &*gate;
+                    let mut failed = lock.lock().unwrap();
+                    while !*failed {
+                        failed = ready.wait(failed).unwrap();
+                    }
+                }
+                if mini.id() == failure_id {
+                    let (lock, ready) = &*gate;
+                    *lock.lock().unwrap() = true;
+                    ready.notify_all();
+                    if panic {
+                        panic!("injected sampling panic");
+                    }
+                    bail!("injected sampling error");
+                }
+                Ok(MiniResult {
+                    id: mini.id(),
+                    total_cells: 1,
+                    nodata: [0; 5],
+                    statistics: None,
+                    failures: Vec::new(),
+                })
+            },
+        );
+        let error = result.unwrap_err();
+        let error = format!("{error:#}");
+        assert!(
+            error.contains(&format!("Sample mini {failure_id}")),
+            "{error}"
+        );
+        assert!(
+            error.contains(if panic {
+                "Sampling worker panicked"
+            } else {
+                "injected sampling error"
+            }),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn admitted_sampling_panics_stop_workers_and_release_reservations() {
+        injected_job_failure(0, true);
+        injected_job_failure(2, true);
+    }
+
+    #[test]
+    fn admitted_sampling_errors_stop_workers_and_release_reservations() {
+        injected_job_failure(2, false);
+    }
+
     #[test]
     fn exact_percentiles_ties_and_flood_thresholds() {
         assert_eq!(percentile(&[0., 10.], 0.85), 8.5);
@@ -1255,14 +1407,59 @@ mod tests {
         };
         assert_eq!(
             sample_reservation(&mini, 32 * MIB).unwrap(),
-            32 * MIB + (20 * 30 * 54) + 24_000 + 2048
+            32 * MIB + 24_000 + 2048
         );
         let required = sample_reservation(&mini, 32 * MIB).unwrap();
         let error = ensure_sample_fits(&mini, required - 1, 32 * MIB).unwrap_err();
         assert!(format!("{error:#}").contains("Mini 1 requires about 33 MiB"));
-        let mut too_large = mini;
-        too_large.owned_cells = usize::MAX;
-        assert!(sample_reservation(&too_large, 32 * MIB).is_err());
+
+        let mut sparse = mini;
+        sparse.window.width = usize::MAX;
+        sparse.window.height = 2;
+        sparse.owned_cells = 1;
+        assert_eq!(
+            sample_reservation(&sparse, 32 * MIB).unwrap(),
+            32 * MIB + 24 + 2048
+        );
+        assert!(sample_reservation(&sparse, usize::MAX).is_err());
+
+        let mut overflow = sparse;
+        overflow.owned_cells = usize::MAX / 24 + 1;
+        assert!(sample_reservation(&overflow, 32 * MIB).is_err());
+    }
+
+    #[test]
+    fn mini_tiles_cover_only_unaligned_mini_bounds() {
+        let mini = Mini {
+            attributes: Attributes {
+                integers: [1; 4],
+                metrics: [1.; 4],
+            },
+            longitude: 0.,
+            latitude: 0.,
+            reach_length: 1.,
+            window: Window {
+                x: 5,
+                y: 3,
+                width: 7,
+                height: 6,
+            },
+            owned_cells: 42,
+        };
+        let mut coverage = vec![0; mini.window.width * mini.window.height];
+        let tiles: Vec<_> = mini_windows(&mini, 4).collect();
+        for tile in &tiles {
+            assert!(tile.x >= mini.window.x && tile.y >= mini.window.y);
+            assert!(tile.x + tile.width <= mini.window.x + mini.window.width);
+            assert!(tile.y + tile.height <= mini.window.y + mini.window.height);
+            for y in tile.y..tile.y + tile.height {
+                for x in tile.x..tile.x + tile.width {
+                    coverage[(y - mini.window.y) * mini.window.width + (x - mini.window.x)] += 1;
+                }
+            }
+        }
+        assert_eq!(tiles.len(), 4);
+        assert!(coverage.into_iter().all(|count| count == 1));
     }
 
     #[test]

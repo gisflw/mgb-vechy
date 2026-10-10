@@ -55,6 +55,31 @@ fn sampling_requires_explicit_inputs() {
 }
 
 #[test]
+fn batch_size_is_only_exposed_by_roi_and_aggregation() {
+    let help = |stage: &str| {
+        let output = Command::new(env!("CARGO_BIN_EXE_mgb"))
+            .args(["prepro", stage, "--help"])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{stage}: {output:?}");
+        String::from_utf8(output.stdout).unwrap()
+    };
+
+    for stage in ["define-roi", "aggregate"] {
+        assert!(help(stage).contains("--batch-size"));
+    }
+    assert!(!help("sample-minis").contains("--batch-size"));
+    assert!(
+        !Command::new(env!("CARGO_BIN_EXE_mgb"))
+            .args(["prepro", "sample-minis", "--batch-size", "1"])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+}
+
+#[test]
 fn terrain_requires_explicit_inputs_and_rejects_invalid_flags() {
     for args in [
         vec!["prepro", "terrain-products"],
