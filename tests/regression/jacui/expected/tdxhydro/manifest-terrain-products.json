@@ -1,11 +1,34 @@
 {
   "step": "terrain-products",
+  "inputs": {
+    "dem": {
+      "path": "/workspace/mgb_builder/tests/regression/jacui/expected/tdxhydro/dem.tif",
+      "sha256": "42e30a989dbaf56a258d5e30c7baa0d6068fc2c5d4888d2b6c97538388e37f26"
+    },
+    "grid_catchments": {
+      "path": "/workspace/mgb_builder/tests/regression/jacui/expected/tdxhydro/grid_catchments.tif",
+      "sha256": "c8a37b5bd3a240a09d1ce9e45432cbaa9b58209322d6f34e8d6189c581af59bb"
+    },
+    "grid_segments": {
+      "path": "/workspace/mgb_builder/tests/regression/jacui/expected/tdxhydro/grid_segments.tif",
+      "sha256": "a24aaeb16ea52791dd53f16c7c15cacf224ed598cc8e699b8989e48a83d3a3e3"
+    }
+  },
+  "outputs": {
+    "hand": {
+      "path": "/workspace/mgb_builder/tests/regression/jacui/expected/tdxhydro/hand.tif",
+      "sha256": "9707ecf403eb1c2500b1f36d540dc452cbdd82e2f7883ed451073446da07e7c1"
+    },
+    "ltnd": {
+      "path": "/workspace/mgb_builder/tests/regression/jacui/expected/tdxhydro/ltnd.tif",
+      "sha256": "847d2f3c679aa3899ee14368f6ef0489915b7102d50942de594e3bfb035eefb9"
+    },
+    "undrained_cells": {
+      "path": "/workspace/mgb_builder/tests/regression/jacui/expected/tdxhydro/undrained_cells.csv",
+      "sha256": "f535425cfbfa3a8c47ddb72ef6a2988673887c22b907fa56b9aed51591083123"
+    }
+  },
   "parameters": {
-    "dem": "/workspace/mgb_builder/tests/regression/jacui/runs/capture-tdxhydro/dem.tif",
-    "grid_catchments": "/workspace/mgb_builder/tests/regression/jacui/runs/capture-tdxhydro/grid_catchments.tif",
-    "grid_segments": "/workspace/mgb_builder/tests/regression/jacui/runs/capture-tdxhydro/grid_segments.tif",
-    "output_dir": "/workspace/mgb_builder/tests/regression/jacui/expected/tdxhydro",
-    "d8": null,
     "direction_source": "dem",
     "write_flow_direction": false,
     "agree_sharp": 80.0,
@@ -13,7 +36,21 @@
     "agree_buffer": 4,
     "workers": 4,
     "memory_limit_mb": 4096,
-    "io_slots": 2,
-    "overwrite": false
+    "routing_bytes_per_cell": 128,
+    "io_slots": 2
+  },
+  "runtime": {
+    "ran_at": "2026-10-10 11:52",
+    "timezone": "+00:00",
+    "elapsed_time": {
+      "preparation": 1.840236549,
+      "processing": 6.08644672,
+      "finalizing": 3.978717116,
+      "total": 11.905401746999999
+    },
+    "workers_used": 4,
+    "peak_ram_usage_mib": 2088.1015625,
+    "peak_cpu_usage_percent": 425.70281982421875,
+    "cpu_time_seconds": 37.17
   }
 }

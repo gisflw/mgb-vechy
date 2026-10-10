@@ -1,15 +1,12 @@
 use super::{Network, Stage};
 use anyhow::{Context, Result, bail, ensure};
 use clap::Args;
-use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::Value;
 use std::{
-    collections::BTreeMap,
     ffi::OsString,
     fs::{self, File},
     path::{Component, Path, PathBuf},
     process::Command,
-    time::Instant,
 };
 
 #[derive(Args, Debug)]
@@ -34,27 +31,6 @@ pub struct RunOptions {
     pub io_slots: Option<u32>,
 }
 
-#[derive(Deserialize)]
-pub struct Config {
-    crs: String,
-    uparea_min: f64,
-    lmin: f64,
-    dem_scale: f64,
-    agree_sharp: f64,
-    agree_smooth: f64,
-    agree_buffer: u32,
-    networks: BTreeMap<String, Fields>,
-}
-#[derive(Deserialize)]
-struct Fields {
-    outlet_ids: Vec<String>,
-    id_col: String,
-    id_down_col: String,
-    strahler_order_col: String,
-    catchments_source_crs: Option<String>,
-    segments_source_crs: Option<String>,
-}
-
 pub struct Invocation {
     pub args: Vec<OsString>,
     pub inputs: Vec<PathBuf>,
@@ -62,11 +38,18 @@ pub struct Invocation {
 
 /// All stage adapters match the Rust CLI.
 pub fn invocation(root: &Path, options: &RunOptions, stage: Stage) -> Result<Invocation> {
-    let config: Config = serde_json::from_reader(File::open(root.join("config.json"))?)?;
-    let fields = config
-        .networks
-        .get(options.network.name())
-        .context("Network configuration missing")?;
+    let manifest_path = root
+        .join("expected")
+        .join(options.network.name())
+        .join(format!("manifest-{}.json", stage.name()));
+    let manifest: Value = serde_json::from_reader(
+        File::open(&manifest_path)
+            .with_context(|| format!("Stage manifest missing: {}", manifest_path.display()))?,
+    )?;
+    ensure!(manifest["step"] == stage.name(), "Invalid stage manifest");
+    let parameters = manifest["parameters"]
+        .as_object()
+        .context("Stage manifest parameters missing")?;
     let input = root.join("input");
     let upstream = if options.stage == Stage::All {
         options.output_dir.clone()
@@ -137,35 +120,92 @@ pub fn invocation(root: &Path, options: &RunOptions, stage: Stage) -> Result<Inv
     match stage {
         Stage::DefineRoi => {
             for (flag, val) in [
-                ("--crs", &config.crs),
-                ("--id-col", &fields.id_col),
-                ("--id-down-col", &fields.id_down_col),
-                ("--strahler-order-col", &fields.strahler_order_col),
+                ("--crs", "crs"),
+                ("--id-col", "id_col"),
+                ("--id-down-col", "id_down_col"),
+                ("--strahler-order-col", "strahler_order_col"),
             ] {
-                value(flag, val.clone());
+                value(
+                    flag,
+                    parameters[val]
+                        .as_str()
+                        .with_context(|| format!("Manifest parameter {val} missing"))?
+                        .to_owned(),
+                );
             }
-            for outlet in &fields.outlet_ids {
-                value("--outlet-id", outlet.clone());
+            for outlet in parameters["outlet_ids"]
+                .as_array()
+                .context("Manifest outlet IDs missing")?
+            {
+                value(
+                    "--outlet-id",
+                    outlet
+                        .as_str()
+                        .context("Manifest outlet ID is not a string")?
+                        .to_owned(),
+                );
             }
             for (flag, val) in [
-                ("--catchments-source-crs", &fields.catchments_source_crs),
-                ("--segments-source-crs", &fields.segments_source_crs),
+                ("--catchments-source-crs", "catchments_source_crs"),
+                ("--segments-source-crs", "segments_source_crs"),
             ] {
-                if let Some(val) = val {
-                    value(flag, val.clone());
+                if let Some(val) = parameters[val].as_str() {
+                    value(flag, val.to_owned());
                 }
             }
         }
         Stage::Aggregate => {
-            value("--uparea-min", config.uparea_min.to_string());
-            value("--lmin", config.lmin.to_string());
+            value(
+                "--uparea-min",
+                parameters["uparea_min"]
+                    .as_f64()
+                    .context("Manifest uparea_min missing")?
+                    .to_string(),
+            );
+            value(
+                "--lmin",
+                parameters["lmin"]
+                    .as_f64()
+                    .context("Manifest lmin missing")?
+                    .to_string(),
+            );
         }
-        Stage::Prepare => value("--dem-scale", config.dem_scale.to_string()),
+        Stage::Prepare => value(
+            "--dem-scale",
+            parameters["dem_scale"]
+                .as_f64()
+                .context("Manifest dem_scale missing")?
+                .to_string(),
+        ),
         Stage::TerrainProducts => {
-            value("--direction-source", "dem".into());
-            value("--agree-sharp", config.agree_sharp.to_string());
-            value("--agree-smooth", config.agree_smooth.to_string());
-            value("--agree-buffer", config.agree_buffer.to_string());
+            value(
+                "--direction-source",
+                parameters["direction_source"]
+                    .as_str()
+                    .context("Manifest direction source missing")?
+                    .to_owned(),
+            );
+            value(
+                "--agree-sharp",
+                parameters["agree_sharp"]
+                    .as_f64()
+                    .context("Manifest agree_sharp missing")?
+                    .to_string(),
+            );
+            value(
+                "--agree-smooth",
+                parameters["agree_smooth"]
+                    .as_f64()
+                    .context("Manifest agree_smooth missing")?
+                    .to_string(),
+            );
+            value(
+                "--agree-buffer",
+                parameters["agree_buffer"]
+                    .as_u64()
+                    .context("Manifest agree_buffer missing")?
+                    .to_string(),
+            );
         }
         _ => {}
     }
@@ -226,7 +266,7 @@ pub fn protect_output(root: &Path, output: &Path) -> Result<PathBuf> {
     Ok(output)
 }
 
-pub fn run(root: &Path, options: &RunOptions) -> Result<Value> {
+pub fn run(root: &Path, options: &RunOptions) -> Result<()> {
     ensure!(
         options.workers > 0 && options.memory_limit_mb > 0,
         "Resource settings must be positive"
@@ -256,29 +296,14 @@ pub fn run(root: &Path, options: &RunOptions) -> Result<Value> {
         ensure!(path.is_file(), "Local fixture missing: {}", path.display());
     }
     fs::create_dir_all(&output)?;
-    let revision = Command::new("git")
-        .args(["rev-parse", "HEAD"])
-        .current_dir(env!("CARGO_MANIFEST_DIR"))
-        .output()?;
-    let mut report = json!({
-        "network": options.network.name(), "command": [options.command.as_os_str().to_string_lossy()],
-        "command_args": options.command_arg.iter().map(|s| s.to_string_lossy()).collect::<Vec<_>>(),
-        "workers": options.workers, "memory_limit_mb": options.memory_limit_mb,
-        "io_slots": options.io_slots,
-        "platform": format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
-        "cpu_count": std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1),
-        "recorded_at": chrono::Utc::now().to_rfc3339(),
-        "revision": String::from_utf8_lossy(&revision.stdout).trim(), "measurements": []
-    });
-    let pipeline_started = Instant::now();
     for stage in options.stage.stages() {
-        let result = || -> Result<(i32, Usage)> {
+        let result = || -> Result<i32> {
             let invocation = invocation(&root, &options, stage)?;
             for path in &invocation.inputs {
                 ensure!(path.is_file(), "Stage input missing: {}", path.display());
             }
             let log = File::create(output.join(format!("{}.log", stage.name())))?;
-            let child = Command::new(&options.command)
+            let mut child = Command::new(&options.command)
                 .args(&options.command_arg)
                 .args(&invocation.args)
                 .current_dir(env!("CARGO_MANIFEST_DIR"))
@@ -286,33 +311,9 @@ pub fn run(root: &Path, options: &RunOptions) -> Result<Value> {
                 .stderr(log)
                 .spawn()
                 .with_context(|| format!("Cannot start candidate {}", options.command.display()))?;
-            wait_with_usage(child)
+            Ok(child.wait()?.code().unwrap_or(-1))
         };
-        let started = Instant::now();
-        let result = result();
-        let (code, usage) = result.as_ref().copied().unwrap_or((-1, Usage::default()));
-        let wall_seconds = started.elapsed().as_secs_f64();
-        let manifest = File::open(output.join(format!("manifest-{}.json", stage.name())))
-            .ok()
-            .and_then(|file| serde_json::from_reader::<_, Value>(file).ok());
-        let workers_used = manifest
-            .as_ref()
-            .and_then(|m| m["runtime"]["workers_used"].as_u64());
-        let measurement = json!({"stage": stage.name(), "wall_seconds": wall_seconds, "workers_used": workers_used,
-            "max_process_rss_kib": usage.max_process_rss_kib, "cpu_seconds": usage.cpu_seconds,
-            "read_bytes": usage.read_bytes, "write_bytes": usage.write_bytes,
-            "exit_code": code,
-            "error": result.as_ref().err().map(|error| format!("{error:#}"))});
-        report["measurements"]
-            .as_array_mut()
-            .unwrap()
-            .push(measurement);
-        report["pipeline_wall_seconds"] = json!(pipeline_started.elapsed().as_secs_f64());
-        fs::write(
-            output.join("benchmark.json"),
-            serde_json::to_string_pretty(&report)? + "\n",
-        )?;
-        result?;
+        let code = result()?;
         ensure!(
             code == 0,
             "{} failed with exit code {code}; see {}",
@@ -321,53 +322,5 @@ pub fn run(root: &Path, options: &RunOptions) -> Result<Value> {
         );
         println!("{}/{} completed", options.network.name(), stage.name());
     }
-    Ok(report)
-}
-
-#[derive(Clone, Copy, Default, Serialize)]
-struct Usage {
-    max_process_rss_kib: Option<i64>,
-    cpu_seconds: Option<f64>,
-    read_bytes: Option<i64>,
-    write_bytes: Option<i64>,
-}
-
-#[cfg(target_os = "linux")]
-fn wait_with_usage(child: std::process::Child) -> Result<(i32, Usage)> {
-    let mut status = 0;
-    let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
-    loop {
-        // SAFETY: status and usage point to writable storage; wait4 initializes
-        // both on success. Wait only for this owned child's PID.
-        let result = unsafe { libc::wait4(child.id() as i32, &mut status, 0, usage.as_mut_ptr()) };
-        if result >= 0 {
-            break;
-        }
-        let error = std::io::Error::last_os_error();
-        if error.kind() != std::io::ErrorKind::Interrupted {
-            return Err(error.into());
-        }
-    }
-    // SAFETY: successful wait4 initialized the rusage structure.
-    let usage = unsafe { usage.assume_init() };
-    let code = if libc::WIFEXITED(status) {
-        libc::WEXITSTATUS(status)
-    } else {
-        -libc::WTERMSIG(status)
-    };
-    let seconds = |t: libc::timeval| t.tv_sec as f64 + t.tv_usec as f64 / 1_000_000.;
-    Ok((
-        code,
-        Usage {
-            max_process_rss_kib: Some(usage.ru_maxrss),
-            cpu_seconds: Some(seconds(usage.ru_utime) + seconds(usage.ru_stime)),
-            read_bytes: Some(usage.ru_inblock * 512),
-            write_bytes: Some(usage.ru_oublock * 512),
-        },
-    ))
-}
-
-#[cfg(not(target_os = "linux"))]
-fn wait_with_usage(mut child: std::process::Child) -> Result<(i32, Usage)> {
-    Ok((child.wait()?.code().unwrap_or(-1), Usage::default()))
+    Ok(())
 }

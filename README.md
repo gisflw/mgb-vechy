@@ -49,7 +49,8 @@ filenames, units, and audit stage identifiers.
 
 The [Jacui reference](tests/regression/jacui/README.md) covers BHAE and TDXHydro.
 Large captured assets stay local. Rust tools verify checksums, run an external
-candidate, compare decoded products, and record performance:
+candidate, and compare decoded products; stage manifests record runtime and
+product checksums:
 
 ```bash
 cargo run --release --example jacui -- verify

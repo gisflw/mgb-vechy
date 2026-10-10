@@ -1,19 +1,72 @@
 {
   "step": "sample-minis",
+  "inputs": {
+    "mini_catchments": {
+      "path": "/workspace/mgb_builder/tests/regression/jacui/expected/tdxhydro/mini_catchments.fgb",
+      "sha256": "01c0a17fbc171eab7c69922a287f954b6ffc9685533396546ae5b458d6e5d82b"
+    },
+    "mini_segments": {
+      "path": "/workspace/mgb_builder/tests/regression/jacui/expected/tdxhydro/mini_segments.fgb",
+      "sha256": "d945a155c6efddaf75621f80fa44edea44f96b88191b5f9a24be01343b26330f"
+    },
+    "dem": {
+      "path": "/workspace/mgb_builder/tests/regression/jacui/expected/tdxhydro/dem.tif",
+      "sha256": "42e30a989dbaf56a258d5e30c7baa0d6068fc2c5d4888d2b6c97538388e37f26"
+    },
+    "grid_catchments": {
+      "path": "/workspace/mgb_builder/tests/regression/jacui/expected/tdxhydro/grid_catchments.tif",
+      "sha256": "c8a37b5bd3a240a09d1ce9e45432cbaa9b58209322d6f34e8d6189c581af59bb"
+    },
+    "grid_segments": {
+      "path": "/workspace/mgb_builder/tests/regression/jacui/expected/tdxhydro/grid_segments.tif",
+      "sha256": "a24aaeb16ea52791dd53f16c7c15cacf224ed598cc8e699b8989e48a83d3a3e3"
+    },
+    "hand": {
+      "path": "/workspace/mgb_builder/tests/regression/jacui/expected/tdxhydro/hand.tif",
+      "sha256": "9707ecf403eb1c2500b1f36d540dc452cbdd82e2f7883ed451073446da07e7c1"
+    },
+    "ltnd": {
+      "path": "/workspace/mgb_builder/tests/regression/jacui/expected/tdxhydro/ltnd.tif",
+      "sha256": "847d2f3c679aa3899ee14368f6ef0489915b7102d50942de594e3bfb035eefb9"
+    },
+    "hru": {
+      "path": "/workspace/mgb_builder/tests/regression/jacui/expected/tdxhydro/hru.tif",
+      "sha256": "21f77c02995e0cc5996a8466f9b3fdfc01ca36ae91fc3c49933ccc8287826c2e"
+    }
+  },
+  "outputs": {
+    "sampled_minis": {
+      "path": "/workspace/mgb_builder/tests/regression/jacui/expected/tdxhydro/sampled_minis.csv",
+      "sha256": "9d879b6a4ba8e9ad8d6a711c5d727432f326e9d30ae86cf72c4f3bdfc9b86e30"
+    },
+    "diagnostics": {
+      "hand": {
+        "path": "/workspace/mgb_builder/tests/regression/jacui/expected/tdxhydro/nodata_hand.csv",
+        "sha256": "7bb1878e4d0d3ac687639bbdb5a3d06f2fc42cbf3bf95859050aade4b6c0238e"
+      },
+      "ltnd": {
+        "path": "/workspace/mgb_builder/tests/regression/jacui/expected/tdxhydro/nodata_ltnd.csv",
+        "sha256": "7bb1878e4d0d3ac687639bbdb5a3d06f2fc42cbf3bf95859050aade4b6c0238e"
+      }
+    }
+  },
   "parameters": {
-    "mini_catchments": "/workspace/mgb_builder/tests/regression/jacui/runs/capture-tdxhydro/mini_catchments.fgb",
-    "mini_segments": "/workspace/mgb_builder/tests/regression/jacui/runs/capture-tdxhydro/mini_segments.fgb",
-    "dem": "/workspace/mgb_builder/tests/regression/jacui/runs/capture-tdxhydro/dem.tif",
-    "grid_catchments": "/workspace/mgb_builder/tests/regression/jacui/runs/capture-tdxhydro/grid_catchments.tif",
-    "grid_segments": "/workspace/mgb_builder/tests/regression/jacui/runs/capture-tdxhydro/grid_segments.tif",
-    "hand": "/workspace/mgb_builder/tests/regression/jacui/runs/capture-tdxhydro/hand.tif",
-    "ltnd": "/workspace/mgb_builder/tests/regression/jacui/runs/capture-tdxhydro/ltnd.tif",
-    "hru": "/workspace/mgb_builder/tests/regression/jacui/runs/capture-tdxhydro/hru.tif",
-    "output_dir": "/workspace/mgb_builder/tests/regression/jacui/expected/tdxhydro",
     "workers": 4,
     "memory_limit_mb": 4096,
-    "io_slots": 2,
-    "batch_size": 10000,
-    "overwrite": false
+    "io_slots": 2
+  },
+  "runtime": {
+    "ran_at": "2026-10-10 11:52",
+    "timezone": "+00:00",
+    "elapsed_time": {
+      "preparation": 3.31364771,
+      "processing": 3.393077353,
+      "finalizing": 0.004148736,
+      "total": 6.710874658
+    },
+    "workers_used": 4,
+    "peak_ram_usage_mib": 1531.765625,
+    "peak_cpu_usage_percent": 269.6177062988281,
+    "cpu_time_seconds": 12.06
   }
 }

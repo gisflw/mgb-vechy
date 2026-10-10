@@ -18,8 +18,8 @@ do not collect stages in a shared `science` module.
 
 - `src/`: root library/CLI and preprocessing modules under `src/prepro/`.
 - `examples/jacui.rs`: developer entry point for fixture verification,
-  candidate runs, comparisons, and benchmarks.
-- `tests/`: automated checks, scientific regression references, and benchmarks.
+  candidate runs, and comparisons.
+- `tests/`: automated checks and scientific regression references.
   `tests/regression/jacui/` holds the BHAE and TDXHydro dataset references.
 - `docs/`: stable descriptions of frozen scientific behavior and data-file
   contracts.
@@ -48,6 +48,7 @@ in `.dev/`. Distinguish implemented capabilities from remaining work.
 
 Run `cargo fmt --all -- --check`, `cargo clippy --all-targets --locked -- -D warnings`,
 and `cargo test --all-targets --locked`. Scientific candidate regression is opt-in;
-missing local fixtures must fail explicit runs. Keep captures and historical
-benchmarks immutable during candidate work; never write candidate outputs to
-scratch or the reference inputs/expected products.
+missing local fixtures must fail explicit runs. Never write candidate outputs to
+scratch, captured inputs, or expected products during candidate runs. Refresh
+expected products only for explicit corrections; stage manifests record their
+input/output checksums and runtime.

@@ -24,11 +24,6 @@ use std::{
 
 fn fixture() -> tempfile::TempDir {
     let temp = tempfile::tempdir().unwrap();
-    fs::copy(
-        jacui::fixture_root().join("config.json"),
-        temp.path().join("config.json"),
-    )
-    .unwrap();
     for network in ["bhae", "tdxhydro"] {
         let input = temp.path().join("input").join(network);
         let expected = temp.path().join("expected").join(network);
@@ -39,6 +34,16 @@ fn fixture() -> tempfile::TempDir {
         }
         for name in Stage::All.products() {
             fs::write(expected.join(name), b"fixture").unwrap();
+        }
+        for stage in Stage::All.stages() {
+            fs::copy(
+                jacui::fixture_root()
+                    .join("expected")
+                    .join(network)
+                    .join(format!("manifest-{}.json", stage.name())),
+                expected.join(format!("manifest-{}.json", stage.name())),
+            )
+            .unwrap();
         }
     }
     for name in ["dem.tif", "hru.tif"] {
@@ -61,28 +66,38 @@ fn options(output: PathBuf) -> RunOptions {
 }
 
 #[test]
-fn inventory_detects_missing_size_checksum_and_unsafe_paths() {
+fn stage_manifests_detect_checksum_mismatch_and_unsafe_paths() {
     let temp = tempfile::tempdir().unwrap();
-    fs::write(temp.path().join("data"), b"abc").unwrap();
+    let file = temp.path().join("input/data");
+    fs::create_dir_all(file.parent().unwrap()).unwrap();
+    fs::write(&file, b"abc").unwrap();
     let hash = format!("{:x}", Sha256::digest(b"abc"));
-    let inventory = json!({"files":{"data":{"bytes":3,"sha256":hash}}});
-    fs::write(temp.path().join("inventory.json"), inventory.to_string()).unwrap();
+    for network in ["bhae", "tdxhydro"] {
+        let expected = temp.path().join("expected").join(network);
+        fs::create_dir_all(&expected).unwrap();
+        for stage in Stage::All.stages() {
+            let manifest = json!({
+                "step": stage.name(),
+                "inputs": {},
+                "outputs": {"data": {"path": file, "sha256": hash}},
+                "parameters": {}
+            });
+            fs::write(
+                expected.join(format!("manifest-{}.json", stage.name())),
+                manifest.to_string(),
+            )
+            .unwrap();
+        }
+    }
     jacui::verify(temp.path()).unwrap();
-    fs::write(temp.path().join("data"), b"abd").unwrap();
+    fs::write(&file, b"abd").unwrap();
     assert!(
         jacui::verify(temp.path())
             .unwrap_err()
             .to_string()
             .contains("Checksum")
     );
-    fs::write(temp.path().join("data"), b"ab").unwrap();
-    assert!(
-        jacui::verify(temp.path())
-            .unwrap_err()
-            .to_string()
-            .contains("Size")
-    );
-    fs::remove_file(temp.path().join("data")).unwrap();
+    fs::remove_file(&file).unwrap();
     assert!(
         jacui::verify(temp.path())
             .unwrap_err()
@@ -90,8 +105,14 @@ fn inventory_detects_missing_size_checksum_and_unsafe_paths() {
             .contains("Missing")
     );
     fs::write(
-        temp.path().join("inventory.json"),
-        json!({"files":{"../data":{"bytes":3,"sha256":hash}}}).to_string(),
+        temp.path().join("expected/bhae/manifest-define-roi.json"),
+        json!({
+            "step": "define-roi",
+            "inputs": {},
+            "outputs": {"data": {"path": "../input/data", "sha256": hash}},
+            "parameters": {}
+        })
+        .to_string(),
     )
     .unwrap();
     assert!(
@@ -218,7 +239,7 @@ fn protected_outputs_resolve_symlinks_even_for_missing_children() {
 
 #[cfg(unix)]
 #[test]
-fn full_pipeline_records_stage_sequence_prefix_logs_and_benchmarks() {
+fn full_pipeline_runs_stages_in_order_and_writes_logs() {
     let temp = fixture();
     let mock = temp.path().join("candidate.sh");
     fs::write(
@@ -248,31 +269,19 @@ for file in $files; do : > "$out/$file"; done
     opts.stage = Stage::All;
     opts.command = "/bin/sh".into();
     opts.command_arg = vec![mock.into_os_string()];
-    let report = run(temp.path(), &opts).unwrap();
-    let measurements = report["measurements"].as_array().unwrap();
-    assert_eq!(measurements.len(), 5);
-    assert!(report["pipeline_wall_seconds"].as_f64().unwrap() >= 0.);
-    for (measurement, stage) in measurements.iter().zip(Stage::All.stages()) {
-        assert_eq!(measurement["stage"], stage.name());
-        assert_eq!(measurement["exit_code"], 0);
-        assert!(measurement["wall_seconds"].as_f64().unwrap() >= 0.);
-        #[cfg(target_os = "linux")]
-        assert!(measurement["max_process_rss_kib"].as_i64().unwrap() > 0);
+    run(temp.path(), &opts).unwrap();
+    for stage in Stage::All.stages() {
         assert!(
             fs::read_to_string(opts.output_dir.join(format!("{}.log", stage.name())))
                 .unwrap()
                 .contains(stage.name())
         );
     }
-    let saved: Value =
-        serde_json::from_slice(&fs::read(opts.output_dir.join("benchmark.json")).unwrap()).unwrap();
-    assert_eq!(saved, report);
-    assert!(report["revision"].as_str().unwrap().len() == 40);
 }
 
 #[cfg(unix)]
 #[test]
-fn failures_keep_measurements_and_missing_inputs_fail_before_outputs() {
+fn failures_keep_logs_and_missing_inputs_fail_before_outputs() {
     let temp = fixture();
     let mut opts = options(temp.path().join("runs/failure"));
     opts.command = "/bin/false".into();
@@ -283,11 +292,7 @@ fn failures_keep_measurements_and_missing_inputs_fail_before_outputs() {
             .to_string()
             .contains("exit code")
     );
-    let report: Value =
-        serde_json::from_slice(&fs::read(opts.output_dir.join("benchmark.json")).unwrap()).unwrap();
-    assert_eq!(report["measurements"].as_array().unwrap().len(), 1);
-    assert_eq!(report["measurements"][0]["exit_code"], 1);
-    assert!(report["pipeline_wall_seconds"].as_f64().unwrap() >= 0.);
+    assert!(opts.output_dir.join("define-roi.log").is_file());
     opts.output_dir = temp.path().join("runs/missing-input");
     fs::remove_file(temp.path().join("input/bhae/catchments.fgb")).unwrap();
     assert!(
@@ -312,14 +317,7 @@ fn failures_keep_measurements_and_missing_inputs_fail_before_outputs() {
             .to_string()
             .contains("Cannot start candidate")
     );
-    let report: Value =
-        serde_json::from_slice(&fs::read(opts.output_dir.join("benchmark.json")).unwrap()).unwrap();
-    assert!(
-        report["measurements"][0]["error"]
-            .as_str()
-            .unwrap()
-            .contains("Cannot start")
-    );
+    assert!(opts.output_dir.join("sample-minis.log").is_file());
 }
 
 #[test]
@@ -491,7 +489,7 @@ fn vector_schema_distinguishes_boolean_and_integer_fields() {
 }
 
 #[test]
-fn compare_requires_product_set_and_audit_envelope() {
+fn compare_requires_product_set_and_checksummed_runtime_manifests() {
     let temp = tempfile::tempdir().unwrap();
     let expected = temp.path().join("expected/bhae");
     let actual = temp.path().join("candidate");
@@ -509,19 +507,28 @@ fn compare_requires_product_set_and_audit_envelope() {
     assert!(
         jacui::compare::compare(temp.path(), Network::Bhae, Stage::SampleMinis, &actual).is_err()
     );
+    let sampled = actual.join("sampled_minis.csv");
+    let digest = format!("{:x}", Sha256::digest(fs::read(&sampled).unwrap()));
     fs::write(
         actual.join("manifest-sample-minis.json"),
         json!({
             "step":"sample-minis",
             "inputs":{},
-            "outputs":{},
+            "outputs":{"sampled_minis":{"path":sampled,"sha256":digest}},
             "parameters":{},
-            "runtime":{}
+            "runtime":{"elapsed_time":{"total":0.1}}
         })
         .to_string(),
     )
     .unwrap();
     jacui::compare::compare(temp.path(), Network::Bhae, Stage::SampleMinis, &actual).unwrap();
+    let manifest_path = actual.join("manifest-sample-minis.json");
+    let mut manifest: Value = serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+    manifest["outputs"]["sampled_minis"]["sha256"] = Value::String("0".repeat(64));
+    fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+    assert!(
+        jacui::compare::compare(temp.path(), Network::Bhae, Stage::SampleMinis, &actual).is_err()
+    );
     fs::write(actual.join("unexpected.csv"), "id\n1\n").unwrap();
     assert!(
         jacui::compare::compare(temp.path(), Network::Bhae, Stage::SampleMinis, &actual).is_err()

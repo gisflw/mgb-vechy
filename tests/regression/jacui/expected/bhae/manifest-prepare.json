@@ -1,23 +1,70 @@
 {
   "step": "prepare",
+  "inputs": {
+    "dem": {
+      "path": "/workspace/mgb_builder/tests/regression/jacui/input/dem.tif",
+      "sha256": "df5efa1934ee7aea11266b427904ec7055ad27598e6f0e59de6d15430924092a"
+    },
+    "mini_catchments": {
+      "path": "/workspace/mgb_builder/tests/regression/jacui/expected/bhae/mini_catchments.fgb",
+      "sha256": "59bdab60e70cf037aee638e203378c5324263ac52a23fb9396aa59ca03ab3bfd"
+    },
+    "mini_segments": {
+      "path": "/workspace/mgb_builder/tests/regression/jacui/expected/bhae/mini_segments.fgb",
+      "sha256": "e090167b2faca8ee0434cdddbb21123e2f89c89990024d9c2db2f42cad29fa93"
+    },
+    "rasters": {
+      "hru": {
+        "path": "/workspace/mgb_builder/tests/regression/jacui/input/hru.tif",
+        "sha256": "3e52503fae76a31a2b70a1a13b44b1d06dd07cf58b74057d36fd13e8a06a0505"
+      }
+    }
+  },
+  "outputs": {
+    "dem": {
+      "path": "/workspace/mgb_builder/tests/regression/jacui/expected/bhae/dem.tif",
+      "sha256": "87f13d00248227b72bda87ec719f4d594c7f7f482640a038e5163b8fe4715d7c"
+    },
+    "grid_catchments": {
+      "path": "/workspace/mgb_builder/tests/regression/jacui/expected/bhae/grid_catchments.tif",
+      "sha256": "0c076d2ae00edc392616798d0c40465fbb64d593a752c2a92087e4b9b8eb34d4"
+    },
+    "grid_segments": {
+      "path": "/workspace/mgb_builder/tests/regression/jacui/expected/bhae/grid_segments.tif",
+      "sha256": "7de2f6e5f3d4fa5e205dc8da9813f1526cceca78cb3437fa461503929beb177d"
+    },
+    "rasters": {
+      "hru": {
+        "path": "/workspace/mgb_builder/tests/regression/jacui/expected/bhae/hru.tif",
+        "sha256": "88ad0ddccd31dffa3a0705f6db2278586c0fff2ea6fd28779b12eee765af97bc"
+      }
+    }
+  },
   "parameters": {
-    "dem": "/workspace/mgb_builder/tests/regression/jacui/input/dem.tif",
-    "output_dir": "/workspace/mgb_builder/tests/regression/jacui/expected/bhae",
-    "mini_catchments": "/workspace/mgb_builder/tests/regression/jacui/runs/capture-bhae/mini_catchments.fgb",
-    "mini_segments": "/workspace/mgb_builder/tests/regression/jacui/runs/capture-bhae/mini_segments.fgb",
+    "dem_scale": 0.01,
     "rasters": [
       {
         "name": "hru",
-        "path": "/workspace/mgb_builder/tests/regression/jacui/input/hru.tif",
         "kind": "categorical"
       }
     ],
-    "d8": null,
     "d8_encoding": null,
     "workers": 4,
     "memory_limit_mb": 4096,
-    "io_slots": 2,
-    "dem_scale": 0.01,
-    "overwrite": false
+    "io_slots": 2
+  },
+  "runtime": {
+    "ran_at": "2026-10-10 11:51",
+    "timezone": "+00:00",
+    "elapsed_time": {
+      "preparation": 0.475274525,
+      "processing": 4.179067361,
+      "finalizing": 5.375754357,
+      "total": 10.030097165
+    },
+    "workers_used": 4,
+    "peak_ram_usage_mib": 2462.61328125,
+    "peak_cpu_usage_percent": 449.7991943359375,
+    "cpu_time_seconds": 31.07
   }
 }

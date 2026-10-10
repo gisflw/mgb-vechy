@@ -1,9 +1,9 @@
 # Jacui regression reference
 
-The frozen scientific reference covers **Jacui / BHAE** and **Jacui / TDXHydro**,
+The scientific reference covers **Jacui / BHAE** and **Jacui / TDXHydro**,
 each with three ordered outlets. Large assets remain local and gitignored;
-the tracked configuration, inventory, audit provenance, and historical timing
-records stay unchanged during candidate work except for explicit corrections.
+the stage manifests carry the scientific parameters, input/output checksums,
+and runtime measurements.
 
 The Rust package implements all five preprocessing stages and provides
 regression tooling.
@@ -14,26 +14,21 @@ cargo run --release --example jacui -- --help
 cargo run --release --example jacui -- verify
 ```
 
-`verify` checks existence, byte length, and SHA-256 for every inventory entry.
-A checkout without local assets must obtain a copy of the original capture;
-missing assets fail explicit verification and candidate runs.
+`verify` checks every input and output recorded by the stage manifests against
+its SHA-256 checksum. A checkout without local assets must obtain a copy of the
+original capture; missing assets fail explicit verification and candidate runs.
 
 ## Contents and provenance
 
 | Path | Purpose |
 | --- | --- |
-| `config.json` | Scientific settings, ordered outlets, source fields, and CRS overrides. |
-| `inventory.json` | Captured file sizes, SHA-256 checksums, and source location. |
 | `input/` | Shared source DEM/HRU crops and raw basin-only vectors. |
-| `expected/bhae/`, `expected/tdxhydro/` | Frozen five-stage products, audit manifests, and diagnostics. |
-| `benchmarks/` | Historical three-outlet timing records. |
-| `runs/` | Disposable candidate products, logs, and measurements. |
+| `expected/bhae/`, `expected/tdxhydro/` | Frozen five-stage products and manifests with parameters, checksums, and diagnostics. |
+| `runs/` | Disposable candidate products, logs, and manifests. |
 
 The capture was generated with the historical scientific implementation.
 Source and tests are available at commit
-`0e29ede1d2fbb729cbdffebb2eb5b13bebf231c0`. The baseline measurements identify
-the production revision used for their runs; they are historical evidence,
-including their original executable names and absolute paths.
+`0e29ede1d2fbb729cbdffebb2eb5b13bebf231c0`.
 
 | Case | Ordered outlets | Source units | Minis |
 | --- | --- | --- | --- |
@@ -50,9 +45,13 @@ On 2026-10-09, an explicitly authorized correction changed `sub` from float64
 to int64 in both networks' mini catchments, mini segments, and sampled CSVs.
 Values are unchanged. Other vector attributes, geometry bytes, and mini feature
 order were checked unchanged. ROI vectors and source-to-mini CSVs already use
-integer `sub`; source rasters and historical benchmarks were not changed.
-`inventory.json` records corrected checksums and the six original file records.
-Local copies of the capture must include this correction to pass verification.
+integer `sub`; source rasters were not changed. The stage manifests record
+checksums for the captured inputs and regenerated outputs. Local copies of the
+capture must include this correction to pass verification.
+
+On 2026-10-10, both expected product sets were regenerated with the Rust
+implementation and compared against the previous references. Decoded products
+matched; manifests now record input and output checksums and runtime measurements.
 
 ## Candidate runs and comparisons
 
@@ -95,8 +94,9 @@ including other networks and symlink aliases, are protected from candidate
 writes. Candidate runs never read or write scratch. `--fixture PATH` globally
 selects another local capture directory.
 
-`compare` checks the exact stage product set and audit `step`/`parameters`
-envelopes. It checks vector schemas, IDs, attributes, topologically equivalent
+`compare` checks the exact stage product set, checksummed manifest outputs,
+runtime measurements, and audit `step`/`parameters` envelopes. It checks vector
+schemas, IDs, attributes, topologically equivalent
 geometry, and mini feature ordering. ROI rows and sampled CSV rows are matched
 by ID. Integer values and masks are exact. Numeric CSV/vector attributes use
 `rtol=1e-10, atol=1e-10`; continuous rasters use `rtol=1e-6, atol=1e-6`.
@@ -131,25 +131,10 @@ utility for executable-prefix arguments. Explicit runs fail on missing fixtures.
 The dataset capture omits flow-direction products; the
 [synthetic terrain cases](../synthetic/README.md) preserve focused examples.
 
-## Performance evidence
-
-Each candidate stage writes a log. `benchmark.json` records stage and whole-run
-wall time, exit status, revision, platform, resource settings, workers used from
-each stage manifest, executable arguments, and timing of failed invocations
-too. On Linux, `max_process_rss_kib` is `wait4`'s maximum
-individual-process RSS including completed descendants, not summed concurrent
-RSS. Other platforms record null for this Linux-specific metric.
-
-Historical benchmark records are single-run observations, not thresholds.
-Use release builds, the same local inputs/settings/machine, controlled cache
-conditions, repeated runs, and medians for performance conclusions. Timing does
-not determine scientific pass/fail. Broader scaling comes after both Jacui cases
-are scientifically useful.
-
 ## Historical baseline refresh
 
-Current Rust tools deliberately do not recapture or regenerate expected data.
-For an intentional historical refresh, create a separate checkout:
+The Rust tools do not recapture the historical input data. For an intentional
+historical refresh, create a separate checkout:
 
 ```bash
 git worktree add --detach ../mgb-python-reference \
@@ -158,8 +143,8 @@ git worktree add --detach ../mgb-python-reference \
 
 Follow that checkout's regression README and dependency manifest to use its
 historical `capture.py`, explicitly pointing it at the original scratch data.
-Review regenerated products, provenance, inventory, and benchmark records
-before replacing this capture. This is a separate reference operation, never
+Review regenerated products and stage manifests before replacing this capture.
+This is a separate reference operation, never
 part of candidate regression. `scratch/analysis` stays reserved for the user's
 broader manual testing.
 

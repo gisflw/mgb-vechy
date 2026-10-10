@@ -1,19 +1,72 @@
 {
   "step": "sample-minis",
+  "inputs": {
+    "mini_catchments": {
+      "path": "/workspace/mgb_builder/tests/regression/jacui/expected/bhae/mini_catchments.fgb",
+      "sha256": "59bdab60e70cf037aee638e203378c5324263ac52a23fb9396aa59ca03ab3bfd"
+    },
+    "mini_segments": {
+      "path": "/workspace/mgb_builder/tests/regression/jacui/expected/bhae/mini_segments.fgb",
+      "sha256": "e090167b2faca8ee0434cdddbb21123e2f89c89990024d9c2db2f42cad29fa93"
+    },
+    "dem": {
+      "path": "/workspace/mgb_builder/tests/regression/jacui/expected/bhae/dem.tif",
+      "sha256": "87f13d00248227b72bda87ec719f4d594c7f7f482640a038e5163b8fe4715d7c"
+    },
+    "grid_catchments": {
+      "path": "/workspace/mgb_builder/tests/regression/jacui/expected/bhae/grid_catchments.tif",
+      "sha256": "0c076d2ae00edc392616798d0c40465fbb64d593a752c2a92087e4b9b8eb34d4"
+    },
+    "grid_segments": {
+      "path": "/workspace/mgb_builder/tests/regression/jacui/expected/bhae/grid_segments.tif",
+      "sha256": "7de2f6e5f3d4fa5e205dc8da9813f1526cceca78cb3437fa461503929beb177d"
+    },
+    "hand": {
+      "path": "/workspace/mgb_builder/tests/regression/jacui/expected/bhae/hand.tif",
+      "sha256": "d282ada2a8914ba3c06813d4161cd1c4aae4ccdfcbcc5890b030aff8d87530c9"
+    },
+    "ltnd": {
+      "path": "/workspace/mgb_builder/tests/regression/jacui/expected/bhae/ltnd.tif",
+      "sha256": "3098dab1ef415192af20dfa79dc2739157917a001468796cc2f0e47c23e29dee"
+    },
+    "hru": {
+      "path": "/workspace/mgb_builder/tests/regression/jacui/expected/bhae/hru.tif",
+      "sha256": "88ad0ddccd31dffa3a0705f6db2278586c0fff2ea6fd28779b12eee765af97bc"
+    }
+  },
+  "outputs": {
+    "sampled_minis": {
+      "path": "/workspace/mgb_builder/tests/regression/jacui/expected/bhae/sampled_minis.csv",
+      "sha256": "1b5f91319f6a1ecd7adc8acd8cf7f27f82bdf4ae5e2ec9c6e97de7238c01896b"
+    },
+    "diagnostics": {
+      "hand": {
+        "path": "/workspace/mgb_builder/tests/regression/jacui/expected/bhae/nodata_hand.csv",
+        "sha256": "4c64f4c26987349aec43fb842e958679fe5d0969af09b7efc4948e98da6679e1"
+      },
+      "ltnd": {
+        "path": "/workspace/mgb_builder/tests/regression/jacui/expected/bhae/nodata_ltnd.csv",
+        "sha256": "4c64f4c26987349aec43fb842e958679fe5d0969af09b7efc4948e98da6679e1"
+      }
+    }
+  },
   "parameters": {
-    "mini_catchments": "/workspace/mgb_builder/tests/regression/jacui/runs/capture-bhae/mini_catchments.fgb",
-    "mini_segments": "/workspace/mgb_builder/tests/regression/jacui/runs/capture-bhae/mini_segments.fgb",
-    "dem": "/workspace/mgb_builder/tests/regression/jacui/runs/capture-bhae/dem.tif",
-    "grid_catchments": "/workspace/mgb_builder/tests/regression/jacui/runs/capture-bhae/grid_catchments.tif",
-    "grid_segments": "/workspace/mgb_builder/tests/regression/jacui/runs/capture-bhae/grid_segments.tif",
-    "hand": "/workspace/mgb_builder/tests/regression/jacui/runs/capture-bhae/hand.tif",
-    "ltnd": "/workspace/mgb_builder/tests/regression/jacui/runs/capture-bhae/ltnd.tif",
-    "hru": "/workspace/mgb_builder/tests/regression/jacui/runs/capture-bhae/hru.tif",
-    "output_dir": "/workspace/mgb_builder/tests/regression/jacui/expected/bhae",
     "workers": 4,
     "memory_limit_mb": 4096,
-    "io_slots": 2,
-    "batch_size": 10000,
-    "overwrite": false
+    "io_slots": 2
+  },
+  "runtime": {
+    "ran_at": "2026-10-10 11:51",
+    "timezone": "+00:00",
+    "elapsed_time": {
+      "preparation": 2.747212436,
+      "processing": 3.292473085,
+      "finalizing": 0.003845809,
+      "total": 6.043532261
+    },
+    "workers_used": 4,
+    "peak_ram_usage_mib": 1637.9453125,
+    "peak_cpu_usage_percent": 273.0923767089844,
+    "cpu_time_seconds": 11.23
   }
 }

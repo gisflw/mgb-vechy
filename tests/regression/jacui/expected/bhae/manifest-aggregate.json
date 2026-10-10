@@ -1,15 +1,49 @@
 {
   "step": "aggregate",
+  "inputs": {
+    "roi_catchments": {
+      "path": "/workspace/mgb_builder/tests/regression/jacui/expected/bhae/roi_catchments.fgb",
+      "sha256": "c8e0d015f294e43c658f66483cbc56b0f433f08d46d26e6ec2add69c09fe62a6"
+    },
+    "roi_segments": {
+      "path": "/workspace/mgb_builder/tests/regression/jacui/expected/bhae/roi_segments.fgb",
+      "sha256": "3aab1b27749feed0daf99b075189eda6eb25fa85acbfc32dabc8bd2c312b5a65"
+    }
+  },
+  "outputs": {
+    "mini_catchments": {
+      "path": "/workspace/mgb_builder/tests/regression/jacui/expected/bhae/mini_catchments.fgb",
+      "sha256": "59bdab60e70cf037aee638e203378c5324263ac52a23fb9396aa59ca03ab3bfd"
+    },
+    "mini_segments": {
+      "path": "/workspace/mgb_builder/tests/regression/jacui/expected/bhae/mini_segments.fgb",
+      "sha256": "e090167b2faca8ee0434cdddbb21123e2f89c89990024d9c2db2f42cad29fa93"
+    },
+    "source_to_mini": {
+      "path": "/workspace/mgb_builder/tests/regression/jacui/expected/bhae/source_to_mini.csv",
+      "sha256": "c002cc97e4504077244b859dc5d448efa8c82da8a5ed1bf040cb68a457155b92"
+    }
+  },
   "parameters": {
-    "roi_catchments": "/workspace/mgb_builder/tests/regression/jacui/runs/capture-bhae/roi_catchments.fgb",
-    "roi_segments": "/workspace/mgb_builder/tests/regression/jacui/runs/capture-bhae/roi_segments.fgb",
     "uparea_min": 60.0,
     "lmin": 6.0,
-    "output_dir": "/workspace/mgb_builder/tests/regression/jacui/expected/bhae",
     "workers": 4,
     "memory_limit_mb": 4096,
     "io_slots": 2,
-    "batch_size": 10000,
-    "overwrite": false
+    "batch_size": 10000
+  },
+  "runtime": {
+    "ran_at": "2026-10-10 11:51",
+    "timezone": "+00:00",
+    "elapsed_time": {
+      "preparation": 0.097288391,
+      "processing": 1.2092999570000003,
+      "finalizing": 0.027393845,
+      "total": 1.333983368
+    },
+    "workers_used": 4,
+    "peak_ram_usage_mib": 84.91015625,
+    "peak_cpu_usage_percent": 400.8016052246094,
+    "cpu_time_seconds": 4.85
   }
 }

@@ -1,9 +1,27 @@
 {
   "step": "define-roi",
+  "inputs": {
+    "catchments": {
+      "path": "/workspace/mgb_builder/tests/regression/jacui/input/bhae/catchments.fgb",
+      "sha256": "79153d8a2634445e06ebb0b5728c9e70323c99720632f2884cc1e8600cfd56cf"
+    },
+    "segments": {
+      "path": "/workspace/mgb_builder/tests/regression/jacui/input/bhae/segments.fgb",
+      "sha256": "1e1b2ce2fa3719566a44ae2a359c7e0428ad6318bad2cbf68c311d88896a5daa"
+    }
+  },
+  "outputs": {
+    "catchments": {
+      "path": "/workspace/mgb_builder/tests/regression/jacui/expected/bhae/roi_catchments.fgb",
+      "sha256": "c8e0d015f294e43c658f66483cbc56b0f433f08d46d26e6ec2add69c09fe62a6"
+    },
+    "segments": {
+      "path": "/workspace/mgb_builder/tests/regression/jacui/expected/bhae/roi_segments.fgb",
+      "sha256": "3aab1b27749feed0daf99b075189eda6eb25fa85acbfc32dabc8bd2c312b5a65"
+    }
+  },
   "parameters": {
     "crs": "EPSG:4326",
-    "catchments": "/workspace/mgb_builder/tests/regression/jacui/input/bhae/catchments.fgb",
-    "segments": "/workspace/mgb_builder/tests/regression/jacui/input/bhae/segments.fgb",
     "outlet_ids": [
       "171984",
       "420329",
@@ -12,7 +30,6 @@
     "id_col": "cotrecho",
     "id_down_col": "nutrjus",
     "strahler_order_col": "nustrahler",
-    "output_dir": "/workspace/mgb_builder/tests/regression/jacui/expected/bhae",
     "catchments_layer": null,
     "segments_layer": null,
     "catchments_source_crs": null,
@@ -20,7 +37,20 @@
     "workers": 4,
     "memory_limit_mb": 4096,
     "io_slots": 2,
-    "batch_size": 10000,
-    "overwrite": false
+    "batch_size": 10000
+  },
+  "runtime": {
+    "ran_at": "2026-10-10 11:51",
+    "timezone": "+00:00",
+    "elapsed_time": {
+      "preparation": 0.103893959,
+      "processing": 0.685880577,
+      "finalizing": 0.406651787,
+      "total": 1.196427827
+    },
+    "workers_used": 4,
+    "peak_ram_usage_mib": 67.44140625,
+    "peak_cpu_usage_percent": 403.193603515625,
+    "cpu_time_seconds": 2.96
   }
 }

@@ -1,9 +1,27 @@
 {
   "step": "define-roi",
+  "inputs": {
+    "catchments": {
+      "path": "/workspace/mgb_builder/tests/regression/jacui/input/tdxhydro/catchments.fgb",
+      "sha256": "dd484c4605bdfb2f81bce4419486b433928f6f055e11706ca3b700f53c469e65"
+    },
+    "segments": {
+      "path": "/workspace/mgb_builder/tests/regression/jacui/input/tdxhydro/segments.fgb",
+      "sha256": "963039a90cd76f63e1e413b86858891080b4d48cb9d4569133e47345171b5ba6"
+    }
+  },
+  "outputs": {
+    "catchments": {
+      "path": "/workspace/mgb_builder/tests/regression/jacui/expected/tdxhydro/roi_catchments.fgb",
+      "sha256": "faa3cc725d45cff97b2a56abcc008ebf211b16e64639cf9eb1bea41e13217fc8"
+    },
+    "segments": {
+      "path": "/workspace/mgb_builder/tests/regression/jacui/expected/tdxhydro/roi_segments.fgb",
+      "sha256": "2788f46426384439fb0e4f918aff2766ef4e1df37a017e30bb6c132e810299cd"
+    }
+  },
   "parameters": {
     "crs": "EPSG:4326",
-    "catchments": "/workspace/mgb_builder/tests/regression/jacui/input/tdxhydro/catchments.fgb",
-    "segments": "/workspace/mgb_builder/tests/regression/jacui/input/tdxhydro/segments.fgb",
     "outlet_ids": [
       "640538827",
       "640543432",
@@ -12,7 +30,6 @@
     "id_col": "linkno",
     "id_down_col": "dslinkno",
     "strahler_order_col": "strmOrder",
-    "output_dir": "/workspace/mgb_builder/tests/regression/jacui/expected/tdxhydro",
     "catchments_layer": null,
     "segments_layer": null,
     "catchments_source_crs": "EPSG:4326",
@@ -20,7 +37,20 @@
     "workers": 4,
     "memory_limit_mb": 4096,
     "io_slots": 2,
-    "batch_size": 10000,
-    "overwrite": false
+    "batch_size": 10000
+  },
+  "runtime": {
+    "ran_at": "2026-10-10 11:51",
+    "timezone": "+00:00",
+    "elapsed_time": {
+      "preparation": 0.126509077,
+      "processing": 0.836838977,
+      "finalizing": 0.334929295,
+      "total": 1.298278889
+    },
+    "workers_used": 4,
+    "peak_ram_usage_mib": 66.1796875,
+    "peak_cpu_usage_percent": 400.8016052246094,
+    "cpu_time_seconds": 3.7
   }
 }

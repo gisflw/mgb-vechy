@@ -17,9 +17,9 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Check every recorded file size and SHA-256 checksum.
+    /// Check fixture files against SHA-256 checksums in stage manifests.
     Verify,
-    /// Run a candidate preprocessing executable and record benchmarks.
+    /// Run a candidate preprocessing executable and write stage logs.
     Run(jacui::runner::RunOptions),
     /// Compare candidate products with a frozen reference.
     CompareProducts {
@@ -47,7 +47,7 @@ fn main() -> anyhow::Result<()> {
     let fixture = cli.fixture.unwrap_or_else(jacui::fixture_root);
     match cli.command {
         Commands::Verify => jacui::verify(&fixture),
-        Commands::Run(options) => jacui::runner::run(&fixture, &options).map(|_| ()),
+        Commands::Run(options) => jacui::runner::run(&fixture, &options),
         Commands::CompareProducts {
             reference_dir,
             output_dir,

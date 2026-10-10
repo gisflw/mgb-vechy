@@ -6,9 +6,11 @@ use gdal::{
 };
 use geos::{Geom, Geometry};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs::{self, File},
+    io::Read,
     path::Path,
 };
 
@@ -33,6 +35,104 @@ fn product_names(directory: &Path) -> Result<BTreeSet<String>> {
         })
         .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
         .collect())
+}
+
+fn output_records(value: &Value, records: &mut Vec<(String, String)>) -> Result<()> {
+    let object = value
+        .as_object()
+        .context("Manifest outputs must be an object")?;
+    if object.contains_key("path") || object.contains_key("sha256") {
+        let path = object["path"]
+            .as_str()
+            .context("Manifest output path missing")?;
+        let checksum = object["sha256"]
+            .as_str()
+            .context("Manifest output checksum missing")?;
+        ensure!(
+            checksum.len() == 64 && checksum.bytes().all(|byte| byte.is_ascii_hexdigit()),
+            "Invalid manifest output checksum"
+        );
+        records.push((path.to_owned(), checksum.to_owned()));
+    } else {
+        ensure!(!object.is_empty(), "Manifest outputs must include files");
+        for value in object.values() {
+            output_records(value, records)?;
+        }
+    }
+    Ok(())
+}
+
+fn checksum(path: &Path) -> Result<String> {
+    let mut file = File::open(path)?;
+    let mut hash = Sha256::new();
+    let mut buffer = vec![0; 1024 * 1024];
+    loop {
+        let count = file.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        hash.update(&buffer[..count]);
+    }
+    Ok(format!("{:x}", hash.finalize()))
+}
+
+fn check_manifest(manifest: &Value, stage: Stage, expected: &Path, output: &Path) -> Result<()> {
+    ensure!(
+        manifest["step"] == stage.name()
+            && manifest["inputs"].is_object()
+            && manifest["outputs"].is_object()
+            && manifest["parameters"].is_object(),
+        "Invalid audit manifest envelope for {}",
+        stage.name()
+    );
+    let elapsed = manifest["runtime"]["elapsed_time"]["total"]
+        .as_f64()
+        .context("Manifest runtime is missing total elapsed time")?;
+    ensure!(
+        elapsed.is_finite() && elapsed >= 0.,
+        "Invalid manifest runtime for {}",
+        stage.name()
+    );
+
+    let mut expected_outputs: BTreeSet<_> =
+        stage.products().into_iter().map(str::to_owned).collect();
+    if stage == Stage::SampleMinis {
+        expected_outputs.extend(
+            product_names(expected)?
+                .into_iter()
+                .filter(|name| name.starts_with("nodata_")),
+        );
+    }
+    let output_dir = fs::canonicalize(output)?;
+    let mut records = Vec::new();
+    output_records(&manifest["outputs"], &mut records)?;
+    let mut found = BTreeSet::new();
+    for (recorded, digest) in records {
+        let recorded = Path::new(&recorded);
+        let name = recorded
+            .file_name()
+            .and_then(|name| name.to_str())
+            .context("Manifest output has an invalid filename")?;
+        ensure!(
+            expected_outputs.contains(name) && found.insert(name.to_owned()),
+            "Unexpected or duplicate manifest output: {name}"
+        );
+        let product = fs::canonicalize(output_dir.join(name))?;
+        ensure!(
+            fs::canonicalize(recorded)? == product,
+            "Manifest output path does not match {name}"
+        );
+        ensure!(
+            checksum(&product)? == digest,
+            "Manifest checksum mismatch: {name}"
+        );
+    }
+    ensure!(
+        found == expected_outputs,
+        "Manifest output set mismatch; missing {:?}",
+        expected_outputs.difference(&found).collect::<Vec<_>>()
+    );
+    Ok(())
 }
 
 pub fn compare(root: &Path, network: Network, stage: Stage, output: &Path) -> Result<()> {
@@ -104,15 +204,8 @@ pub fn compare_products(
             File::open(&path)
                 .with_context(|| format!("Audit manifest missing: {}", path.display()))?,
         )?;
-        ensure!(
-            manifest["step"] == step.name()
-                && manifest["inputs"].is_object()
-                && manifest["outputs"].is_object()
-                && manifest["parameters"].is_object()
-                && manifest["runtime"].is_object(),
-            "Invalid audit envelope: {}",
-            path.display()
-        );
+        check_manifest(&manifest, step, expected, output)
+            .with_context(|| path.display().to_string())?;
     }
     Ok(())
 }
@@ -425,8 +518,12 @@ fn compare_vector_impl(actual: &Path, reference: &Path, legacy_sub: bool) -> Res
 }
 
 fn check_outlets(root: &Path, network: Network, output: &Path) -> Result<()> {
-    let config: Value = serde_json::from_reader(File::open(root.join("config.json"))?)?;
-    let outlets = config["networks"][network.name()]["outlet_ids"]
+    let manifest: Value = serde_json::from_reader(File::open(
+        root.join("expected")
+            .join(network.name())
+            .join("manifest-define-roi.json"),
+    )?)?;
+    let outlets = manifest["parameters"]["outlet_ids"]
         .as_array()
         .context("Outlet list missing")?;
     ensure!(
