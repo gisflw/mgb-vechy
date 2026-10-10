@@ -282,7 +282,6 @@ struct SampleAdmission {
     bytes: usize,
     active: usize,
     peak: usize,
-    consumed: usize,
     stopped: bool,
 }
 
@@ -323,13 +322,21 @@ fn sample_minis_bounded(
     for mini in minis {
         ensure_sample_fits(mini, available, worker_bytes)?;
     }
+    // Reuse terrain's tile order so nearby minis share decoded GDAL blocks.
+    let mut order: Vec<_> = (0..minis.len()).collect();
+    order.sort_unstable_by_key(|&i| {
+        (
+            minis[i].window.y / io::BLOCK,
+            minis[i].window.x / io::BLOCK,
+            minis[i].id(),
+        )
+    });
     let state = Mutex::new(SampleAdmission {
-        pending: (0..minis.len()).collect(),
+        pending: order.into(),
         reservations: BTreeMap::new(),
         bytes: 0,
         active: 0,
         peak: 0,
-        consumed: 0,
         stopped: false,
     });
     let ready = Condvar::new();
@@ -354,10 +361,8 @@ fn sample_minis_bounded(
                                     return Ok(());
                                 }
                                 let ordinal = *admission.pending.front().unwrap();
-                                let within_window = ordinal
-                                    < admission.consumed.saturating_add(workers.saturating_mul(2));
                                 let bytes = reservation(ordinal)?;
-                                if within_window && bytes <= available.saturating_sub(admission.bytes) {
+                                if bytes <= available.saturating_sub(admission.bytes) {
                                     ensure!(
                                         !admission.reservations.contains_key(&ordinal),
                                         "Sampling mini {ordinal} already has a reservation"
@@ -369,7 +374,7 @@ fn sample_minis_bounded(
                                     admission.peak = admission.peak.max(admission.active.min(workers));
                                     break (ordinal, bytes);
                                 }
-                                if admission.active == 0 && within_window {
+                                if admission.active == 0 {
                                     ensure_sample_fits(&minis[ordinal], available, worker_bytes)?;
                                     bail!(
                                         "Cannot admit mini {} under the current sampling memory reservations",
@@ -416,69 +421,42 @@ fn sample_minis_bounded(
         drop(sender);
         let mut error = None;
         let mut completed = 0;
-        let mut pending = BTreeMap::<usize, (usize, Result<MiniResult>)>::new();
+        let mut processed = 0;
+        // Compact results fit the existing 8192-byte-per-mini coordinator reserve.
+        let mut pending = BTreeMap::<usize, MiniResult>::new();
         for (ordinal, bytes, result) in receiver {
-            if ordinal == usize::MAX {
-                if error.is_none() {
-                    error = Some(result.err().unwrap_or_else(|| {
-                        anyhow::anyhow!("Sampling worker failed without an error")
-                    }));
+            release_sample(&state, &ready, ordinal, bytes)?;
+            if error.is_some() {
+                continue;
+            }
+            match result {
+                Ok(result) => {
+                    processed += 1;
+                    reporter.advance(processed, Some(minis.len()));
+                    pending.insert(ordinal, result);
+                    while let Some(result) = pending.remove(&completed) {
+                        if let Err(e) = output.add(&minis[completed], result) {
+                            error = Some(e);
+                            break;
+                        }
+                        completed += 1;
+                    }
                 }
+                Err(e) => error = Some(e),
+            }
+            if error.is_some() {
                 state
                     .lock()
                     .map_err(|_| anyhow::anyhow!("Sampling admission lock poisoned"))?
                     .stopped = true;
                 ready.notify_all();
-                for (ordinal, (bytes, _)) in std::mem::take(&mut pending) {
-                    release_sample(&state, &ready, ordinal, bytes)?;
-                }
-                continue;
-            }
-            if error.is_some() {
-                release_sample(&state, &ready, ordinal, bytes)?;
-                continue;
-            }
-            pending.insert(ordinal, (bytes, result));
-            while let Some((bytes, result)) = pending.remove(&completed) {
-                match result {
-                    Ok(result) => {
-                        if let Err(e) = output.add(&minis[completed], result) {
-                            error = Some(e);
-                        } else {
-                            completed += 1;
-                            let mut admission = state
-                                .lock()
-                                .map_err(|_| anyhow::anyhow!("Sampling admission lock poisoned"))?;
-                            admission.consumed = completed;
-                            release_sample_reservation(&mut admission, completed - 1, bytes)?;
-                            ready.notify_all();
-                            reporter.advance(completed, Some(minis.len()));
-                            continue;
-                        }
-                    }
-                    Err(e) => error = Some(e),
-                }
-                release_sample(&state, &ready, completed, bytes)?;
-                if error.is_some() {
-                    state
-                        .lock()
-                        .map_err(|_| anyhow::anyhow!("Sampling admission lock poisoned"))?
-                        .stopped = true;
-                    ready.notify_all();
-                    for (ordinal, (bytes, _)) in std::mem::take(&mut pending) {
-                        release_sample(&state, &ready, ordinal, bytes)?;
-                    }
-                    break;
-                }
+                pending.clear();
             }
         }
         for handle in handles {
             if handle.join().is_err() && error.is_none() {
                 error = Some(anyhow::anyhow!("Sampling worker panicked"));
             }
-        }
-        for (ordinal, (bytes, _)) in std::mem::take(&mut pending) {
-            release_sample(&state, &ready, ordinal, bytes)?;
         }
         let outstanding = state
             .lock()
@@ -1281,6 +1259,67 @@ mod tests {
             },
             owned_cells: 1,
         }
+    }
+
+    #[test]
+    fn spatial_sampling_releases_working_memory_and_keeps_output_order() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let minis: Vec<_> = (1..=6)
+            .map(|id| {
+                let mut mini = mini(id);
+                mini.window.x = (6 - id) as usize * io::BLOCK;
+                mini
+            })
+            .collect();
+        let grid = Grid {
+            transform: [0., 0.01, 0., 0., 0., -0.01],
+            width: 6 * io::BLOCK,
+            height: 1,
+            wkt: SpatialRef::from_epsg(4326)?.to_wkt()?,
+        };
+        let bytes = sample_reservation(&minis[0], 1024)?;
+        let mut output = SampleOutput::new(directory.path())?;
+        let visited = Mutex::new(Vec::new());
+        let progress = Mutex::new(Vec::new());
+        let record_progress = |event: super::super::execution::StageProgress| {
+            if event.phase == "processing" && event.total.is_some() {
+                progress.lock().unwrap().push(event.completed);
+            }
+        };
+        let mut reporter = super::super::execution::Reporter::new(&record_progress);
+        reporter.enter("processing", "Sampling mini basins");
+        assert_eq!(
+            sample_minis_bounded(
+                &grid,
+                &minis,
+                bytes,
+                1024,
+                1,
+                &reporter,
+                &mut output,
+                |mini, _| {
+                    visited.lock().unwrap().push(mini.id());
+                    Ok(MiniResult {
+                        id: mini.id(),
+                        total_cells: 1,
+                        nodata: [1; 5],
+                        statistics: None,
+                        failures: Vec::new(),
+                    })
+                },
+            )?,
+            1
+        );
+        assert_eq!(*visited.lock().unwrap(), [6, 5, 4, 3, 2, 1]);
+        assert_eq!(*progress.lock().unwrap(), [1, 2, 3, 4, 5, 6]);
+        output.finish(directory.path(), minis.len())?;
+        let mut reader = csv::Reader::from_path(directory.path().join("nodata_dem.csv"))?;
+        let ids = reader
+            .records()
+            .map(|row| Ok(row?[0].parse::<i64>()?))
+            .collect::<Result<Vec<_>>>()?;
+        assert_eq!(ids, [1, 2, 3, 4, 5, 6]);
+        Ok(())
     }
 
     fn injected_job_failure(failure_id: i64, panic: bool) {

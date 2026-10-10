@@ -107,8 +107,9 @@ The report returns output paths, mini count, and actual worker count.
 Worker and memory defaults above apply to the CLI. Concurrency decreases when
 necessary to fit the managed working budget. Each admitted mini is read only
 within its own bounds in bounded tiles; its owned-cell accumulator and bounded
-tile buffers are reserved along with coordinator overhead. Results stream in
-mini-ID order to the staged CSV; the dataset is never accumulated in memory.
+tile buffers are reserved along with coordinator overhead. Jobs run in top-left raster-tile order to reuse decoded blocks. Compact
+per-mini results use the coordinator reserve and are written in mini-ID order
+to the staged CSV; raster cells are never accumulated across minis.
 A mini that cannot fit the budget fails with its estimated requirement.
 At least 48 MiB is needed for the GIS cache and one sampling worker, plus
 coordinator metadata. The configured GDAL block cache uses one quarter of the
