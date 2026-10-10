@@ -39,7 +39,12 @@ fn geometry_union_centroids_and_worker_determinism() -> Result<()> {
     assert_eq!(minis.mini_count, 3);
     let manifest: serde_json::Value =
         serde_json::from_reader(std::fs::File::open(&minis.manifest)?)?;
-    assert!(manifest["elapsed_seconds"].as_f64().unwrap().is_finite());
+    assert!(
+        manifest["runtime"]["elapsed_time"]["total"]
+            .as_f64()
+            .unwrap()
+            .is_finite()
+    );
     assert!(
         !Dataset::open(&minis.catchments)?
             .layer(0)?

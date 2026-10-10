@@ -97,8 +97,20 @@ directories. Multiple stages may use the same output folder.
 | `terrain-products` | `manifest-terrain-products.json` |
 | `sample-minis` | `manifest-sample-minis.json` |
 
-Each manifest is a JSON object containing `step` (the stage identifier) and
-`parameters` (an object recording input paths and processing parameters).
-Paths are recorded as absolute paths. Runtime-specific parameter fields are
-not frozen. Manifest serialization, overwrite behavior, and publication
-mechanisms do not define the scientific products.
+Each manifest contains `step`, `inputs`, `outputs`, `parameters`, and `runtime`
+in that order. Input and output records contain an absolute `path` and a
+lowercase SHA-256 checksum; the manifest does not checksum itself. Preparation
+stores named rasters under a nested `rasters` object. FileGeodatabase directory
+inputs use a deterministic digest of sorted relative filenames and file hashes.
+
+`parameters` contains stage settings, with required settings before optional
+settings and execution limits last. File paths and overwrite controls are not
+parameters. `workers` is the requested worker limit; actual concurrency is
+recorded as `runtime.workers_used`. `runtime` records the local start time and UTC offset, phase and
+total elapsed seconds, actual worker count, and process RAM/CPU measurements.
+RAM and CPU peaks are sampled, process CPU percentage can exceed 100%, and
+resource fields may be null when the platform cannot provide a measurement or
+the run is too short for a valid CPU sample. The elapsed snapshot includes
+input/output hashing and product publication; manifest writing follows it.
+Manifest serialization, overwrite behavior, and publication mechanisms do not
+define the scientific products.

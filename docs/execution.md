@@ -20,9 +20,9 @@ processing, finalizing, and total elapsed seconds, followed by a short completio
 message and every output filename under its output directory. Sampling prints
 nodata warnings on their own line. Failed runs print elapsed time before failure.
 
-Each successful stage manifest includes a top-level `elapsed_seconds` value for
-the total stage run. Reports also expose wall-clock phase timings for the CLI and
-progress callbacks. Dataset-sized raster and vector inputs are processed with
+Stage manifests include per-phase and total elapsed time under `runtime`.
+Reports also expose wall-clock phase timings for the CLI and progress callbacks.
+Dataset-sized raster and vector inputs are processed with
 bounded windows or complete-mini jobs; concurrent work is reduced to fit the
 configured managed-memory budget. One mini that cannot fit its required working
 memory fails with an estimated requirement. Configured GIS cache reservations

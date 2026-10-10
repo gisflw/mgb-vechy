@@ -55,7 +55,7 @@ and match between catchments and segments.
 | `mini_catchments.fgb` | Unindexed mini polygons in final processing order. |
 | `mini_segments.fgb` | Unindexed mini reaches in the same order. |
 | `source_to_mini.csv` | Every ROI source ID mapped exactly once. |
-| `manifest-aggregate.json` | Input paths and processing parameters. |
+| `manifest-aggregate.json` | Checksummed inputs and outputs, parameters, and runtime. |
 
 Both vector files have the ordered schema:
 

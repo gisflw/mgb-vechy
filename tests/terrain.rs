@@ -219,10 +219,22 @@ fn products_preserve_ownership_masks_metadata_and_worker_determinism() -> Result
         assert_eq!(csv.lines().count(), 2);
         let manifest: serde_json::Value = serde_json::from_reader(fs::File::open(first.manifest)?)?;
         assert_eq!(manifest["step"], "terrain-products");
-        assert_eq!(manifest["parameters"]["workers_used"], first.workers_used);
+        assert_eq!(manifest["runtime"]["workers_used"], first.workers_used);
         assert_eq!(manifest["parameters"]["routing_bytes_per_cell"], 128);
-        assert!(manifest["elapsed_seconds"].as_f64().unwrap().is_finite());
-        assert!(Path::new(manifest["parameters"]["dem"].as_str().unwrap()).is_absolute());
+        assert!(
+            manifest["runtime"]["elapsed_time"]["total"]
+                .as_f64()
+                .unwrap()
+                .is_finite()
+        );
+        assert!(Path::new(manifest["inputs"]["dem"]["path"].as_str().unwrap()).is_absolute());
+        assert_eq!(
+            manifest["outputs"]["hand"]["sha256"]
+                .as_str()
+                .unwrap()
+                .len(),
+            64
+        );
         let second_manifest: serde_json::Value =
             serde_json::from_reader(fs::File::open(second.manifest)?)?;
         assert_eq!(second_manifest["parameters"]["routing_bytes_per_cell"], 256);

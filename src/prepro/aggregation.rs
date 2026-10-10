@@ -108,6 +108,10 @@ pub fn aggregate_roi_dataset_with_progress(
         ],
         &[&spec.roi_catchments, &spec.roi_segments],
     )?;
+    let manifest_inputs = super::execution::manifest_files(&[
+        ("roi_catchments", &spec.roi_catchments),
+        ("roi_segments", &spec.roi_segments),
+    ])?;
     let _cache = CacheBudget::new()?;
     fs::create_dir_all(&spec.output_dir)?;
     let segments = read_roi(&spec.roi_segments, &mut budget)?;
@@ -303,20 +307,27 @@ pub fn aggregate_roi_dataset_with_progress(
     }
     mapping.flush()?;
     drop(mapping);
-    let manifest = vector::finish(
+    let (manifest, timings) = vector::finish(
         staging.path(),
         &spec.output_dir,
-        "aggregate",
-        &spec,
-        &[
-            "mini_catchments.fgb",
-            "mini_segments.fgb",
-            "source_to_mini.csv",
-        ],
-        workers_used,
-        reporter.elapsed_seconds(),
+        vector::ManifestSpec {
+            stage: "aggregate",
+            parameters: super::execution::manifest_parameters(
+                &spec,
+                &["roi_catchments", "roi_segments"],
+            )?,
+            inputs: manifest_inputs,
+            products: vec![
+                ("mini_catchments".into(), "mini_catchments.fgb".into()),
+                ("mini_segments".into(), "mini_segments.fgb".into()),
+                ("source_to_mini".into(), "source_to_mini.csv".into()),
+            ],
+            workers_used,
+            overwrite: spec.overwrite,
+            remove: vec![],
+        },
+        &mut reporter,
     )?;
-    let timings = reporter.finish();
     Ok(AggregationReport {
         timings,
         catchments: spec.output_dir.join("mini_catchments.fgb"),

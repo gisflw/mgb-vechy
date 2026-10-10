@@ -40,9 +40,10 @@ copies are stored beside staged outputs and removed when preparation exits;
 the input files and manifest paths remain unchanged.
 
 The report includes output paths, mini count, and peak processing concurrency.
-The manifest records absolute input paths and `workers_used`. Stale optional
-products recorded by the previous preparation manifest are removed on successful
-replacement. See [execution controls](execution.md) for publication and progress.
+The manifest records checksummed inputs and outputs, processing parameters, and
+runtime measurements. Stale optional products recorded by the previous
+preparation manifest are removed on successful replacement. See
+[execution controls](execution.md) for publication and progress.
 
 Clip aligned rasters and establish mini ownership and matching drainage on a
 canonical DEM grid. See the [shared data contracts](shared_data_contracts.md).
@@ -120,7 +121,7 @@ Canonical D8 codes are 0 and 1–8 clockwise from north. ESRI codes normalize as
 | `d8.tif` | Optional normalized `uint8` direction raster. |
 | `grid_catchments.tif` | Final mini ownership, with `mini_index` metadata. |
 | `grid_segments.tif` | Matching drainage IDs and zero background. |
-| `manifest-prepare.json` | Input paths and processing parameters. |
+| `manifest-prepare.json` | Checksummed inputs and outputs, parameters, and runtime. |
 
 All rasters are canonical-grid COGs with internal validity masks. The
 `mini_index` dataset tag contains ordered JSON records

@@ -54,10 +54,10 @@ pub struct PreparationSpec {
     pub mini_catchments: PathBuf,
     pub mini_segments: PathBuf,
     pub output_dir: PathBuf,
+    pub dem_scale: f64,
     pub rasters: Vec<NamedRaster>,
     pub d8: Option<PathBuf>,
     pub d8_encoding: Option<D8Encoding>,
-    pub dem_scale: f64,
     pub workers: usize,
     /// Application allocation budget in MiB, not a hard RSS ceiling.
     pub memory_limit_mb: usize,
@@ -878,6 +878,24 @@ pub fn prepare_dataset_with_progress(
     inputs.extend(spec.rasters.iter().map(|r| r.path.as_path()));
     inputs.extend(spec.d8.as_deref());
     super::execution::protect_inputs(&spec.output_dir, &affected, &inputs)?;
+    let mut input_files = vec![
+        ("dem", spec.dem.as_path()),
+        ("mini_catchments", spec.mini_catchments.as_path()),
+        ("mini_segments", spec.mini_segments.as_path()),
+    ];
+    let raster_input_keys: Vec<_> = spec
+        .rasters
+        .iter()
+        .map(|raster| format!("rasters/{}", raster.name))
+        .collect();
+    input_files.extend(
+        spec.rasters
+            .iter()
+            .zip(&raster_input_keys)
+            .map(|(raster, key)| (key.as_str(), raster.path.as_path())),
+    );
+    input_files.extend(spec.d8.as_deref().map(|path| ("d8", path)));
+    let manifest_inputs = super::execution::manifest_files(&input_files)?;
     let mut cache = CacheBudget::new()?;
     fs::create_dir_all(&spec.output_dir)?;
     let indexed_minis = tempfile::tempdir_in(&spec.output_dir)?;
@@ -1294,21 +1312,45 @@ pub fn prepare_dataset_with_progress(
         )?;
     }
     let workers_used = peak.load(Ordering::Relaxed);
-    let products: Vec<_> = refs
+    let mut product_files: Vec<(String, String)> = vec![
+        ("dem".into(), "dem.tif".into()),
+        ("grid_catchments".into(), "grid_catchments.tif".into()),
+        ("grid_segments".into(), "grid_segments.tif".into()),
+    ];
+    product_files.extend(spec.rasters.iter().map(|raster| {
+        (
+            format!("rasters/{}", raster.name),
+            format!("{}.tif", raster.name),
+        )
+    }));
+    if spec.d8.is_some() {
+        product_files.push(("d8".into(), "d8.tif".into()));
+    }
+    let current: std::collections::BTreeSet<_> = product_files
         .iter()
-        .copied()
-        .filter(|&name| name != "manifest-prepare.json")
+        .map(|(_, filename)| filename.clone())
         .collect();
-    let manifest = vector::finish(
+    let remove: Vec<_> = super::execution::preparation_optional(&spec.output_dir)?
+        .into_iter()
+        .filter(|name| !current.contains(name))
+        .collect();
+    let (manifest, timings) = vector::finish(
         staging.path(),
         &spec.output_dir,
-        "prepare",
-        &spec,
-        &products,
-        workers_used,
-        reporter.elapsed_seconds(),
+        vector::ManifestSpec {
+            stage: "prepare",
+            parameters: super::execution::manifest_parameters(
+                &spec,
+                &["dem", "mini_catchments", "mini_segments", "d8"],
+            )?,
+            inputs: manifest_inputs,
+            products: product_files,
+            workers_used,
+            overwrite: spec.overwrite,
+            remove,
+        },
+        &mut reporter,
     )?;
-    let timings = reporter.finish();
     Ok(PreparationReport {
         timings,
         dem: spec.output_dir.join("dem.tif"),

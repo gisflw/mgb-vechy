@@ -1,6 +1,8 @@
 //! Narrow vector adapters shared by ROI and aggregation.
 use crate::prepro::{
-    execution::{CACHE_BYTES, MIB, publish},
+    execution::{
+        CACHE_BYTES, MIB, Reporter, StageTimings, manifest_outputs, publish_with_manifest,
+    },
     model::{RoiAttributes, SourceId},
 };
 use anyhow::{Context, Result, bail, ensure};
@@ -14,7 +16,6 @@ use gdal::{
 };
 use geographiclib_rs::{Geodesic, InverseGeodesic, PolygonArea, Winding};
 use geos::{Geom, Geometry as GeosGeometry, GeometryTypes};
-use serde::Serialize;
 use std::{
     fs::{self, File},
     path::{Path, PathBuf},
@@ -32,6 +33,16 @@ pub(crate) const ROI_FIELDS: [&str; 9] = [
     "upstream_area",
     "water_course",
 ];
+
+pub(crate) struct ManifestSpec {
+    pub stage: &'static str,
+    pub parameters: serde_json::Value,
+    pub inputs: serde_json::Value,
+    pub products: Vec<(String, String)>,
+    pub workers_used: usize,
+    pub overwrite: bool,
+    pub remove: Vec<String>,
+}
 
 pub(crate) struct Provider {
     dataset: Dataset,
@@ -573,39 +584,62 @@ pub(crate) fn output_paths(output: &Path, names: &[&str], overwrite: bool) -> Re
 pub(crate) fn finish(
     staging: &Path,
     output: &Path,
-    stage: &str,
-    parameters: &impl Serialize,
-    products: &[&str],
-    workers_used: usize,
-    elapsed_seconds: f64,
-) -> Result<PathBuf> {
-    let name = format!("manifest-{stage}.json");
-    let mut parameters = serde_json::to_value(parameters)?;
-    parameters["workers_used"] = serde_json::json!(workers_used);
-    serde_json::to_writer_pretty(
-        File::create(staging.join(&name))?,
-        &serde_json::json!({
-            "step": stage,
-            "parameters": parameters,
-            "elapsed_seconds": elapsed_seconds
-        }),
-    )?;
-    let names: Vec<_> = products
+    spec: ManifestSpec,
+    reporter: &mut Reporter<'_>,
+) -> Result<(PathBuf, StageTimings)> {
+    let name = format!("manifest-{}.json", spec.stage);
+    let names: Vec<_> = spec
+        .products
         .iter()
-        .map(|s| s.to_string())
-        .chain([name.clone()])
+        .map(|(_, filename)| filename.clone())
         .collect();
-    let overwrite = parameters["overwrite"].as_bool().unwrap_or(false);
-    let remove = if stage == "prepare" {
-        super::super::execution::preparation_optional(output)?
-            .into_iter()
-            .filter(|name| !names.contains(name))
-            .collect()
-    } else {
-        Vec::new()
-    };
-    publish(staging, output, &names, overwrite, &remove)?;
-    Ok(output.join(name))
+    let products: Vec<_> = spec
+        .products
+        .iter()
+        .map(|(key, filename)| (key.as_str(), filename.as_str()))
+        .collect();
+    let outputs = manifest_outputs(staging, output, &products)?;
+    let mut timings = None;
+    publish_with_manifest(
+        staging,
+        output,
+        &names,
+        &name,
+        spec.overwrite,
+        &spec.remove,
+        || {
+            let runtime = reporter.finish(spec.workers_used);
+            timings = Some(runtime.timings.clone());
+            let mut manifest = serde_json::Map::new();
+            manifest.insert("step".into(), serde_json::json!(spec.stage));
+            manifest.insert("inputs".into(), spec.inputs);
+            manifest.insert("outputs".into(), outputs);
+            manifest.insert("parameters".into(), spec.parameters);
+            manifest.insert(
+                "runtime".into(),
+                serde_json::json!({
+                    "ran_at": runtime.ran_at,
+                    "timezone": runtime.timezone,
+                    "elapsed_time": {
+                        "preparation": runtime.timings.preparing,
+                        "processing": runtime.timings.processing,
+                        "finalizing": runtime.timings.finalizing,
+                        "total": runtime.timings.total
+                    },
+                    "workers_used": runtime.workers_used,
+                    "peak_ram_usage_mib": runtime.peak_ram_usage_mib,
+                    "peak_cpu_usage_percent": runtime.peak_cpu_usage_percent,
+                    "cpu_time_seconds": runtime.cpu_time_seconds
+                }),
+            );
+            serde_json::to_writer_pretty(File::create(staging.join(&name))?, &manifest)?;
+            Ok(())
+        },
+    )?;
+    Ok((
+        output.join(name),
+        timings.context("Manifest publication did not capture runtime")?,
+    ))
 }
 
 pub(crate) fn absolute_input(path: &Path) -> Result<PathBuf> {

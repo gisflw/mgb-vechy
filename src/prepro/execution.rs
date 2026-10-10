@@ -1,11 +1,14 @@
 // Shared GIS cache and temporary-output helpers.
 use anyhow::{Context, Result, ensure};
 use serde::Serialize;
+use serde_json::{Map, Value};
+use sha2::{Digest, Sha256};
 use std::{
     fs,
-    path::Path,
+    io::Read,
+    path::{Path, PathBuf},
     sync::{Condvar, Mutex, MutexGuard},
-    time::Instant,
+    time::{Duration, Instant},
 };
 pub(crate) const MIB: usize = 1024 * 1024;
 pub(crate) const CACHE_BYTES: usize = 16 * MIB;
@@ -124,28 +127,63 @@ pub(crate) fn preparation_optional(output: &Path) -> Result<Vec<String>> {
         manifest["step"] == "prepare",
         "Invalid preparation manifest stage"
     );
-    let parameters = &manifest["parameters"];
     let mut names = Vec::new();
-    if !parameters["d8"].is_null() {
-        names.push("d8.tif".to_owned());
-    }
-    if let Some(rasters) = parameters["rasters"].as_array() {
-        for raster in rasters {
-            let name = raster["name"]
-                .as_str()
-                .context("Invalid preparation raster manifest")?;
-            ensure!(
-                name.as_bytes().first().is_some_and(u8::is_ascii_lowercase)
-                    && name.bytes().all(|b| b.is_ascii_lowercase()
-                        || b.is_ascii_digit()
-                        || b == b'_'
-                        || b == b'-'),
-                "Invalid preparation raster name"
-            );
-            names.push(format!("{name}.tif"));
+    if let Some(outputs) = manifest["outputs"].as_object() {
+        if let Some(record) = outputs.get("d8") {
+            validate_manifest_output(record, "d8.tif", output)?;
+            names.push("d8.tif".to_owned());
+        }
+        if let Some(rasters) = outputs.get("rasters").and_then(Value::as_object) {
+            for (name, record) in rasters {
+                validate_raster_name(name)?;
+                let filename = format!("{name}.tif");
+                validate_manifest_output(record, &filename, output)?;
+                names.push(filename);
+            }
+        }
+    } else {
+        let parameters = &manifest["parameters"];
+        if !parameters["d8"].is_null() {
+            names.push("d8.tif".to_owned());
+        }
+        if let Some(rasters) = parameters["rasters"].as_array() {
+            for raster in rasters {
+                let name = raster["name"]
+                    .as_str()
+                    .context("Invalid preparation raster manifest")?;
+                validate_raster_name(name)?;
+                names.push(format!("{name}.tif"));
+            }
         }
     }
     Ok(names)
+}
+
+fn validate_raster_name(name: &str) -> Result<()> {
+    ensure!(
+        name.as_bytes().first().is_some_and(u8::is_ascii_lowercase)
+            && name.bytes().all(|b| {
+                b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-'
+            }),
+        "Invalid preparation raster name"
+    );
+    Ok(())
+}
+
+fn validate_manifest_output(record: &Value, filename: &str, output: &Path) -> Result<()> {
+    let path = Path::new(
+        record["path"]
+            .as_str()
+            .context("Invalid preparation output manifest path")?,
+    );
+    ensure!(
+        path.is_absolute()
+            && path.file_name().and_then(|name| name.to_str()) == Some(filename)
+            && path.parent() == Some(output),
+        "Invalid preparation output filename: {}",
+        path.display()
+    );
+    Ok(())
 }
 
 pub(crate) fn protect_inputs(output: &Path, names: &[String], inputs: &[&Path]) -> Result<()> {
@@ -173,9 +211,46 @@ pub(crate) fn publish(
     overwrite: bool,
     remove: &[String],
 ) -> Result<()> {
+    publish_transaction(staging, output, names, None, overwrite, remove, || Ok(()))
+}
+
+pub(crate) fn publish_with_manifest(
+    staging: &Path,
+    output: &Path,
+    products: &[String],
+    manifest: &str,
+    overwrite: bool,
+    remove: &[String],
+    write_manifest: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    publish_transaction(
+        staging,
+        output,
+        products,
+        Some(manifest),
+        overwrite,
+        remove,
+        write_manifest,
+    )
+}
+
+fn publish_transaction(
+    staging: &Path,
+    output: &Path,
+    products: &[String],
+    manifest: Option<&str>,
+    overwrite: bool,
+    remove: &[String],
+    write_manifest: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    let names: Vec<_> = products
+        .iter()
+        .cloned()
+        .chain(manifest.map(str::to_owned))
+        .collect();
     let affected: Vec<_> = names.iter().chain(remove).cloned().collect();
     check_outputs(output, &affected, overwrite)?;
-    for name in names {
+    for name in products {
         ensure!(
             staging.join(name).is_file(),
             "Missing staged output: {name}"
@@ -194,9 +269,16 @@ pub(crate) fn publish(
                 }
             }
         }
-        for name in names {
+        for name in products {
             let target = output.join(name);
             fs::hard_link(staging.join(name), &target)
+                .with_context(|| format!("Publish {}", target.display()))?;
+            published.push(target);
+        }
+        if let Some(manifest) = manifest {
+            write_manifest()?;
+            let target = output.join(manifest);
+            fs::hard_link(staging.join(manifest), &target)
                 .with_context(|| format!("Publish {}", target.display()))?;
             published.push(target);
         }
@@ -227,6 +309,180 @@ pub(crate) fn publish(
     Ok(())
 }
 
+pub(crate) fn manifest_files(entries: &[(&str, &Path)]) -> Result<Value> {
+    let mut files = Map::new();
+    for (key, path) in entries {
+        let path = std::path::absolute(path)?;
+        insert_file(
+            &mut files,
+            key,
+            serde_json::json!({
+                "path": path.to_string_lossy(),
+                "sha256": checksum_path(&path)?
+            }),
+        )?;
+    }
+    Ok(Value::Object(files))
+}
+
+pub(crate) fn manifest_outputs(
+    staging: &Path,
+    output: &Path,
+    entries: &[(&str, &str)],
+) -> Result<Value> {
+    let mut files = Map::new();
+    for (key, filename) in entries {
+        let staged = staging.join(filename);
+        let path = output.join(filename);
+        insert_file(
+            &mut files,
+            key,
+            serde_json::json!({
+                "path": std::path::absolute(&path)?.to_string_lossy(),
+                "sha256": checksum_path(&staged)?
+            }),
+        )?;
+    }
+    Ok(Value::Object(files))
+}
+
+fn insert_file(map: &mut Map<String, Value>, key: &str, value: Value) -> Result<()> {
+    if let Some((parent, leaf)) = key.rsplit_once('/') {
+        ensure!(
+            !parent.is_empty() && !leaf.is_empty(),
+            "Invalid manifest file key"
+        );
+        let entry = map
+            .entry(parent.to_owned())
+            .or_insert_with(|| Value::Object(Map::new()));
+        return insert_file(
+            entry
+                .as_object_mut()
+                .context("Conflicting manifest file keys")?,
+            leaf,
+            value,
+        );
+    }
+    ensure!(!key.is_empty(), "Empty manifest file key");
+    ensure!(!map.contains_key(key), "Duplicate manifest file key: {key}");
+    map.insert(key.to_owned(), value);
+    Ok(())
+}
+
+pub(crate) fn manifest_parameters<T: Serialize>(spec: &T, paths: &[&str]) -> Result<Value> {
+    let mut parameters = serde_json::to_value(spec)?;
+    let object = std::mem::take(
+        parameters
+            .as_object_mut()
+            .context("Stage parameters must serialize as an object")?,
+    );
+    let removed: std::collections::BTreeSet<_> = paths
+        .iter()
+        .copied()
+        .chain(["output_dir", "overwrite"])
+        .collect();
+    let mut ordered = Map::new();
+    for (key, mut value) in object {
+        if removed.contains(key.as_str()) {
+            continue;
+        }
+        if key == "rasters"
+            && let Some(rasters) = value.as_array_mut()
+        {
+            for raster in rasters {
+                if let Some(fields) = raster.as_object_mut() {
+                    *fields = std::mem::take(fields)
+                        .into_iter()
+                        .filter(|(field, _)| field != "path")
+                        .collect();
+                }
+            }
+        }
+        ordered.insert(key, value);
+    }
+    parameters = Value::Object(ordered);
+    Ok(parameters)
+}
+
+fn checksum_path(path: &Path) -> Result<String> {
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() {
+        anyhow::bail!("Cannot checksum a symlink: {}", path.display());
+    }
+    if metadata.is_file() {
+        return checksum_file(path).map(|digest| hex_digest(&digest));
+    }
+    ensure!(
+        metadata.is_dir(),
+        "Unsupported input type: {}",
+        path.display()
+    );
+    let mut files = Vec::new();
+    collect_directory_files(path, path, &mut files)?;
+    files.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut hash = Sha256::new();
+    for (relative, file) in files {
+        let bytes = relative.as_bytes();
+        hash.update((bytes.len() as u64).to_be_bytes());
+        hash.update(bytes);
+        hash.update(checksum_file(&file)?);
+    }
+    Ok(hex_digest(&hash.finalize()))
+}
+
+fn hex_digest(digest: &[u8]) -> String {
+    use std::fmt::Write;
+    let mut hex = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        let _ = write!(hex, "{byte:02x}");
+    }
+    hex
+}
+
+fn collect_directory_files(
+    root: &Path,
+    current: &Path,
+    files: &mut Vec<(String, PathBuf)>,
+) -> Result<()> {
+    for entry in fs::read_dir(current)? {
+        let entry = entry?;
+        let path = entry.path();
+        let file_type = entry.file_type()?;
+        if file_type.is_symlink() {
+            anyhow::bail!(
+                "Cannot checksum a directory containing a symlink: {}",
+                path.display()
+            );
+        } else if file_type.is_dir() {
+            collect_directory_files(root, &path, files)?;
+        } else if file_type.is_file() {
+            let relative = path
+                .strip_prefix(root)?
+                .to_str()
+                .context("Directory input has a non-UTF-8 filename")?
+                .replace('\\', "/");
+            files.push((relative, path));
+        } else {
+            anyhow::bail!("Unsupported directory entry: {}", path.display());
+        }
+    }
+    Ok(())
+}
+
+fn checksum_file(path: &Path) -> Result<[u8; 32]> {
+    let mut file = fs::File::open(path)?;
+    let mut hash = Sha256::new();
+    let mut buffer = [0; 1024 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hash.update(&buffer[..read]);
+    }
+    Ok(hash.finalize().into())
+}
+
 /// A coordinator progress update. Totals are absent during open-ended scans.
 #[derive(Clone, Debug)]
 pub struct StageProgress {
@@ -249,6 +505,138 @@ pub struct StageTimings {
     pub total: f64,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct RuntimeSnapshot {
+    pub ran_at: String,
+    pub timezone: String,
+    pub timings: StageTimings,
+    pub workers_used: usize,
+    pub peak_ram_usage_mib: Option<f64>,
+    pub peak_cpu_usage_percent: Option<f64>,
+    pub cpu_time_seconds: Option<f64>,
+}
+
+#[derive(Default)]
+struct ResourceMetrics {
+    peak_ram_bytes: Option<u64>,
+    peak_cpu_percent: Option<f32>,
+    latest_cpu_ms: Option<u64>,
+}
+
+struct ResourceMonitor {
+    metrics: std::sync::Arc<Mutex<ResourceMetrics>>,
+    start_cpu_ms: Option<u64>,
+    stop: Option<std::sync::mpsc::Sender<()>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl ResourceMonitor {
+    fn new() -> Self {
+        use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
+        let pid = Pid::from_u32(std::process::id());
+        let mut system = System::new();
+        system.refresh_processes_specifics(
+            ProcessesToUpdate::Some(&[pid]),
+            true,
+            ProcessRefreshKind::nothing().with_cpu().with_memory(),
+        );
+        let start_cpu_ms = system
+            .process(pid)
+            .map(|process| process.accumulated_cpu_time());
+        let mut initial = ResourceMetrics::default();
+        if let Some(process) = system.process(pid) {
+            initial.peak_ram_bytes = Some(process.memory());
+            initial.latest_cpu_ms = Some(process.accumulated_cpu_time());
+        }
+        let metrics = std::sync::Arc::new(Mutex::new(initial));
+        let (stop, receiver) = std::sync::mpsc::channel();
+        let shared = metrics.clone();
+        let thread = std::thread::Builder::new()
+            .name("mgb-resource-monitor".into())
+            .spawn(move || {
+                let mut samples = 1;
+                let mut sampled = Instant::now();
+                loop {
+                    let stopping = receiver.recv_timeout(Duration::from_millis(250)).is_ok();
+                    let cpu_due = !stopping || sampled.elapsed() >= Duration::from_millis(200);
+                    system.refresh_processes_specifics(
+                        ProcessesToUpdate::Some(&[pid]),
+                        true,
+                        ProcessRefreshKind::nothing().with_cpu().with_memory(),
+                    );
+                    if let Some(process) = system.process(pid)
+                        && let Ok(mut metrics) = shared.lock()
+                    {
+                        metrics.peak_ram_bytes = Some(
+                            metrics
+                                .peak_ram_bytes
+                                .unwrap_or_default()
+                                .max(process.memory()),
+                        );
+                        metrics.latest_cpu_ms = Some(process.accumulated_cpu_time());
+                        if cpu_due {
+                            samples += 1;
+                            if samples >= 2 {
+                                metrics.peak_cpu_percent = Some(
+                                    metrics
+                                        .peak_cpu_percent
+                                        .unwrap_or_default()
+                                        .max(process.cpu_usage()),
+                                );
+                            }
+                        }
+                    }
+                    if stopping {
+                        break;
+                    }
+                    sampled = Instant::now();
+                }
+            })
+            .ok();
+        Self {
+            metrics,
+            start_cpu_ms,
+            stop: thread.as_ref().map(|_| stop),
+            thread,
+        }
+    }
+
+    fn finish(&mut self) -> (Option<f64>, Option<f64>, Option<f64>) {
+        let Some(thread) = self.thread.take() else {
+            return (None, None, None);
+        };
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
+        if thread.join().is_err() {
+            return (None, None, None);
+        }
+        let Ok(metrics) = self.metrics.lock() else {
+            return (None, None, None);
+        };
+        (
+            metrics
+                .peak_ram_bytes
+                .map(|bytes| bytes as f64 / (1024. * 1024.)),
+            metrics.peak_cpu_percent.map(f64::from),
+            self.start_cpu_ms
+                .zip(metrics.latest_cpu_ms)
+                .map(|(start, end)| end.saturating_sub(start) as f64 / 1000.),
+        )
+    }
+}
+
+impl Drop for ResourceMonitor {
+    fn drop(&mut self) {
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
 pub(crate) struct Reporter<'a> {
     callback: ProgressCallback<'a>,
     started: Instant,
@@ -256,11 +644,16 @@ pub(crate) struct Reporter<'a> {
     phase: &'static str,
     operation: &'static str,
     timings: StageTimings,
+    ran_at: String,
+    timezone: String,
+    resources: ResourceMonitor,
+    finished: bool,
 }
 
 impl<'a> Reporter<'a> {
     pub fn new(callback: ProgressCallback<'a>) -> Self {
         let now = Instant::now();
+        let date_time = chrono::Local::now();
         let reporter = Self {
             callback,
             started: now,
@@ -268,6 +661,10 @@ impl<'a> Reporter<'a> {
             phase: "preparing",
             operation: "Preparing inputs",
             timings: StageTimings::default(),
+            ran_at: date_time.format("%Y-%m-%d %H:%M").to_string(),
+            timezone: date_time.format("%:z").to_string(),
+            resources: ResourceMonitor::new(),
+            finished: false,
         };
         reporter.advance(0, None);
         reporter
@@ -308,13 +705,22 @@ impl<'a> Reporter<'a> {
         }
         self.boundary = Instant::now();
     }
-    pub fn finish(mut self) -> StageTimings {
-        self.record();
-        self.timings.total = self.started.elapsed().as_secs_f64();
-        self.timings
-    }
-    pub fn elapsed_seconds(&self) -> f64 {
-        self.started.elapsed().as_secs_f64()
+    pub fn finish(&mut self, workers_used: usize) -> RuntimeSnapshot {
+        let (ram, cpu, cpu_time) = self.resources.finish();
+        if !self.finished {
+            self.record();
+            self.timings.total = self.started.elapsed().as_secs_f64();
+            self.finished = true;
+        }
+        RuntimeSnapshot {
+            ran_at: self.ran_at.clone(),
+            timezone: self.timezone.clone(),
+            timings: self.timings.clone(),
+            workers_used,
+            peak_ram_usage_mib: ram,
+            peak_cpu_usage_percent: cpu,
+            cpu_time_seconds: cpu_time,
+        }
     }
 }
 
@@ -477,6 +883,108 @@ mod tests {
             "previous"
         );
         assert_eq!(fs::read_dir(output.path())?.count(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn manifest_failure_restores_products_manifest_and_stale_outputs() -> Result<()> {
+        let staging = tempfile::tempdir()?;
+        let output = tempfile::tempdir()?;
+        fs::write(staging.path().join("product.csv"), "new product")?;
+        fs::write(output.path().join("product.csv"), "old product")?;
+        fs::write(output.path().join("manifest-stage.json"), "old manifest")?;
+        fs::write(output.path().join("stale.csv"), "old optional")?;
+
+        let result = publish_with_manifest(
+            staging.path(),
+            output.path(),
+            &["product.csv".into()],
+            "manifest-stage.json",
+            true,
+            &["stale.csv".into()],
+            || {
+                fs::write(staging.path().join("manifest-stage.json"), "partial")?;
+                anyhow::bail!("manifest serialization failed")
+            },
+        );
+
+        assert!(result.is_err());
+        assert_eq!(
+            fs::read_to_string(output.path().join("product.csv"))?,
+            "old product"
+        );
+        assert_eq!(
+            fs::read_to_string(output.path().join("manifest-stage.json"))?,
+            "old manifest"
+        );
+        assert_eq!(
+            fs::read_to_string(output.path().join("stale.csv"))?,
+            "old optional"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn directory_checksums_ignore_creation_order_and_include_names() -> Result<()> {
+        let first = tempfile::tempdir()?;
+        let second = tempfile::tempdir()?;
+        fs::create_dir_all(first.path().join("nested"))?;
+        fs::write(first.path().join("z.txt"), "two")?;
+        fs::write(first.path().join("nested/a.txt"), "one")?;
+        fs::create_dir_all(second.path().join("nested"))?;
+        fs::write(second.path().join("nested/a.txt"), "one")?;
+        fs::write(second.path().join("z.txt"), "two")?;
+
+        assert_eq!(checksum_path(first.path())?, checksum_path(second.path())?);
+        fs::rename(
+            second.path().join("z.txt"),
+            second.path().join("renamed.txt"),
+        )?;
+        assert_ne!(checksum_path(first.path())?, checksum_path(second.path())?);
+        Ok(())
+    }
+
+    #[test]
+    fn resource_monitor_finishes_and_drop_stops_sampling() {
+        let started = Instant::now();
+        let mut monitor = ResourceMonitor::new();
+        std::thread::sleep(Duration::from_millis(275));
+        let (ram, cpu, cpu_time) = monitor.finish();
+        assert!(started.elapsed() < Duration::from_secs(2));
+        for value in [ram, cpu, cpu_time].into_iter().flatten() {
+            assert!(value.is_finite() && value >= 0.);
+        }
+        let started = Instant::now();
+        drop(ResourceMonitor::new());
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn preparation_optional_validates_new_manifest_filenames() -> Result<()> {
+        let output = tempfile::tempdir()?;
+        fs::write(
+            output.path().join("manifest-prepare.json"),
+            serde_json::json!({
+                "step": "prepare",
+                "outputs": {
+                    "d8": {"path": output.path().join("elsewhere/d8.tif"), "sha256": ""},
+                    "rasters": {}
+                }
+            })
+            .to_string(),
+        )?;
+        assert!(preparation_optional(output.path()).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn preparation_optional_reads_legacy_manifest_parameters() -> Result<()> {
+        let output = tempfile::tempdir()?;
+        fs::write(
+            output.path().join("manifest-prepare.json"),
+            r#"{"step":"prepare","parameters":{"d8":"old-path.tif","rasters":[{"name":"hru","path":"old-hru.tif"}]}}"#,
+        )?;
+        assert_eq!(preparation_optional(output.path())?, ["d8.tif", "hru.tif"]);
         Ok(())
     }
 

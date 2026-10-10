@@ -52,7 +52,7 @@ HRU percentages use valid HRU cells as their denominator and sum to 100%.
 | --- | --- |
 | `sampled_minis.csv` | One row per mini, without geometry. |
 | `nodata_<raster>.csv` | Missing-cell report for each affected input raster. |
-| `manifest-sample-minis.json` | Input paths and processing parameters. |
+| `manifest-sample-minis.json` | Checksummed inputs and outputs, parameters, and runtime. |
 
 The sampled CSV has these ordered column groups:
 

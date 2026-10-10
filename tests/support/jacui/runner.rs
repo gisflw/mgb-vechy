@@ -297,7 +297,7 @@ pub fn run(root: &Path, options: &RunOptions) -> Result<Value> {
             .and_then(|file| serde_json::from_reader::<_, Value>(file).ok());
         let workers_used = manifest
             .as_ref()
-            .and_then(|m| m["parameters"]["workers_used"].as_u64());
+            .and_then(|m| m["runtime"]["workers_used"].as_u64());
         let measurement = json!({"stage": stage.name(), "wall_seconds": wall_seconds, "workers_used": workers_used,
             "max_process_rss_kib": usage.max_process_rss_kib, "cpu_seconds": usage.cpu_seconds,
             "read_bytes": usage.read_bytes, "write_bytes": usage.write_bytes,

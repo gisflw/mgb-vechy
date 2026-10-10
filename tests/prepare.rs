@@ -191,12 +191,23 @@ fn scaling_only_dem_types_masks_units_index_and_manifest() -> Result<()> {
     assert_eq!(index, serde_json::json!([[1, 0., 0., 2., 2.]]));
     let manifest: Value = serde_json::from_slice(&fs::read(&report.manifest)?)?;
     assert_eq!(manifest["step"], "prepare");
-    assert_eq!(manifest["parameters"]["workers_used"], 1);
-    assert!(manifest["elapsed_seconds"].as_f64().unwrap().is_finite());
+    assert_eq!(manifest["runtime"]["workers_used"], 1);
+    assert!(
+        manifest["runtime"]["elapsed_time"]["total"]
+            .as_f64()
+            .unwrap()
+            .is_finite()
+    );
     assert_eq!(
-        manifest["parameters"]["dem"],
+        manifest["inputs"]["dem"]["path"],
         fs::canonicalize(&spec.dem)?.to_str().unwrap()
     );
+    assert_eq!(
+        manifest["outputs"]["dem"]["sha256"].as_str().unwrap().len(),
+        64
+    );
+    assert!(manifest["outputs"]["rasters"].is_object());
+    assert!(manifest["parameters"].get("dem").is_none());
     assert_eq!(fs::read_dir(&spec.output_dir)?.count(), 7);
     Ok(())
 }

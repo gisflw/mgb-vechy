@@ -256,21 +256,52 @@ fn sampling_values_order_and_worker_determinism() -> Result<()> {
     fixture.spec.workers = 2;
     let parallel = sample_minibasins(&fixture.spec)?;
     assert_eq!(parallel.workers_used, 2);
-    assert_eq!(bytes, fs::read(parallel.sampled_minis)?);
+    assert_eq!(bytes, fs::read(&parallel.sampled_minis)?);
     let manifest: Value = serde_json::from_reader(fs::File::open(parallel.manifest)?)?;
     assert_eq!(manifest["step"], "sample-minis");
-    assert_eq!(
-        manifest["parameters"]["workers_used"],
-        parallel.workers_used
+    assert_eq!(manifest["runtime"]["workers_used"], parallel.workers_used);
+    assert!(
+        manifest["runtime"]["elapsed_time"]["total"]
+            .as_f64()
+            .unwrap()
+            .is_finite()
     );
-    assert!(manifest["elapsed_seconds"].as_f64().unwrap().is_finite());
     assert!(
         !manifest["parameters"]
             .as_object()
             .unwrap()
             .contains_key("batch_size")
     );
-    assert!(Path::new(manifest["parameters"]["dem"].as_str().unwrap()).is_absolute());
+    assert!(Path::new(manifest["inputs"]["dem"]["path"].as_str().unwrap()).is_absolute());
+    assert!(manifest["parameters"].get("dem").is_none());
+    assert!(manifest["parameters"].get("overwrite").is_none());
+    assert_eq!(
+        manifest["outputs"]["sampled_minis"]["sha256"]
+            .as_str()
+            .unwrap()
+            .len(),
+        64
+    );
+    use sha2::Digest;
+    let expected_hash = format!(
+        "{:x}",
+        sha2::Sha256::digest(fs::read(&parallel.sampled_minis)?)
+    );
+    assert_eq!(
+        manifest["outputs"]["sampled_minis"]["sha256"],
+        expected_hash
+    );
+    assert_eq!(manifest["runtime"]["ran_at"].as_str().unwrap().len(), 16);
+    assert_eq!(manifest["runtime"]["timezone"].as_str().unwrap().len(), 6);
+    for field in [
+        "peak_ram_usage_mib",
+        "peak_cpu_usage_percent",
+        "cpu_time_seconds",
+    ] {
+        if let Some(value) = manifest["runtime"][field].as_f64() {
+            assert!(value.is_finite() && value >= 0.);
+        }
+    }
     Ok(())
 }
 

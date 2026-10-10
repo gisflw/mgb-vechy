@@ -96,6 +96,10 @@ pub fn define_roi_dataset_with_progress(
         ],
         &[&spec.catchments, &spec.segments],
     )?;
+    let manifest_inputs = super::execution::manifest_files(&[
+        ("catchments", &spec.catchments),
+        ("segments", &spec.segments),
+    ])?;
     let _cache = CacheBudget::new()?;
     let segments = Provider::open(
         &spec.segments,
@@ -401,16 +405,23 @@ pub fn define_roi_dataset_with_progress(
             }),
         )?;
     }
-    let manifest = vector::finish(
+    let (manifest, timings) = vector::finish(
         staging.path(),
         &spec.output_dir,
-        "define-roi",
-        &spec,
-        &["roi_catchments.fgb", "roi_segments.fgb"],
-        workers,
-        reporter.elapsed_seconds(),
+        vector::ManifestSpec {
+            stage: "define-roi",
+            parameters: super::execution::manifest_parameters(&spec, &["catchments", "segments"])?,
+            inputs: manifest_inputs,
+            products: vec![
+                ("catchments".into(), "roi_catchments.fgb".into()),
+                ("segments".into(), "roi_segments.fgb".into()),
+            ],
+            workers_used: workers,
+            overwrite: spec.overwrite,
+            remove: vec![],
+        },
+        &mut reporter,
     )?;
-    let timings = reporter.finish();
     Ok(RoiReport {
         timings,
         catchments: spec.output_dir.join("roi_catchments.fgb"),

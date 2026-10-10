@@ -105,7 +105,11 @@ pub fn compare_products(
                 .with_context(|| format!("Audit manifest missing: {}", path.display()))?,
         )?;
         ensure!(
-            manifest["step"] == step.name() && manifest["parameters"].is_object(),
+            manifest["step"] == step.name()
+                && manifest["inputs"].is_object()
+                && manifest["outputs"].is_object()
+                && manifest["parameters"].is_object()
+                && manifest["runtime"].is_object(),
             "Invalid audit envelope: {}",
             path.display()
         );

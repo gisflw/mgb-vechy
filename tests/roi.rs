@@ -38,8 +38,62 @@ fn ordered_outlets_and_worker_determinism() -> Result<()> {
     );
     let manifest: serde_json::Value = serde_json::from_reader(std::fs::File::open(&roi.manifest)?)?;
     assert_eq!(manifest["step"], "define-roi");
-    assert!(manifest["elapsed_seconds"].as_f64().unwrap().is_finite());
-    assert!(Path::new(manifest["parameters"]["catchments"].as_str().unwrap()).is_absolute());
+    assert_eq!(
+        manifest
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        ["step", "inputs", "outputs", "parameters", "runtime"]
+    );
+    assert!(
+        manifest["runtime"]["elapsed_time"]["total"]
+            .as_f64()
+            .unwrap()
+            .is_finite()
+    );
+    assert!(Path::new(manifest["inputs"]["catchments"]["path"].as_str().unwrap()).is_absolute());
+    assert_eq!(
+        manifest["inputs"]["catchments"]["sha256"]
+            .as_str()
+            .unwrap()
+            .len(),
+        64
+    );
+    assert!(manifest["parameters"].get("catchments").is_none());
+    assert!(manifest["parameters"].get("overwrite").is_none());
+    assert!(manifest["parameters"].get("output_dir").is_none());
+    assert_eq!(
+        manifest["parameters"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        [
+            "crs",
+            "outlet_ids",
+            "id_col",
+            "id_down_col",
+            "strahler_order_col",
+            "catchments_layer",
+            "segments_layer",
+            "catchments_source_crs",
+            "segments_source_crs",
+            "workers",
+            "memory_limit_mb",
+            "io_slots",
+            "batch_size"
+        ]
+    );
+    assert_eq!(
+        manifest["outputs"]["catchments"]["sha256"]
+            .as_str()
+            .unwrap()
+            .len(),
+        64
+    );
     spec.output_dir = temp.path().join("serial-roi");
     spec.memory_limit_mb = 32;
     let serial = define_roi_dataset(&spec)?;

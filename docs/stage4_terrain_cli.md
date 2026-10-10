@@ -119,7 +119,7 @@ connected to matching drainage. Output masks retain the resulting validity.
 | `ltnd.tif` | Canonical-grid `float32` LTND, with `units=m` and `distance_method=geodesic`. |
 | `undrained_cells.csv` | Counts and percentages for affected minis. |
 | `flow_direction.tif` | Optional canonical-grid `uint8` selected directions: drainage 0, directions 1–8. |
-| `manifest-terrain-products.json` | Input paths and processing parameters. |
+| `manifest-terrain-products.json` | Checksummed inputs and outputs, parameters, and runtime. |
 
 Rasters are internally masked COGs. Dataset metadata includes `role`,
 `routing_source`, and `ownership`, whose value is

@@ -153,6 +153,16 @@ pub fn sample_minibasins_with_progress(
     check_collisions(&spec.output_dir, spec.overwrite)?;
     let input_refs: Vec<_> = inputs.iter().map(PathBuf::as_path).collect();
     super::execution::protect_inputs(&spec.output_dir, &sampling_names(), &input_refs)?;
+    let manifest_inputs = super::execution::manifest_files(&[
+        ("mini_catchments", &spec.mini_catchments),
+        ("mini_segments", &spec.mini_segments),
+        ("dem", &spec.dem),
+        ("grid_catchments", &spec.grid_catchments),
+        ("grid_segments", &spec.grid_segments),
+        ("hand", &spec.hand),
+        ("ltnd", &spec.ltnd),
+        ("hru", &spec.hru),
+    ])?;
     let staging = tempfile::tempdir_in(&spec.output_dir)?;
     let cache_bytes = (budget / 4).clamp(CACHE_BYTES, 8 * 1024 * MIB);
     let _cache = CacheBudget::with_limit(cache_bytes)?;
@@ -227,39 +237,55 @@ pub fn sample_minibasins_with_progress(
             spec.output_dir.display()
         );
     }
-    let mut parameters = serde_json::to_value(&spec)?;
-    parameters["workers_used"] = serde_json::json!(workers_used);
-    serde_json::to_writer_pretty(
-        File::create(staging.path().join("manifest-sample-minis.json"))?,
-        &serde_json::json!({
-            "step": "sample-minis",
-            "parameters": parameters,
-            "elapsed_seconds": reporter.elapsed_seconds()
-        }),
-    )?;
     let nodata_reports = files
         .iter()
         .map(|name| spec.output_dir.join(name))
         .collect();
-    files.extend([
-        "sampled_minis.csv".into(),
-        "manifest-sample-minis.json".into(),
-    ]);
-    publish(
+    let mut product_files = vec![("sampled_minis".to_owned(), "sampled_minis.csv".to_owned())];
+    product_files.extend(files.iter().map(|name| {
+        (
+            format!(
+                "diagnostics/{}",
+                name.trim_start_matches("nodata_").trim_end_matches(".csv")
+            ),
+            name.clone(),
+        )
+    }));
+    files.push("sampled_minis.csv".into());
+    let remove: Vec<_> = sampling_names()
+        .into_iter()
+        .filter(|name| name != "manifest-sample-minis.json" && !files.contains(name))
+        .collect();
+    let (manifest, timings) = super::io::vector::finish(
         staging.path(),
         &spec.output_dir,
-        &files,
-        spec.overwrite,
-        &sampling_names()
-            .into_iter()
-            .filter(|name| !files.contains(name))
-            .collect::<Vec<_>>(),
+        super::io::vector::ManifestSpec {
+            stage: "sample-minis",
+            parameters: super::execution::manifest_parameters(
+                &spec,
+                &[
+                    "mini_catchments",
+                    "mini_segments",
+                    "dem",
+                    "grid_catchments",
+                    "grid_segments",
+                    "hand",
+                    "ltnd",
+                    "hru",
+                ],
+            )?,
+            inputs: manifest_inputs,
+            products: product_files,
+            workers_used,
+            overwrite: spec.overwrite,
+            remove,
+        },
+        &mut reporter,
     )?;
-    let timings = reporter.finish();
     Ok(SamplingReport {
         timings,
         sampled_minis: spec.output_dir.join("sampled_minis.csv"),
-        manifest: spec.output_dir.join("manifest-sample-minis.json"),
+        manifest,
         nodata_reports,
         mini_count: minis.len(),
         workers_used,

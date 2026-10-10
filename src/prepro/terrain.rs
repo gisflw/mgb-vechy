@@ -1,6 +1,6 @@
 //! Confined mini-basin routing and raw-DEM HAND/geodesic LTND products.
 use super::{
-    execution::{CacheBudget, MIB, cache_allocation, publish},
+    execution::{CacheBudget, MIB, cache_allocation},
     io::{self, attach_mask, read, staging_raster, windows},
     model::{Grid, Window},
 };
@@ -11,7 +11,7 @@ use serde::Serialize;
 use std::{
     cmp::{Ordering, Reverse},
     collections::{BTreeMap, BinaryHeap, HashMap},
-    fs::{self, File},
+    fs,
     path::{Path, PathBuf},
     sync::{Condvar, Mutex, mpsc},
     thread,
@@ -1173,6 +1173,13 @@ pub fn create_terrain_dataset_with_progress(
     ];
     inputs.extend(spec.d8.as_deref());
     super::execution::protect_inputs(&spec.output_dir, &output_names(true), &inputs)?;
+    let mut input_files = vec![
+        ("dem", spec.dem.as_path()),
+        ("grid_catchments", spec.grid_catchments.as_path()),
+        ("grid_segments", spec.grid_segments.as_path()),
+    ];
+    input_files.extend(spec.d8.as_deref().map(|path| ("d8", path)));
+    let manifest_inputs = super::execution::manifest_files(&input_files)?;
     let staging = tempfile::tempdir_in(&spec.output_dir)?;
     let mut hand = output_raster::<f32>(
         staging.path(),
@@ -1403,28 +1410,38 @@ pub fn create_terrain_dataset_with_progress(
             )?;
         }
     }
-    let mut parameters = serde_json::to_value(&spec)?;
-    parameters["workers_used"] = serde_json::json!(workers_used);
-    serde_json::to_writer_pretty(
-        File::create(staging.path().join("manifest-terrain-products.json"))?,
-        &serde_json::json!({
-            "step": "terrain-products",
-            "parameters": parameters,
-            "elapsed_seconds": reporter.elapsed_seconds()
-        }),
-    )?;
-    publish(
+    let mut product_files = vec![
+        ("hand", "hand.tif"),
+        ("ltnd", "ltnd.tif"),
+        ("undrained_cells", "undrained_cells.csv"),
+    ];
+    if spec.write_flow_direction {
+        product_files.push(("flow_direction", "flow_direction.tif"));
+    }
+    let (manifest, timings) = super::io::vector::finish(
         staging.path(),
         &spec.output_dir,
-        &output_names(spec.write_flow_direction),
-        spec.overwrite,
-        &if spec.write_flow_direction {
-            vec![]
-        } else {
-            vec!["flow_direction.tif".into()]
+        super::io::vector::ManifestSpec {
+            stage: "terrain-products",
+            parameters: super::execution::manifest_parameters(
+                &spec,
+                &["dem", "grid_catchments", "grid_segments", "d8"],
+            )?,
+            inputs: manifest_inputs,
+            products: product_files
+                .iter()
+                .map(|(key, filename)| ((*key).to_owned(), (*filename).to_owned()))
+                .collect(),
+            workers_used,
+            overwrite: spec.overwrite,
+            remove: if spec.write_flow_direction {
+                vec![]
+            } else {
+                vec!["flow_direction.tif".into()]
+            },
         },
+        &mut reporter,
     )?;
-    let timings = reporter.finish();
     Ok(TerrainReport {
         timings,
         hand: spec.output_dir.join("hand.tif"),
@@ -1433,7 +1450,7 @@ pub fn create_terrain_dataset_with_progress(
             .write_flow_direction
             .then(|| spec.output_dir.join("flow_direction.tif")),
         undrained_cells: spec.output_dir.join("undrained_cells.csv"),
-        manifest: spec.output_dir.join("manifest-terrain-products.json"),
+        manifest,
         mini_count: minis.len(),
         workers_used,
         undrained_count: reports.iter().map(|r| r.1).sum(),

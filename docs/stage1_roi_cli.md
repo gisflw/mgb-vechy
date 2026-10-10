@@ -50,7 +50,7 @@ case-insensitive match. Identifiers are interpreted in the source ID type.
 | --- | --- |
 | `roi_catchments.fgb` | Spatially indexed normalized catchment polygons. |
 | `roi_segments.fgb` | Spatially indexed normalized network lines. |
-| `manifest-define-roi.json` | Input paths and processing parameters. |
+| `manifest-define-roi.json` | Checksummed inputs and outputs, parameters, and runtime. |
 
 Both vector files use this ordered schema:
 

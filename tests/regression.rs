@@ -511,7 +511,14 @@ fn compare_requires_product_set_and_audit_envelope() {
     );
     fs::write(
         actual.join("manifest-sample-minis.json"),
-        json!({"step":"sample-minis","parameters":{}}).to_string(),
+        json!({
+            "step":"sample-minis",
+            "inputs":{},
+            "outputs":{},
+            "parameters":{},
+            "runtime":{}
+        })
+        .to_string(),
     )
     .unwrap();
     jacui::compare::compare(temp.path(), Network::Bhae, Stage::SampleMinis, &actual).unwrap();
@@ -522,7 +529,14 @@ fn compare_requires_product_set_and_audit_envelope() {
     fs::remove_file(actual.join("unexpected.csv")).unwrap();
     fs::write(
         actual.join("manifest-sample-minis.json"),
-        json!({"step":"wrong","parameters":{}}).to_string(),
+        json!({
+            "step":"wrong",
+            "inputs":{},
+            "outputs":{},
+            "parameters":{},
+            "runtime":{}
+        })
+        .to_string(),
     )
     .unwrap();
     assert!(
