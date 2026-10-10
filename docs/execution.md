@@ -26,6 +26,14 @@ memory fails with an estimated requirement. Configured GIS cache reservations
 and bounded application buffers are included; GDAL/GEOS allocations and
 operating-system overhead lie outside this estimate.
 
+Preparation and terrain inspect inputs with a 16 MiB GDAL block cache, then
+target one quarter of the memory budget, bounded to 16 MiB–8 GiB. The cache is
+further capped to leave coordinator buffers and one complete work item: a
+preparation window with collision workspace, or the largest terrain mini.
+Insufficient budgets fail before processing. The selected cache is deducted
+before worker admission; the original process-wide GDAL setting is restored on
+exit, including failures. Temporary rasters remain disk-backed.
+
 Existing library entry points retain their names. Progress-enabled variants add
 `_with_progress` and accept a shared `ProgressCallback`, for example:
 

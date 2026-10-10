@@ -8,7 +8,8 @@ use gdal::{
     Dataset, DriverManager,
     spatial_ref::{AxisMappingStrategy, CoordTransform, SpatialRef},
     vector::{
-        Feature, FieldDefn, FieldValue, Geometry, Layer, LayerAccess, LayerOptions, OGRFieldType,
+        Feature, FieldDefn, FieldValue, Geometry, Layer, LayerAccess, LayerCaps, LayerOptions,
+        OGRFieldType,
     },
 };
 use geographiclib_rs::{Geodesic, InverseGeodesic, PolygonArea, Winding};
@@ -77,6 +78,79 @@ impl Provider {
             None => self.dataset.layer(0)?,
         })
     }
+}
+
+pub(crate) fn index_unindexed_flatgeobuf(
+    path: &Path,
+    workspace: &Path,
+    output_name: &str,
+    required_fields: &[&str],
+) -> Result<PathBuf> {
+    let dataset = Dataset::open(path).with_context(|| format!("Open vector {}", path.display()))?;
+    if dataset.driver().short_name() != "FlatGeobuf" {
+        return Ok(path.to_owned());
+    }
+    ensure!(
+        dataset.layer_count() == 1,
+        "Select a layer for {}",
+        path.display()
+    );
+    let mut layer = dataset.layer(0)?;
+    if layer.has_capability(LayerCaps::OLCRandomRead) {
+        return Ok(path.to_owned());
+    }
+
+    let field_indices = required_fields
+        .iter()
+        .map(|name| field(&layer, name))
+        .collect::<Result<Vec<_>>>()?;
+    let schema = field_indices
+        .iter()
+        .map(|&index| {
+            let definition = layer
+                .defn()
+                .fields()
+                .nth(index)
+                .context("Missing required mini field")?;
+            Ok((definition.name(), definition.field_type()))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let schema: Vec<_> = schema
+        .iter()
+        .map(|(name, field_type)| (name.as_str(), *field_type))
+        .collect();
+    let geometry_type = layer.defn().geometry_type();
+    let crs = layer
+        .spatial_ref()
+        .context("Vector must declare a CRS or supply a source-CRS override")?;
+    let indexed_path = workspace.join(output_name);
+
+    write_vector_stream(
+        &indexed_path,
+        &crs,
+        &schema,
+        geometry_type,
+        true,
+        |append| {
+            for feature in layer.features() {
+                let values = field_indices
+                    .iter()
+                    .map(|&index| value(&feature, index))
+                    .collect::<Result<Vec<_>>>()?;
+                let geometry = feature.geometry().context("Missing mini geometry")?.wkb()?;
+                append(values, &geometry)?;
+            }
+            Ok(())
+        },
+    )?;
+
+    let indexed = Dataset::open(&indexed_path)?;
+    let indexed_layer = indexed.layer(0)?;
+    ensure!(
+        indexed_layer.has_capability(LayerCaps::OLCRandomRead),
+        "Failed to create a spatially indexed temporary FlatGeobuf"
+    );
+    Ok(indexed_path)
 }
 
 pub(crate) fn parse_crs(text: &str) -> Result<SpatialRef> {
@@ -541,6 +615,8 @@ pub(crate) fn absolute_input(path: &Path) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
+
     #[test]
     fn field_resolution_prefers_exact_names_and_rejects_ambiguity() -> Result<()> {
         let mut dataset = DriverManager::get_driver_by_name("Memory")?.create_vector_only("")?;
@@ -558,6 +634,102 @@ mod tests {
         assert_eq!(integer(&feature, 0)?, 9_007_199_254_740_993);
         Ok(())
     }
+
+    #[test]
+    fn unindexed_flatgeobuf_mini_copy_supports_random_reads_and_preserves_rows() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let source = temp.path().join("mini_segments.fgb");
+        let indexed_workspace = temp.path().join("indexed");
+        fs::create_dir(&indexed_workspace)?;
+        let crs = parse_crs("EPSG:4326")?;
+        let schema = [
+            ("id", OGRFieldType::OFTInteger64),
+            ("id_down", OGRFieldType::OFTInteger64),
+        ];
+        let input = [
+            (2, None, "LINESTRING (10 0, 11 0)"),
+            (1, Some(2), "LINESTRING (0 0, 1 0)"),
+        ];
+        let mut expected = BTreeMap::new();
+        let mut rows = Vec::new();
+        for (id, downstream, wkt) in input {
+            let wkb = Geometry::from_wkt(wkt)?.wkb()?;
+            expected.insert(id, (downstream, wkb.clone()));
+            rows.push(Ok((
+                vec![
+                    Some(FieldValue::Integer64Value(id)),
+                    downstream.map(FieldValue::Integer64Value),
+                ],
+                wkb,
+            )));
+        }
+        write_vector(
+            &source,
+            &crs,
+            &schema,
+            gdal_sys::OGRwkbGeometryType::wkbLineString,
+            false,
+            rows.into_iter(),
+        )?;
+
+        let source_is_random_readable = {
+            let source_dataset = Dataset::open(&source)?;
+            let source_layer = source_dataset.layer(0)?;
+            source_layer.has_capability(LayerCaps::OLCRandomRead)
+        };
+        assert!(!source_is_random_readable);
+
+        let indexed_path = index_unindexed_flatgeobuf(
+            &source,
+            &indexed_workspace,
+            "mini_segments.fgb",
+            &["id", "id_down"],
+        )?;
+        assert_ne!(indexed_path, source);
+        let indexed_dataset = Dataset::open(&indexed_path)?;
+        let mut indexed_layer = indexed_dataset.layer(0)?;
+        assert!(indexed_layer.has_capability(LayerCaps::OLCRandomRead));
+        let id_column = field(&indexed_layer, "id")?;
+        let downstream_column = field(&indexed_layer, "id_down")?;
+        let mut actual = BTreeMap::new();
+        for feature in indexed_layer.features() {
+            let id = feature
+                .field_as_integer64(id_column)?
+                .context("Missing copied mini ID")?;
+            let downstream = match value(&feature, downstream_column)? {
+                None => None,
+                Some(FieldValue::IntegerValue(value)) => Some(i64::from(value)),
+                Some(FieldValue::Integer64Value(value)) => Some(value),
+                _ => anyhow::bail!("Unexpected copied downstream type"),
+            };
+            let wkb = feature
+                .geometry()
+                .context("Missing copied geometry")?
+                .wkb()?;
+            actual.insert(id, (downstream, wkb));
+        }
+        assert_eq!(actual.len(), expected.len());
+        for (id, (expected_downstream, expected_wkb)) in expected {
+            let (actual_downstream, actual_wkb) = actual.get(&id).context("Missing copied ID")?;
+            assert_eq!(*actual_downstream, expected_downstream);
+            assert!(
+                GeosGeometry::new_from_wkb(&expected_wkb)?
+                    .equals(&GeosGeometry::new_from_wkb(actual_wkb)?)?
+            );
+        }
+
+        assert_eq!(
+            index_unindexed_flatgeobuf(
+                &indexed_path,
+                &indexed_workspace,
+                "mini_segments_copy.fgb",
+                &["id", "id_down"],
+            )?,
+            indexed_path
+        );
+        Ok(())
+    }
+
     #[test]
     fn measurements_use_native_ellipsoid_degrees_and_signed_rings() -> Result<()> {
         let metric = GeodesicMetric::new(&parse_crs("EPSG:4326")?)?;

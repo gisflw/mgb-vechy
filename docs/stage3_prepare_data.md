@@ -23,8 +23,21 @@ allocation budget bounds resident geometry, worker scratch, queued results, and
 configured GIS caches; it is separate from process RSS. Windows are generated
 lazily. Larger geometry collections use a disk spatial index and local geometry
 loading; collision contenders are batched without changing ancestry rules.
+Each admitted worker reserves workspace for at least 256 collision cells using
+the largest candidate-reach count found during window inspection, including
+contender-vector headers and growth. Remaining worker memory allows larger
+batches. The geometry cache remains capped at 8 MiB. GDAL starts with a 16 MiB
+cache for inspection, then targets one quarter of the budget (16 MiB–8 GiB),
+capped to leave coordinator memory and one complete worker reservation.
 Mini metadata currently requires resident space; the remaining limit is tracked
 in `.dev/pr/execution-validation.md`.
+
+Preparation creates temporary indexed FlatGeobuf copies for unindexed mini
+inputs, containing the required IDs and geometries. It uses the dense mini IDs
+to restore logical order after GDAL spatially orders those copies. Existing
+indexed FlatGeobuf inputs and other vector formats are read directly. The
+copies are stored beside staged outputs and removed when preparation exits;
+the input files and manifest paths remain unchanged.
 
 The report includes output paths, mini count, and peak processing concurrency.
 The manifest records absolute input paths and `workers_used`. Stale optional

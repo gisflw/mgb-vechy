@@ -1,6 +1,6 @@
 //! Aligned raster preparation, canonical mini ownership, and matching drainage.
 use super::{
-    execution::{CACHE_BYTES, CacheBudget, MIB},
+    execution::{CACHE_BYTES, CacheBudget, MIB, cache_allocation},
     io::{self, BLOCK, vector},
     model::{Grid, SourceId, Window, topological_order},
 };
@@ -25,6 +25,7 @@ use std::{
 };
 
 const GEOMETRY_CACHE_BYTES: usize = 8 * MIB;
+const COLLISION_CELLS: usize = 256;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -567,6 +568,15 @@ fn winner(values: &[usize], downstream: &[Option<usize>]) -> usize {
         .expect("Acyclic contenders have a downstream survivor")
 }
 
+fn collision_cell_bytes(reaches: usize) -> Result<usize> {
+    // Cover Vec's minimum capacity, doubling, and old/new storage during growth.
+    reaches
+        .max(4)
+        .checked_mul(3 * size_of::<usize>())
+        .and_then(|bytes| bytes.checked_add(size_of::<Vec<usize>>()))
+        .context("Collision workspace allocation overflow")
+}
+
 fn drainage(
     index: &Index,
     hits: &[usize],
@@ -581,7 +591,7 @@ fn drainage(
         .enumerate()
         .filter_map(|(i, &count)| (count > 1).then_some(i))
         .collect();
-    let batch_cells = (workspace / hits.len().max(1) / 16).max(1);
+    let batch_cells = (workspace / collision_cell_bytes(hits.len())?).max(1);
     for batch in cells.chunks(batch_cells) {
         let mut contenders = vec![Vec::new(); batch.len()];
         for &id in hits {
@@ -868,11 +878,24 @@ pub fn prepare_dataset_with_progress(
     inputs.extend(spec.rasters.iter().map(|r| r.path.as_path()));
     inputs.extend(spec.d8.as_deref());
     super::execution::protect_inputs(&spec.output_dir, &affected, &inputs)?;
-    let _cache = CacheBudget::new()?;
-    let mut retained = CACHE_BYTES + 32 * MIB;
+    let mut cache = CacheBudget::new()?;
     fs::create_dir_all(&spec.output_dir)?;
-    let (crs, catchments) = read_minis(&spec.mini_catchments, true, budget, &mut retained)?;
-    let (segment_crs, segments) = read_minis(&spec.mini_segments, false, budget, &mut retained)?;
+    let indexed_minis = tempfile::tempdir_in(&spec.output_dir)?;
+    let mini_catchments_path = vector::index_unindexed_flatgeobuf(
+        &spec.mini_catchments,
+        indexed_minis.path(),
+        "mini_catchments.fgb",
+        &["id"],
+    )?;
+    let mini_segments_path = vector::index_unindexed_flatgeobuf(
+        &spec.mini_segments,
+        indexed_minis.path(),
+        "mini_segments.fgb",
+        &["id", "id_down"],
+    )?;
+    let mut retained = CACHE_BYTES + 32 * MIB;
+    let (crs, catchments) = read_minis(&mini_catchments_path, true, budget, &mut retained)?;
+    let (segment_crs, segments) = read_minis(&mini_segments_path, false, budget, &mut retained)?;
     ensure!(
         io::spatial_ref(&crs)? == io::spatial_ref(&segment_crs)?
             && catchments.len() == segments.len(),
@@ -896,6 +919,7 @@ pub fn prepare_dataset_with_progress(
     let polygon_bounds = Index::bounds(&catchments)?;
     let line_bounds = Index::bounds(&segments)?;
     let mut largest_window_geometry = 0usize;
+    let mut largest_candidate_reaches = 0usize;
     let columns = grid.width.div_ceil(BLOCK);
     for ordinal in 0..block_count {
         let x = ordinal % columns * BLOCK;
@@ -921,8 +945,9 @@ pub fn prepare_dataset_with_progress(
                 bytes.checked_add(catchments[id].geometry_bytes)
             })
             .context("Preparation geometry allocation overflow")?;
-        let line_bytes = line_bounds
-            .hits(&query)
+        let line_hits = line_bounds.hits(&query);
+        largest_candidate_reaches = largest_candidate_reaches.max(line_hits.len());
+        let line_bytes = line_hits
             .into_iter()
             .try_fold(0usize, |bytes, id| {
                 bytes.checked_add(segments[id].geometry_bytes)
@@ -951,15 +976,27 @@ pub fn prepare_dataset_with_progress(
         .checked_add((8 + sources.len() * 5) * BLOCK * BLOCK)
         .and_then(|bytes| bytes.checked_add(geometry_cache_bytes))
         .context("Coordinator buffer overflow")?;
-    let available = budget
-        .checked_sub(retained)
-        .context("Memory budget cannot hold preparation inputs")?;
-    ensure!(
-        worker_base <= available,
-        "One preparation window requires about {} MiB; increase --memory-limit-mb",
-        worker_base.div_ceil(MIB)
-    );
-    let workers = spec.workers.min(block_count).min(available / worker_base);
+    let collision_minimum = collision_cell_bytes(largest_candidate_reaches)?
+        .checked_mul(COLLISION_CELLS)
+        .context("Collision workspace allocation overflow")?;
+    let worker_minimum = worker_base
+        .checked_add(collision_minimum)
+        .context("Preparation worker allocation overflow")?;
+    let coordinator = retained
+        .checked_sub(CACHE_BYTES)
+        .context("Preparation coordinator allocation underflow")?;
+    let cache_bytes = cache_allocation(budget, coordinator, worker_minimum).with_context(|| {
+        format!(
+            "One preparation window requires about {} MiB; increase --memory-limit-mb",
+            worker_minimum.div_ceil(MIB)
+        )
+    })?;
+    cache.resize(cache_bytes)?;
+    let available = budget - coordinator - cache_bytes;
+    let workers = spec
+        .workers
+        .min(block_count)
+        .min(available / worker_minimum);
     ensure!(
         workers > 0,
         "Memory budget cannot hold one preparation worker"
@@ -1031,8 +1068,8 @@ pub fn prepare_dataset_with_progress(
                 &geometry_cache,
             );
             let io_slots = &io_slots;
-            let catchment_path = &spec.mini_catchments;
-            let segment_path = &spec.mini_segments;
+            let catchment_path = &mini_catchments_path;
+            let segment_path = &mini_segments_path;
             let scale = spec.dem_scale;
             handles.push(scope.spawn(move || {
                 let work = || -> Result<()> {
@@ -1416,6 +1453,31 @@ mod tests {
     }
 
     #[test]
+    fn collision_workspace_covers_vector_growth_and_minimum_batch() -> Result<()> {
+        for reaches in [0, 1, 3, 4, 5, 8, 9, 255, 256, 257, 1024] {
+            let bytes = collision_cell_bytes(reaches)?;
+            let workspace = bytes * COLLISION_CELLS;
+            assert_eq!(workspace / bytes, 256);
+            assert_eq!((workspace + bytes * 17) / bytes, 273);
+            let mut contenders = Vec::<usize>::new();
+            for id in 0..reaches {
+                let old_capacity = contenders.capacity();
+                contenders.push(id);
+                let capacity = contenders.capacity();
+                let peak = capacity
+                    + if capacity > old_capacity {
+                        old_capacity
+                    } else {
+                        0
+                    };
+                assert!(size_of::<Vec<usize>>() + peak * size_of::<usize>() <= bytes);
+            }
+        }
+        assert!(collision_cell_bytes(usize::MAX).is_err());
+        Ok(())
+    }
+
+    #[test]
     fn collisions_follow_ancestry_and_lowest_id_with_noncontending_connectors() -> Result<()> {
         let rows = (0..3)
             .map(|_| mini("LINESTRING (0 0.5,2 0.5)", None))
@@ -1440,6 +1502,25 @@ mod tests {
             drainage(&index, &[0, 1, 2], &grid, &[None, None, None], 0)?,
             drainage(&index, &[0, 1, 2], &grid, &[None, None, None], usize::MAX)?
         );
+        Ok(())
+    }
+
+    #[test]
+    fn dense_collisions_match_across_workspace_sizes() -> Result<()> {
+        let rows = (0..257)
+            .map(|_| mini("LINESTRING (0 0.5,600 0.5)", None))
+            .collect::<Result<Vec<_>>>()?;
+        let index = Index::new(&rows, false)?;
+        let grid = test_grid(600, 1)?;
+        let downstream = vec![None; rows.len()];
+        let hits: Vec<_> = (0..rows.len()).collect();
+        let bytes = collision_cell_bytes(hits.len())?;
+        for cells in [1, COLLISION_CELLS, 600] {
+            assert_eq!(
+                drainage(&index, &hits, &grid, &downstream, bytes * cells)?,
+                vec![1; 600]
+            );
+        }
         Ok(())
     }
 

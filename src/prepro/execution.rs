@@ -11,6 +11,24 @@ pub(crate) const MIB: usize = 1024 * 1024;
 pub(crate) const CACHE_BYTES: usize = 16 * MIB;
 static CACHE_LOCK: Mutex<()> = Mutex::new(());
 
+pub(crate) fn cache_allocation(
+    budget: usize,
+    coordinator: usize,
+    work_item: usize,
+) -> Result<usize> {
+    let available = budget
+        .checked_sub(coordinator)
+        .and_then(|bytes| bytes.checked_sub(work_item))
+        .context("Memory budget cannot hold coordinator and one complete work item")?;
+    ensure!(
+        available >= CACHE_BYTES,
+        "Memory budget cannot hold coordinator, one complete work item, and 16 MiB GDAL cache"
+    );
+    Ok((budget / 4)
+        .clamp(CACHE_BYTES, 8 * 1024 * MIB)
+        .min(available))
+}
+
 pub(crate) struct CacheBudget {
     previous: i64,
     _lock: MutexGuard<'static, ()>,
@@ -20,17 +38,23 @@ impl CacheBudget {
         Self::with_limit(CACHE_BYTES)
     }
     pub(crate) fn with_limit(bytes: usize) -> Result<Self> {
+        let limit = bytes.try_into().context("GDAL cache limit exceeds int64")?;
         // Unwinding restores the GDAL limit through Drop, so a later run can recover.
         let lock = CACHE_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         // GDAL's block cache is process-wide; serialize our changes and restore it on exit.
         let previous = unsafe { gdal_sys::GDALGetCacheMax64() };
-        unsafe { gdal_sys::GDALSetCacheMax64(bytes as i64) };
+        unsafe { gdal_sys::GDALSetCacheMax64(limit) };
         Ok(Self {
             previous,
             _lock: lock,
         })
+    }
+    pub(crate) fn resize(&mut self, bytes: usize) -> Result<()> {
+        let limit = bytes.try_into().context("GDAL cache limit exceeds int64")?;
+        unsafe { gdal_sys::GDALSetCacheMax64(limit) };
+        Ok(())
     }
 }
 
@@ -344,6 +368,65 @@ impl Drop for IoPermit<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cache_allocation_preserves_complete_work_items() -> Result<()> {
+        for (budget, coordinator, work, expected) in [
+            (16, 0, 0, 16),
+            (64, 16, 32, 16),
+            (4096, 32, 64, 1024),
+            (65536, 32, 64, 8192),
+            (256, 32, 200, 24),
+        ] {
+            assert_eq!(
+                cache_allocation(budget * MIB, coordinator * MIB, work * MIB)?,
+                expected * MIB
+            );
+        }
+        for (budget, coordinator, work) in [
+            (15 * MIB, 0, 0),
+            (64 * MIB, 17 * MIB, 32 * MIB),
+            (0, usize::MAX, 1),
+            (usize::MAX, usize::MAX, 1),
+            (usize::MAX, 1, usize::MAX),
+        ] {
+            assert!(cache_allocation(budget, coordinator, work).is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn resized_cache_restores_original_on_success_error_and_panic() -> Result<()> {
+        for exit in 0..3 {
+            let mut original = 0;
+            let outcome =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<()> {
+                    let mut cache = CacheBudget::new()?;
+                    original = cache.previous;
+                    assert_eq!(unsafe { gdal_sys::GDALGetCacheMax64() }, CACHE_BYTES as i64);
+                    cache.resize(64 * MIB)?;
+                    assert_eq!(unsafe { gdal_sys::GDALGetCacheMax64() }, (64 * MIB) as i64);
+                    cache.resize(CACHE_BYTES)?;
+                    assert_eq!(unsafe { gdal_sys::GDALGetCacheMax64() }, CACHE_BYTES as i64);
+                    cache.resize(32 * MIB)?;
+                    match exit {
+                        1 => anyhow::bail!("guarded failure"),
+                        2 => panic!("guarded panic"),
+                        _ => Ok(()),
+                    }
+                }));
+            match exit {
+                0 => outcome.unwrap()?,
+                1 => assert!(outcome.unwrap().is_err()),
+                _ => assert!(outcome.is_err()),
+            }
+            let _lock = CACHE_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert_eq!(unsafe { gdal_sys::GDALGetCacheMax64() }, original);
+        }
+        Ok(())
+    }
 
     #[test]
     fn publication_collision_preserves_existing_files_and_rolls_back() -> Result<()> {

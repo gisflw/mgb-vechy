@@ -383,8 +383,14 @@ fn collision_preserves_existing_products_and_allows_shared_stage_directory() -> 
 #[test]
 fn memory_budget_reduces_concurrency_without_changing_products() -> Result<()> {
     let mut f = Fixture::new()?;
-    f.spec.memory_limit_mb = 96;
-    let limited = create_terrain_dataset(&f.spec)?;
+    f.spec.memory_limit_mb = 81;
+    let limited = mgb::prepro::create_terrain_dataset_with_progress(&f.spec, &|event| {
+        if event.phase == "processing" {
+            let cache = unsafe { gdal_sys::GDALGetCacheMax64() };
+            assert!(cache >= 16 * 1024 * 1024);
+            assert!(cache < (81 * 1024 * 1024) / 4);
+        }
+    })?;
     assert_eq!(limited.workers_used, 1);
     f.spec.memory_limit_mb = 256;
     f.spec.output_dir = f.spec.dem.with_file_name("unlimited");

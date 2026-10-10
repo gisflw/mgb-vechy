@@ -1,6 +1,6 @@
 //! Confined mini-basin routing and raw-DEM HAND/geodesic LTND products.
 use super::{
-    execution::{CACHE_BYTES, CacheBudget, MIB, publish},
+    execution::{CacheBudget, MIB, cache_allocation, publish},
     io::{self, attach_mask, read, staging_raster, windows},
     model::{Grid, Window},
 };
@@ -1059,7 +1059,6 @@ fn write_patch<T: GdalType + Copy>(ds: &mut Dataset, patch: &Patch, values: &[T]
         }
     }
     band.write(position, size, &mut previous)?;
-    ds.flush_cache()?;
     Ok(())
 }
 
@@ -1113,23 +1112,34 @@ pub fn create_terrain_dataset_with_progress(
         .memory_limit_mb
         .checked_mul(MIB)
         .context("Memory budget overflow")?;
-    let _cache = CacheBudget::new()?;
+    let mut cache = CacheBudget::new()?;
     let datasets = open_inputs(&spec)?;
     let (grid, minis) = inspect(&spec, &datasets)?;
     drop(datasets);
-    let coordinator = CACHE_BYTES
-        + 32 * MIB
-        + minis
-            .len()
-            .checked_mul(8192)
-            .context("Coordinator allocation overflow")?;
-    let available = budget
-        .checked_sub(coordinator)
-        .context("Memory budget cannot hold terrain coordinator")?;
-    ensure!(
-        available >= WORKER_BYTES,
-        "Memory budget cannot hold one mini"
-    );
+    let coordinator = minis
+        .len()
+        .checked_mul(8192)
+        .and_then(|bytes| bytes.checked_add(32 * MIB))
+        .context("Coordinator allocation overflow")?;
+    let largest = minis
+        .iter()
+        .try_fold((0, 0), |largest, mini| -> Result<_> {
+            let bytes = routing_reservation(mini.window)?;
+            Ok(if bytes > largest.0 {
+                (bytes, mini.id)
+            } else {
+                largest
+            })
+        })?;
+    let cache_bytes = cache_allocation(budget, coordinator, largest.0).with_context(|| {
+        format!(
+            "Mini {} requires about {} MiB; increase --memory-limit-mb",
+            largest.1,
+            largest.0.div_ceil(MIB)
+        )
+    })?;
+    cache.resize(cache_bytes)?;
+    let available = budget - coordinator - cache_bytes;
     let workers = spec.workers.min(minis.len()).min(available / WORKER_BYTES);
     fs::create_dir_all(&spec.output_dir)?;
     spec.output_dir = fs::canonicalize(&spec.output_dir)?;
@@ -1342,6 +1352,7 @@ pub fn create_terrain_dataset_with_progress(
         }
     }
     csv.flush()?;
+    validity.flush_cache()?;
     for (name, mut ds) in [
         ("hand.tif", Some(hand)),
         ("ltnd.tif", Some(ltnd)),
@@ -1519,7 +1530,11 @@ mod tests {
             write_patch(&mut validity, &patch, &patch.valid)?;
             write_patch(&mut ds, &patch, &patch.hand)?;
         }
+        validity.flush_cache()?;
         attach_mask(&mut ds, &validity, &grid)?;
+        let cog = directory.path().join("hand.tif");
+        io::finish_cog(&ds, &cog, 1, None)?;
+        let ds = Dataset::open(cog)?;
         for window in windows(Window {
             x: 0,
             y: 0,
@@ -1538,6 +1553,9 @@ mod tests {
                         && ((y - w.y) * w.width + x - w.x) % d == 0
                 });
                 assert_eq!(block.mask.data()[i] != 0, expected, "mask at {x},{y}");
+                if expected {
+                    assert_eq!(block.values.data()[i], 1., "value at {x},{y}");
+                }
             }
         }
         Ok(())

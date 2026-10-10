@@ -49,6 +49,14 @@ Routing always covers each complete mini, so output window edges never become
 routing boundaries. GDAL/GEOS allocations and process overhead are outside the
 managed working-memory estimate.
 
+GDAL uses a 16 MiB block cache during inspection, then targets one quarter of
+the budget (16 MiB–8 GiB). The allocation is capped to leave coordinator buffers
+and the largest complete mini's routing reservation, then deducted before
+admitting work. Temporary rasters remain disk-backed. Patch writes stay buffered;
+validity is flushed once before attaching masks, and output flushes are retained
+before COG generation and publication. The original GDAL cache limit is restored
+on exit, including failures.
+
 COGs use lossless ZSTD compression through the installed GDAL driver.
 
 Products are staged and published after processing and COG validation;
