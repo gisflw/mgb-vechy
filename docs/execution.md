@@ -13,9 +13,12 @@ entries; their targets are preserved. Directory collisions fail. Inputs and
 unrelated files are protected. Temporary storage stays beside staged outputs.
 
 Progress appears on stderr, refreshing about four times per second in terminals.
-Redirected stderr receives plain phase messages. Successful runs print preparing,
-processing, finalizing, and total elapsed seconds. Failed runs print elapsed time
-before failure.
+Terminal progress keeps completed operation lines visible and shows a 20-character
+percentage bar for processing operations with a known total. Redirected stderr
+receives one plain line per operation. Successful runs print preparing,
+processing, finalizing, and total elapsed seconds, followed by a short completion
+message and every output filename under its output directory. Sampling prints
+nodata warnings on their own line. Failed runs print elapsed time before failure.
 
 Each successful stage manifest includes a top-level `elapsed_seconds` value for
 the total stage run. Reports also expose wall-clock phase timings for the CLI and

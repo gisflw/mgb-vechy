@@ -424,7 +424,11 @@ fn cli_runs_and_reports_errors() -> Result<()> {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(String::from_utf8_lossy(&output.stdout).contains("Sampled 2 minis"));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("Sampling complete."));
+    assert!(stdout.contains("Outputs:"));
+    assert!(stdout.contains("sampled_minis.csv"));
+    assert!(stdout.contains("manifest-sample-minis.json"));
     let output = command.output()?;
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("already exists"));

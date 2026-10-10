@@ -208,16 +208,6 @@ pub fn sample_minibasins_with_progress(
     )?;
     reporter.enter("finalizing", "Writing samples and diagnostics");
     let (mut files, failure) = output.finish(staging.path(), minis.len())?;
-    if !files.is_empty() {
-        eprintln!(
-            "Warning: Nodata cells were found in {}",
-            files
-                .iter()
-                .map(|name| name.trim_start_matches("nodata_").trim_end_matches(".csv"))
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
-    }
     if let Some(message) = failure {
         publish(
             staging.path(),

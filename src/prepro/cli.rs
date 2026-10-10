@@ -225,12 +225,8 @@ pub fn run(args: Args) -> anyhow::Result<()> {
                 &progress,
             )?;
             display.elapsed(&report.timings);
-            println!(
-                "Selected {} sources using {} workers: {}",
-                report.source_count,
-                report.workers_used,
-                report.catchments.display()
-            );
+            println!("ROI selection complete.");
+            outputs(&[report.catchments, report.segments, report.manifest]);
             Ok(())
         }
         Command::Aggregate(mut args) => {
@@ -260,13 +256,13 @@ pub fn run(args: Args) -> anyhow::Result<()> {
                 &progress,
             )?;
             display.elapsed(&report.timings);
-            println!(
-                "Aggregated {} sources into {} minis using {} workers: {}",
-                report.source_count,
-                report.mini_count,
-                report.workers_used,
-                report.catchments.display()
-            );
+            println!("Aggregation complete.");
+            outputs(&[
+                report.catchments,
+                report.segments,
+                report.source_to_mini,
+                report.manifest,
+            ]);
             Ok(())
         }
         Command::Prepare(mut args) => {
@@ -321,11 +317,18 @@ pub fn run(args: Args) -> anyhow::Result<()> {
                 &progress,
             )?;
             display.elapsed(&report.timings);
-            println!(
-                "Prepared {} minis using {} workers: {}",
-                report.mini_count,
-                report.workers_used,
-                report.dem.display()
+            println!("Raster preparation complete.");
+            outputs(
+                &[
+                    report.dem,
+                    report.grid_catchments,
+                    report.grid_segments,
+                    report.manifest,
+                ]
+                .into_iter()
+                .chain(report.d8)
+                .chain(report.rasters.into_values())
+                .collect::<Vec<_>>(),
             );
             Ok(())
         }
@@ -363,12 +366,17 @@ pub fn run(args: Args) -> anyhow::Result<()> {
                 &progress,
             )?;
             display.elapsed(&report.timings);
-            println!(
-                "Routed {} minis using {} workers ({} undrained cells): {}",
-                report.mini_count,
-                report.workers_used,
-                report.undrained_count,
-                report.hand.display()
+            println!("Terrain products complete.");
+            outputs(
+                &[
+                    report.hand,
+                    report.ltnd,
+                    report.undrained_cells,
+                    report.manifest,
+                ]
+                .into_iter()
+                .chain(report.flow_direction)
+                .collect::<Vec<_>>(),
             );
             Ok(())
         }
@@ -399,14 +407,42 @@ pub fn run(args: Args) -> anyhow::Result<()> {
                 },
                 &progress,
             )?;
+            display.finish_progress();
+            if !report.nodata_reports.is_empty() {
+                eprintln!(
+                    "Warning: Nodata cells were found in {}",
+                    report
+                        .nodata_reports
+                        .iter()
+                        .filter_map(|path| path.file_stem())
+                        .map(|name| name
+                            .to_string_lossy()
+                            .trim_start_matches("nodata_")
+                            .to_owned())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+            }
             display.elapsed(&report.timings);
-            println!(
-                "Sampled {} minis using {} workers: {}",
-                report.mini_count,
-                report.workers_used,
-                report.sampled_minis.display()
+            println!("Sampling complete.");
+            outputs(
+                &[report.sampled_minis, report.manifest]
+                    .into_iter()
+                    .chain(report.nodata_reports)
+                    .collect::<Vec<_>>(),
             );
             Ok(())
+        }
+    }
+}
+
+fn outputs(paths: &[PathBuf]) {
+    if let Some(directory) = paths.first().and_then(|path| path.parent()) {
+        println!("Outputs: {}", directory.display());
+        for path in paths {
+            if let Some(name) = path.file_name() {
+                println!("  {}", name.to_string_lossy());
+            }
         }
     }
 }
@@ -480,14 +516,7 @@ impl Display {
                     if let Ok(state) = shared.lock()
                         && let Some((event, updated)) = state.as_ref()
                     {
-                        let total = event.total.map(|n| format!("/{n}")).unwrap_or_default();
-                        eprint!(
-                            "\r\x1b[2K{}  {}{}  {:.1}s",
-                            event.operation,
-                            event.completed,
-                            total,
-                            event.elapsed_seconds + updated.elapsed().as_secs_f64()
-                        );
+                        eprint!("\r\x1b[2K{}", progress_line(event, updated));
                         let _ = std::io::stderr().flush();
                     }
                 }
@@ -502,28 +531,60 @@ impl Display {
     }
     fn update(&self, event: super::StageProgress) {
         if let Ok(mut state) = self.state.lock() {
-            if !self.terminal
-                && state
-                    .as_ref()
-                    .is_none_or(|(previous, _)| previous.operation != event.operation)
-            {
+            if let Some((previous, updated)) = state.as_ref() {
+                if previous.operation != event.operation {
+                    if self.terminal {
+                        eprint!("\r\x1b[2K{}\n", progress_line(previous, updated));
+                    } else {
+                        eprintln!("{}", event.operation);
+                    }
+                } else if previous.phase == event.phase
+                    && previous.completed > event.completed
+                    && previous.total == event.total
+                {
+                    return;
+                }
+            } else if !self.terminal {
                 eprintln!("{}", event.operation);
             }
             *state = Some((event, std::time::Instant::now()));
         }
     }
+    fn finish_progress(&self) {
+        if let Ok(mut state) = self.state.lock()
+            && let Some((event, updated)) = state.take()
+            && self.terminal
+        {
+            eprint!("\r\x1b[2K{}\n", progress_line(&event, &updated));
+        }
+    }
     fn elapsed(&self, timings: &super::StageTimings) {
-        if let Ok(mut state) = self.state.lock() {
-            *state = None;
-        }
-        if self.terminal {
-            eprint!("\r\x1b[2K");
-        }
+        self.finish_progress();
         eprintln!(
             "Elapsed: preparing {:.1}s, processing {:.1}s, finalizing {:.1}s, total {:.1}s",
             timings.preparing, timings.processing, timings.finalizing, timings.total
         );
     }
+}
+
+fn progress_line(event: &super::StageProgress, updated: &std::time::Instant) -> String {
+    let elapsed = event.elapsed_seconds + updated.elapsed().as_secs_f64();
+    if event.phase == "processing"
+        && let Some(total) = event.total.filter(|total| *total > 0)
+    {
+        let percent = ((event.completed as f64 / total as f64) * 100.0)
+            .floor()
+            .clamp(0.0, 100.0) as usize;
+        return format!(
+            "{}  [{}{}] {}%  {:.1}s",
+            event.operation,
+            "#".repeat(percent / 5),
+            "-".repeat(20 - percent / 5),
+            percent,
+            elapsed
+        );
+    }
+    format!("{}  {:.1}s", event.operation, elapsed)
 }
 impl Drop for Display {
     fn drop(&mut self) {
@@ -551,5 +612,54 @@ impl Drop for Display {
                 timings.preparing, timings.processing, timings.finalizing, timings.total
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn event(
+        phase: &'static str,
+        completed: usize,
+        total: Option<usize>,
+    ) -> super::super::StageProgress {
+        super::super::StageProgress {
+            phase,
+            operation: "Sampling mini-basins",
+            completed,
+            total,
+            elapsed_seconds: 0.0,
+            timings: Default::default(),
+        }
+    }
+
+    #[test]
+    fn progress_bar_shows_floored_percentage_and_handles_missing_totals() {
+        let now = std::time::Instant::now();
+        assert!(
+            progress_line(&event("processing", 0, Some(10)), &now)
+                .contains("[--------------------] 0%")
+        );
+        assert!(
+            progress_line(&event("processing", 3, Some(10)), &now)
+                .contains("[######--------------] 30%")
+        );
+        assert!(
+            progress_line(&event("processing", 1, Some(3)), &now)
+                .contains("[######--------------] 33%")
+        );
+        assert!(
+            progress_line(&event("processing", 10, Some(10)), &now)
+                .contains("[####################] 100%")
+        );
+        assert!(
+            progress_line(&event("processing", 1, Some(0)), &now)
+                .starts_with("Sampling mini-basins  0.0s")
+        );
+        assert!(
+            progress_line(&event("preparing", 1, None), &now)
+                .starts_with("Sampling mini-basins  0.0s")
+        );
     }
 }
